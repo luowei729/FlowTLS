@@ -101,6 +101,8 @@ func (s *linuxSearcher) FindProcessInfo(ctx context.Context, network string, sou
 }
 
 func (s *linuxSearcher) resolveSocketByNetlink(network string, source netip.AddrPort, destination netip.AddrPort) (inode, uid uint32, err error) {
+	source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+	destination = netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())
 	family, protocol, err := socketDiagSettings(network, source)
 	if err != nil {
 		return 0, 0, err
@@ -118,7 +120,7 @@ func (s *linuxSearcher) resolveSocketByNetlink(network string, source netip.Addr
 			return 0, 0, err
 		}
 	}
-	return querySocketDiagOnce(family, protocol, source)
+	return dumpSocketDiag(family, protocol, source, destination)
 }
 
 func (s *linuxSearcher) findProcessPath(targetInode, uid uint32) (string, error) {
