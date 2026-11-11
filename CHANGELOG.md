@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-11-12 02:55 (北京时间)
+
+### 完善 README 并推送仓库
+- 重写 `README.md`：项目定位、架构图、7 项核心优势、快速开始、配置说明、实测数据、已知限制、项目结构。
+- 新增 `.gitignore`：排除 `target/`、`ssl/`（证书私钥）、`deploy/`、`test/`、`DEPLOY_CREDENTIALS.md`、IDE 缓存与日志。
+- 新增 `deploy.example/`：脱敏的服务端/客户端示例配置，README 可直接引用。
+- 安全处理：将 `CHANGELOG` / `DEVTIPS` / `AGENTS` / `PROJECT_PLAN` / `docs/DESIGN` 中的
+  服务器 IP、客户端出口 IP、内网地址全部替换为描述性占位（如“香港服务器”“客户端出口 IP”）；
+  真实密码与证书仅保留在本地 `deploy/` 与 `ssl/`，不入库。
+- 已推送到 `origin/main`（commit `3418ab9`）。
+
 ## 2026-11-12 02:48 (北京时间)
 
 ### 流表增加 5 分钟空闲清理（解决测速后流数残留）
