@@ -75,7 +75,7 @@ FlowTLS 用 raw socket 绕过内核 TCP 栈，自己构造 IP/TCP 头，把 TCP 
 抓包只能看到：
 
 ```
-TCP 10.0.0.2:44311 → 1.2.3.4:8443  [PSH, ACK]
+TCP 192.0.2.10:44311 → 198.51.100.4:8443  [PSH, ACK]
 17 03 03 04 cc 86 23 83 0a de 75 ...   ← 标准 TLS 1.3 ApplicationData
 ```
 
