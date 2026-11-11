@@ -179,13 +179,24 @@ http:
   listen: "0.0.0.0:8080"
   username: "admin"
   password: "abcd1234"
+# HTTPS 入口默认开启（127.0.0.1:8443），证书默认自签，鉴权沿用 SOCKS5。
+# 需要局域网访问或自定义证书时再显式配置：
+# https:
+#   listen: "0.0.0.0:8443"
+#   username: "admin"
+#   password: "abcd1234"
+#   cert: "/path/to/fullchain.pem"
+#   key: "/path/to/privkey.pem"
 net:
   mode: "auto"
 ```
 
 ```bash
 sudo ./flowtls client -c client.yaml
-# 之后：curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
+# 之后三种入口都可用：
+#   SOCKS5  curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
+#   HTTP    curl -x http://admin:abcd1234@127.0.0.1:8080 https://www.google.com
+#   HTTPS   curl -x https://admin:abcd1234@127.0.0.1:8443 --proxy-insecure https://www.google.com
 ```
 
 ## 实测数据

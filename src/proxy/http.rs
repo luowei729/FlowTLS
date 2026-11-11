@@ -33,17 +33,50 @@ pub async fn run(addr: SocketAddr, auth: (String, String), client: ProxyClient) 
 }
 
 /// 本地 TLS 代理监听
-pub async fn run_tls(addr: SocketAddr, auth: (String, String), client: ProxyClient) -> Result<()> {
-    // 本地入口用运行时自签证书，浏览器首次访问需要手动信任
-    let cert = rcgen::generate_simple_self_signed(vec!["flowtls-local".to_string()])
-        .context("生成本地自签证书失败")?;
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+pub async fn run_tls(
+    addr: SocketAddr,
+    auth: (String, String),
+    client: ProxyClient,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+) -> Result<()> {
+    // 证书策略：配置里给了 cert/key 就用用户的，否则生成自签。
+    // 自签适合本地入口（浏览器首次访问手动信任），
+    // 指定真实证书则可以让本地入口也对外提供可信 HTTPS。
+    let (certs, key) = match (cert_path.as_deref(), key_path.as_deref()) {
+        (Some(c), Some(k)) => {
+            let mut cert_reader = std::io::BufReader::new(
+                std::fs::File::open(c)
+                    .with_context(|| format!("打开证书失败: {c}"))?,
+            );
+            let certs = rustls_pemfile::certs(&mut cert_reader)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("解析证书失败")?;
+            let mut key_reader = std::io::BufReader::new(
+                std::fs::File::open(k)
+                    .with_context(|| format!("打开私钥失败: {k}"))?,
+            );
+            let key = rustls_pemfile::private_key(&mut key_reader)
+                .context("解析私钥失败")?
+                .context("私钥文件为空")?;
+            tracing::info!(cert = %c, key = %k, "HTTPS 入口使用自定义证书");
+            (certs, key)
+        }
+        _ => {
+            let cert = rcgen::generate_simple_self_signed(vec!["flowtls-local".to_string()])
+                .context("生成本地自签证书失败")?;
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+            tracing::info!("HTTPS 入口使用自签证书（浏览器需手动信任）");
+            (
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+            )
+        }
+    };
+
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(key),
-        )
+        .with_single_cert(certs, key)
         .context("本地 TLS 配置失败")?;
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(tls));

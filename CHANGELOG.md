@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## 2026-11-12 03:00 (北京时间)
+
+### HTTPS 入口默认开启，证书可自签或自定义
+- 需求：SOCKS5 / HTTP / HTTPS 三个入口，HTTPS 默认就要开；证书默认自签，也允许指定。
+- 改动：
+  - `InboundFile` 新增可选 `cert` / `key`（PEM 路径）。
+  - `proxy/http.rs::run_tls` 支持两种模式：配置了 cert/key 就加载用户的证书，
+    否则运行时用 rcgen 生成自签证书（启动日志会标明用的是哪种）。
+  - HTTPS 入口默认启动：未配置 `https` 时监听 `127.0.0.1:8443`（仅本机，安全），
+    用户名密码沿用 `socks5` 配置；需要局域网访问或换证书时在配置里显式写 `https`。
+  - CLI `--https` 只覆盖监听地址时，会保留配置文件里已有的 cert/key。
+- 实测：
+  - 启动日志：`HTTPS 入口已启动 addr=127.0.0.1:8443` + `HTTPS 入口使用自签证书`
+  - 带鉴权：`curl -x https://admin:***@127.0.0.1:8443 --proxy-insecure` → **204 / 0.62s**
+  - 不带鉴权：正确返回 **407 Proxy Authentication Required**
+- 文档：`README.md` 与 `deploy.example/client.yaml` 补充三种入口用法。
+
 ## 2026-11-12 02:55 (北京时间)
 
 ### 完善 README 并推送仓库

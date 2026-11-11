@@ -116,6 +116,9 @@ fn build_client_config(args: cli::ClientArgs) -> Result<config::ClientFile> {
             listen: v,
             username: cfg.socks5.as_ref().map(|i| i.username.clone()).unwrap_or_default(),
             password: cfg.socks5.as_ref().map(|i| i.password.clone()).unwrap_or_default(),
+            // SOCKS5 不需要证书
+            cert: None,
+            key: None,
         });
     }
     if let Some(v) = args.http {
@@ -123,6 +126,8 @@ fn build_client_config(args: cli::ClientArgs) -> Result<config::ClientFile> {
             listen: v,
             username: cfg.http.as_ref().map(|i| i.username.clone()).unwrap_or_default(),
             password: cfg.http.as_ref().map(|i| i.password.clone()).unwrap_or_default(),
+            cert: None,
+            key: None,
         });
     }
     if let Some(v) = args.https {
@@ -130,6 +135,9 @@ fn build_client_config(args: cli::ClientArgs) -> Result<config::ClientFile> {
             listen: v,
             username: cfg.https.as_ref().map(|i| i.username.clone()).unwrap_or_default(),
             password: cfg.https.as_ref().map(|i| i.password.clone()).unwrap_or_default(),
+            // 只改监听地址时保留配置里已有的证书路径
+            cert: cfg.https.as_ref().and_then(|i| i.cert.clone()),
+            key: cfg.https.as_ref().and_then(|i| i.key.clone()),
         });
     }
     Ok(cfg)

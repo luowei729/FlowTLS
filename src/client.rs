@@ -789,12 +789,31 @@ async fn spawn_inbounds(cfg: &ClientFile, client: ProxyClient) -> Result<()> {
         });
         tracing::info!(%addr, "HTTP 入口已启动");
     }
-    if let Some(inb) = &cfg.https {
+    // HTTPS 入口默认开启：未配置时监听 127.0.0.1:8443（仅本机，安全），
+    // 鉴权沿用 SOCKS5 配置；需要局域网访问或换证书时在配置里显式写 https。
+    let https_cfg = cfg.https.clone().unwrap_or_else(|| {
+        let (u, p) = cfg
+            .socks5
+            .as_ref()
+            .map(|s| (s.username.clone(), s.password.clone()))
+            .unwrap_or_default();
+        crate::config::InboundFile {
+            listen: "127.0.0.1:8443".to_string(),
+            username: u,
+            password: p,
+            cert: None,
+            key: None,
+        }
+    });
+    {
+        let inb = &https_cfg;
         let addr = crate::config::parse_listen(&inb.listen)?;
         let client = client.clone();
         let auth = (inb.username.clone(), inb.password.clone());
+        let cert = inb.cert.clone();
+        let key = inb.key.clone();
         tokio::spawn(async move {
-            if let Err(e) = proxy::http::run_tls(addr, auth, client).await {
+            if let Err(e) = proxy::http::run_tls(addr, auth, client, cert, key).await {
                 tracing::error!(error = %e, "HTTPS 入口退出");
             }
         });

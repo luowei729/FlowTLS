@@ -152,6 +152,12 @@ pub struct InboundFile {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    /// HTTPS 入口可选的证书路径（PEM）。不填则运行时生成自签证书。
+    #[serde(default)]
+    pub cert: Option<String>,
+    /// HTTPS 入口可选的私钥路径（PEM）。
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 impl ServerFile {

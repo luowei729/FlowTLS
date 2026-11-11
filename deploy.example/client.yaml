@@ -24,7 +24,15 @@ http:
   username: "admin"
   password: "CHANGE_ME"
 
-# https: 配置项同样可用，指向本地证书即可提供 HTTPS 入口
+# HTTPS 代理入口默认开启（127.0.0.1:8443），鉴权沿用 SOCKS5 配置，
+# 证书默认运行时自签（浏览器首次访问需手动信任）。
+# 需要局域网访问或使用自己的证书时，取消下面注释并修改：
+# https:
+#   listen: "0.0.0.0:8443"
+#   username: "admin"
+#   password: "CHANGE_ME"
+#   cert: "/path/to/fullchain.pem"
+#   key: "/path/to/privkey.pem"
 
 net:
   mode: "auto"
