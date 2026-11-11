@@ -20,6 +20,9 @@
 ```
 写成 `4&0xFFFF=0xF107` 取到的是 Flags/Frag，规则永远不命中。
 
+> 后续变更：运营商 NAT 会把 IP ID 改写为 `0x0000`，该规则在真实链路上已失效。
+> 现在改为按 TCP wscale 匹配：`--u32 "46&0xFFFFFFFF=0x03030C01"`（详见第 22 条）。
+
 ## 4. raw 表里不要用 conntrack INVALID
 
 `iptables -t raw -A PREROUTING ... -m conntrack --ctstate INVALID -j DROP`
@@ -102,18 +105,18 @@ shift 至少 7（8MB），实际取 12（256MB），避免 BBR 窗口超过它�
 验证方法：同链路用内核 TCP 下载大文件对比。实测内核 TCP 265KB/s，FakeTLS 2.2MB/s，
 说明丢包主要是链路客观条件，QUIC 重传已经抄底，不是 FakeTLS 实现问题。
 
-## 15. 拥塞窗口可用环境变量调
+## 15. 拥塞窗口：已改为自适应（旧的环境变量已移除）
 
-固定窗口默认 1MB，不改代码可调：
+早期版本用 `FLOWTLS_CWND` 环境变量调固定窗口，现已**删除**。
+当前由两端每 2 秒按实测丢包率自动调整：
 
-```bash
-export FLOWTLS_CWND=2097152   # 2MB
-./flowtls server -c server.yaml
+```
+丢包 > 20% → 窗口 × 0.90；< 5% → × 1.20；范围 1.5MB ~ 8MB
+并受 quinn MAX_CHUNKS=1024 约束反算安全上限（见第 23 条）
 ```
 
-启动日志会打印 `拥塞控制：固定窗口 cwnd=...`。窗口越小丢包越少但吞吐上限低，
-窗口越大单流越快但突发会导致中间设备丢包。跨境直播建议 1MB；
-大文件下载可试 2-3MB；弱网可降到 512KB。
+配置里的 `net.max_cwnd` 仅作为自适应起点，不决定最终窗口。
+观察方式：日志里的 `loss_pct`（本周期丢包率）和 `win_cap`（当前窗口上限）。
 
 ## 16. hysteria2 的 QUIC 参数参照
 

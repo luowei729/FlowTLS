@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-11-12 03:10 (北京时间)
+
+### 文档全面校正（AGENTS / PROJECT_PLAN / DESIGN / DEPLOY_CREDENTIALS）
+- 用户反馈部分 md 描述已过时。逐份核对当前代码后修正：
+  - `AGENTS.md`：架构图里的「零等待」改为标准三次握手；补充 wscale=12 识别、背压、
+    `capped.rs`、HTTPS 默认开启；更新吞吐数据（3.6MB/s、79/64 Mbps）与已知限制
+    （必须直连公网 IP、443 不可用、quinn MAX_CHUNKS 约束）。
+  - `PROJECT_PLAN.md`：状态更新到 v0.2.0；已完成项补齐标准握手、自适应窗口、自动重连、
+    背压、wscale 识别、读取失败 stop、流表清理、HTTPS 默认；删除重复的旧章节。
+  - `docs/DESIGN.md`：重写。包格式（MTU 1340）、伪包识别（wscale=12）、
+    标准三次握手时序、iptables 新规则、流控与背压、读取失败处理、断线自愈、
+    传输参数（4MB/16MB）全部按当前实现重写。
+  - `DEPLOY_CREDENTIALS.md`：修正客户端实际指向（香港 100M）、HTTPS 默认入口、
+    当前 source_port 44311、INPUT/OUTPUT 两条规则；服务端启动命令改为 setsid + stdbuf。
+- 修正历史记录中的错误表述：香港是 100M 上下行，千兆机器是新加坡 ARM（但云 NAT 不可用）。
+
 ## 2026-11-12 03:00 (北京时间)
 
 ### HTTPS 入口默认开启，证书可自签或自定义

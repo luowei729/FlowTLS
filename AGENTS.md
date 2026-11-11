@@ -6,31 +6,35 @@ FlowTLS 是一个「外观是 TCP + TLS、内部是 QUIC 数据报」的代理�
 客户端与服务端之间不使用内核 TCP 栈：自己构造 IP/TCP 头，用 raw socket 收发，
 所以底层是不可靠的，丢包恢复、多流复用、拥塞控制全部由 quinn-proto 负责。
 
-同端口（默认 8443，生产建议 443）还运行一个内核 TCP 的真证书网站，
-用于应对主动端口探测。
+同端口（默认 8443）还运行一个内核 TCP 的真证书网站，用于应对主动端口探测。
+注意 443 端口实测不可用：国内出口设备对 443 的伪造 TCP 检查更严，包发不出去，
+因此默认端口是 8443。
 
 ## 架构
 
 ```
-本地入口 (SOCKS5 / HTTP / HTTPS)
+本地入口 (SOCKS5 / HTTP / HTTPS；HTTPS 默认开启，证书自签或自定义)
         │
         ▼
-quinn-proto QUIC 状态机（单连接多流，BBR）
+quinn-proto QUIC 状态机（单连接多流，BBR + 自适应窗口上限）
         │  QUIC 数据报
         ▼
 FakeTCP 层（src/faketcp）
   - 伪 TLS 记录外观：17 03 03 len + nonce + ChaCha20-Poly1305(QUIC)
-  - 裸 SYN + 伪 ClientHello + 首个加密包同批发出，零等待
+  - 标准三次握手：SYN → SYN-ACK → ACK，之后才发数据
+    （严格 NAT 会丢弃握手完成前的数据包；零等待版本已废弃）
   - AEAD 密钥 = HKDF-SHA256(password)，解密成功即鉴权
+  - 伪包识别特征 = TCP 窗口缩放因子 wscale=12
+    （IP ID 会被运营商 NAT 改写为 0，不能再用魔数分流）
         │  原始 IPv4 报文
         ▼
-================ TCP 8443 / 443 ================
+================ TCP 8443 ================
         │  原始 IPv4 报文
         ▼
 FakeTCP 层（服务端，AEAD 验签失败静默丢弃）
         │
         ▼
-quinn-proto QUIC → 出站 TCP
+quinn-proto QUIC → 出站 TCP（带 pending 字节背压）
 同端口内核 TCP → rustls 真证书 → 内置 HTML 网站
 ```
 
@@ -47,7 +51,8 @@ src/faketcp/
   socket.rs        AF_PACKET 收包 / IPPROTO_RAW 发包
   codec.rs         伪 TLS 记录 + AEAD + 伪 ClientHello/ServerHello
 src/quic/
-  config.rs        传输参数、BBR、自签证书
+  config.rs        传输参数、自签证书
+  capped.rs        带自适应窗口上限的 BBR（受 quinn MAX_CHUNKS 约束）
 src/proxy/
   socks5.rs        RFC1928 + RFC1929
   http.rs          CONNECT + 普通 HTTP + Basic 认证；HTTPS 本地入口
@@ -103,6 +108,10 @@ flowtls client -c client.yaml
 
 - FakeTCP 目前只支持 IPv4。
 - 需要 root 或 CAP_NET_RAW；需要 iptables（或客户端公网 IP）。
-- 服务端与客户端之间的实际丢包率会影响吞吐，BBR 已开启，实测 1.6MB/s（10MB 下载）。
-- 客户端的 `tick` 固定 5ms 驱动 QUIC 定时器，RTT 会略高于物理 RTT，后续可改成精确 deadline。
+- **必须直接持有公网 IP**：云主机只给内网地址 + NAT 映射时，网关会对 TCP 做状态检查，
+  裸 SYN 会被丢弃（实测 Oracle Cloud 完全不可用）。
+- **443 端口不可用**：国内出口设备对 443 的伪造 TCP 检查更严，建议用 8443/9443。
+- **单流窗口受 quinn `MAX_CHUNKS=1024` 约束**：高丢包时窗口过大会以
+  `too many gaps in stream buffer` 断连，因此用自适应窗口（1.5~8MB）规避。
+- 跨境链路实测吞吐：单路 3.6MB/s、4 路并发 6.9MB/s、FAST.com 79/64 Mbps（100M 端口）。
 - 内层 QUIC 证书是运行时自签，安全由外层 AEAD 保证。
