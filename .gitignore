@@ -1,0 +1,21 @@
+# 构建产物
+/target/
+
+# 证书与私钥：绝不入库
+/ssl/
+*.pem
+*.key
+
+# 部署与凭据（含真实密码/服务器地址，本地维护）
+DEPLOY_CREDENTIALS.md
+/deploy/
+/test/
+
+# IDE 与工具缓存
+.qoder-cn/
+.idea/
+.vscode/
+
+# 日志与临时文件
+*.log
+*.pcap
