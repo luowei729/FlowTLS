@@ -178,6 +178,25 @@ fn check_server(cfg: &ServerFile, r: &mut Report) {
 
     check_net(&cfg.net.mode, cfg.net.max_cwnd, r);
 
+    // UDP 转发：服务端关掉时客户端发来的 datagram 会被读出来丢弃，
+    // 现象是「DNS 能解析（走 TCP 回退）但游戏/语音完全不可用」。
+    if cfg.udp.enabled {
+        r.ok(format!(
+            "UDP 转发已启用（并发会话上限 {}，空闲回收 {}s）",
+            cfg.udp.max_sessions, cfg.udp.timeout_secs
+        ));
+        // 会话上限为 0 会让所有 UDP 会话都被拒绝创建，
+        // 但 UDP 本身不报错，只表现为「发出去的包都没有回音」。
+        if cfg.udp.max_sessions == 0 {
+            r.error("udp.max_sessions 不能为 0（会拒绝所有 UDP 会话）");
+        }
+        if cfg.udp.timeout_secs == 0 {
+            r.warn("udp.timeout_secs=0 会被钳到 10 秒，低频 UDP 会话会被过早回收");
+        }
+    } else {
+        r.warn("udp.enabled=false：客户端发来的 UDP 数据报会被全部丢弃");
+    }
+
     // iptables 规则是否已按该 magic 安装
     if cfg.net.mode == "auto" {
         if let Ok(port) = crate::config::parse_listen(&cfg.listen) {
@@ -242,9 +261,47 @@ fn check_client(cfg: &ClientFile, r: &mut Report) {
 
     check_net(&cfg.net.mode, cfg.net.max_cwnd, r);
 
+    // 伪装用 SNI：客户端连 IP 时不发 SNI 扩展（与真实浏览器一致），
+    // 但配一个真实域名会让握手外观更接近浏览器（也能配合真实证书站点）。
+    let sni = cfg.effective_sni();
+    if sni.is_empty() {
+        r.warn("未配置 sni，且无法从 server 推导");
+    } else if sni.parse::<std::net::IpAddr>().is_ok() {
+        r.warn(format!(
+            "sni 是 IP 地址 ({sni})：伪 ClientHello 会自动省略 SNI 扩展\
+             （与真实浏览器用 IP 直连时一致）。想更接近浏览器可配一个真实域名"
+        ));
+    } else {
+        r.ok(format!("伪装 SNI: {sni}"));
+    }
+
     // 入口至少要有可用的
     if cfg.socks5.is_none() && cfg.http.is_none() && cfg.https.is_none() {
         r.warn("没有配置任何本地入口（socks5 / http / https 全为空），客户端起来也没法用");
+    }
+
+    // UDP 转发：SOCKS5 是唯一的 UDP 入口（HTTP/HTTPS 代理协议本身不支持 UDP），
+    // 所以没配 socks5 时开不开 udp 都没用，必须提醒。
+    if cfg.udp.enabled {
+        if cfg.socks5.is_some() {
+            r.ok(format!(
+                "UDP 转发已启用（会话上限 {}，空闲回收 {}s），入口为 SOCKS5 UDP ASSOCIATE",
+                cfg.udp.max_sessions, cfg.udp.timeout_secs
+            ));
+        } else {
+            r.warn(
+                "udp.enabled=true 但没有配置 socks5 入口：\
+                 HTTP/HTTPS 代理协议不支持 UDP，UDP 实际上用不了",
+            );
+        }
+    } else {
+        r.warn("udp.enabled=false：SOCKS5 的 UDP ASSOCIATE 会被拒绝（返回命令不支持）");
+    }
+    if cfg.udp.max_sessions == 0 {
+        r.error("udp.max_sessions 不能为 0（会拒绝所有 UDP 会话）");
+    }
+    if cfg.udp.timeout_secs == 0 {
+        r.warn("udp.timeout_secs=0 会被钳到 10 秒，低频 UDP 会话会被过早回收");
     }
     for (name, inb) in [
         ("socks5", cfg.socks5.as_ref()),
@@ -311,6 +368,22 @@ fn check_pair(s: &ServerFile, c: &ClientFile, r: &mut Report) {
                 sp.port()
             ));
         }
+    }
+
+    // UDP 开关必须两端一致：QUIC DATAGRAM 是双向协商的，
+    // 但两端配置不一致时**不会报错**（不像密码不一致会解密失败），
+    // 只会表现为「UDP 包发出去石沉大海」，非常难排查。
+    if s.udp.enabled == c.udp.enabled {
+        r.ok(format!(
+            "两端 udp.enabled 一致: {}",
+            if s.udp.enabled { "启用" } else { "关闭" }
+        ));
+    } else {
+        r.error(format!(
+            "两端 udp.enabled 不一致（服务端 {} / 客户端 {}）：\
+             UDP 包会单向消失，且没有任何错误日志",
+            s.udp.enabled, c.udp.enabled
+        ));
     }
 }
 

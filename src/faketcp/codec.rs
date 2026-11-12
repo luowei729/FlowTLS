@@ -182,6 +182,11 @@ const CLIENT_HELLO_TARGET: usize = 512;
 pub fn build_client_hello(sni: &str) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let name = sni.as_bytes();
+    // 用 IP 直连时真实浏览器/curl **不发送 SNI 扩展**（RFC 6066 要求
+    // HostName 必须是域名，放 IP 属于协议违规）。
+    // 我们的默认部署正是 `server: 203.0.113.10:8443`，改造前就把
+    // IP 当 SNI 发了出去——「SNI 是裸 IP」是任何 DPI 都能一眼命中的特征。
+    let sni_valid = !sni.is_empty() && sni.parse::<std::net::IpAddr>().is_err();
 
     // ---- 扩展列表 ----
     let mut exts: Vec<u8> = Vec::with_capacity(480);
@@ -189,13 +194,15 @@ pub fn build_client_hello(sni: &str) -> Vec<u8> {
     // GREASE 扩展必须放在第一个（Chrome 的习惯）
     push_ext(&mut exts, grease(), &[]);
 
-    // server_name (0x0000)
-    let mut sn = Vec::with_capacity(5 + name.len());
-    sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // server_name_list 长度
-    sn.push(0); // host_name
-    sn.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    sn.extend_from_slice(name);
-    push_ext(&mut exts, 0x0000, &sn);
+    // server_name (0x0000)，仅当 SNI 是合法域名时才发
+    if sni_valid {
+        let mut sn = Vec::with_capacity(5 + name.len());
+        sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // server_name_list 长度
+        sn.push(0); // host_name
+        sn.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sn.extend_from_slice(name);
+        push_ext(&mut exts, 0x0000, &sn);
+    }
 
     // extended_master_secret (0x0017)：空体，表示支持
     push_ext(&mut exts, 0x0017, &[]);

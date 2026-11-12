@@ -22,6 +22,8 @@ pub struct ServerFile {
     pub faketcp: FakeTcpFile,
     #[serde(default)]
     pub net: NetFile,
+    #[serde(default)]
+    pub udp: UdpFile,
 }
 
 /// 证书配置
@@ -106,6 +108,55 @@ impl Default for NetFile {
     }
 }
 
+/// UDP 转发参数（两端共用一套结构，语义按角色不同）。
+///
+/// UDP 走 QUIC DATAGRAM（RFC 9221）：不可靠、不重传、不保序，
+/// 发送队列满或超出 MTU 就直接丢弃——和 hysteria2 的处理方式一致。
+/// 因此这里的参数只有「开关」和「资源上限」，没有任何可靠性选项。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UdpFile {
+    /// 是否启用 UDP 转发。
+    ///
+    /// 服务端关掉后所有 datagram 会被读出来丢弃（不能留在 quinn 缓冲里，
+    /// 否则接收队列一直是满的），避免误开成公网 UDP 反射器；
+    /// 客户端关掉后 SOCKS5 的 UDP ASSOCIATE 会按 RFC 返回「命令不支持」。
+    #[serde(default = "default_udp_enabled")]
+    pub enabled: bool,
+    /// 每条连接最多允许的并发 UDP 会话数。
+    ///
+    /// 每个会话在服务端对应一个 UDP socket + 一个收发任务，
+    /// 必须设上限防止单个客户端把文件描述符耗尽。
+    #[serde(default = "default_udp_sessions")]
+    pub max_sessions: usize,
+    /// 会话空闲超时（秒）。
+    ///
+    /// UDP 是无连接的，客户端可能直接消失、永远不发结束信号，
+    /// 只能靠「多久没收到这个 session 的上行包」来回收 socket。
+    /// 120 秒对齐 hysteria2 的默认值：DNS 场景会被系统解析器复用，
+    /// 游戏/语音会话在静默 2 分钟后基本也确实断了。
+    #[serde(default = "default_udp_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_udp_enabled() -> bool {
+    true
+}
+fn default_udp_sessions() -> usize {
+    256
+}
+fn default_udp_timeout() -> u64 {
+    120
+}
+impl Default for UdpFile {
+    fn default() -> Self {
+        Self {
+            enabled: default_udp_enabled(),
+            max_sessions: default_udp_sessions(),
+            timeout_secs: default_udp_timeout(),
+        }
+    }
+}
+
 /// 客户端配置文件
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientFile {
@@ -125,6 +176,8 @@ pub struct ClientFile {
     pub https: Option<InboundFile>,
     #[serde(default)]
     pub net: NetFile,
+    #[serde(default)]
+    pub udp: UdpFile,
 }
 
 /// 客户端 FakeTCP 参数

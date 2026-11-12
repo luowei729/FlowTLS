@@ -918,7 +918,323 @@ let upper = safe_cap.clamp(1536 * 1024, 8 * 1024 * 1024).min(cfg_cap);
 验证方式：60s 单流 + 30s 8 流并发，检查
 `grep -c 'too many gaps'` 必须为 0。
 
-## 43. 常用调试命令
+## 43. UDP 就该允许丢包：别用 TCP 的思维写测试和实现
+
+加 UDP 支持时踩了一个典型的思维惯性：**测试脚本要求 20 个包零丢包**，
+结果每轮都在第 12~13 个卡 10 秒超时。查了两端日志、加了 debug 日志、
+甚至怀疑 `session` 冲突，最后发现是**这条跨境链路 5~10% 的真实丢包**。
+
+UDP 的正确测试方式是：
+
+```python
+# 错误：发一个等一个，丢一个就阻塞到超时
+for i in range(20):
+    udp.sendto(pkt); udp.recvfrom(...)
+
+# 正确：先全发，再按事务 ID 对账，只断言「大部分到达」
+for i in range(20):
+    udp.sendto(pkt_with_id(i))
+got = set()
+while time.time() < deadline:
+    data, _ = udp.recvfrom(...)
+    got.add(parse_txid(data))
+assert len(got) >= n // 2
+```
+
+同样的思路贯穿实现：
+
+| 位置 | 做法 | 原因 |
+|---|---|---|
+| 客户端上行 | `tx.try_send()` | 通道满就丢，绝不阻塞 relay 收包循环 |
+| 客户端 QUIC 发送 | `datagrams().send(pkt, drop=true)` | 缓冲满丢最旧，新包更值钱 |
+| 服务端上行 | `to_target.try_send()` | 目标写不过来就丢 |
+| 服务端回程 | `action_tx.try_send()` | 主循环跟不上就丢 |
+| 超 MTU | 直接丢 | 不做应用层分片（序号/重组/内存放大都不值得） |
+
+**反过来也有一个陷阱**：`drop=true` 只影响「还在本地排队、没被 `poll_transmit`
+取走」的包。已经进 QUIC 状态机的包不会因为后来的包被挤掉——
+它们会正常发出去，只是如果链路丢了就真丢了。
+
+## 44. 服务端重启后 30 秒内测 UDP 必然失败（不是 bug）
+
+服务端重启、客户端要等 `max_idle_timeout`（30 秒）才会发现断连。
+在这段时间里：
+
+1. 客户端仍认为连接有效，UDP datagram 照常发；
+2. 服务端是新进程，`conns` 是空的重建过程中，收不到对应 `ConnectionHandle`；
+3. `ServerAction::Datagram(ch, pkt)` 里 `conns.get_mut(&ch)` 返回 None → 丢弃。
+
+**现象**：服务端日志有 `新建 UDP 会话`（说明上行到了），但客户端收不到任何回程。
+**这就是「链路断开」的正常表现**，等客户端重连（日志出现 `三次握手完成`）后自动恢复。
+
+排查时可先看 `grep "三次握手完成" /tmp/ft-cn.log | tail -1` 的时间戳，
+如果测试跑在这之前，所有失败都是预期的。
+
+**顺带**：`session id` 跨重连不复用也能自愈——因为上行每包都带目标地址，
+服务端在新连接上收到第一个包就会重建会话。这是「每包带地址」这个
+看似冗余的设计换来的最大好处。
+
+## 45. SYN 只发一次 = 一次丢包就永久卡死（最严重的一次审查发现）
+
+客户端的裸 SYN 只发一次，而且**握手阶段完全不发送 QUIC 包**
+（这是对的：严格 NAT 会丢弃 SYN-ACK 之前的包）。
+两个事实撞在一起就是死锁：
+
+- 严格 NAT 要求先完成三次握手才能发数据 → 握手期间 `drain_transmits` 被跳过；
+- quinn 的 idle 定时器**在首次发包之后**才开始计时 → `handle_timeout` 永远不触发。
+
+结果：**SYN 或 SYN-ACK 任意一个丢了，客户端就永远停在「已发送 SYN，等待 SYN-ACK」**，
+进程活着、CPU 为 0、不重连、不报错。实测在这条 5%~30% 丢包的链路上，
+一次部署后客户端卡了 2 分 43 秒（最后是手工重启才恢复）。
+
+修法照抄真实 TCP：
+
+```rust
+// 1/2/4/8 秒退避重传 SYN，总时长 15 秒就放弃本次会话，交给外层重连
+_ = tick(Some(next_syn_at.into())), if awaiting_syn_ack => {
+    if handshake_start.elapsed() >= HANDSHAKE_TIMEOUT { break }
+    ... 重发 SYN（序号不变，只有 TSval 推进）...
+}
+```
+
+服务端配套改了一处：**对重传的 SYN 复用原来的 ISN 和 TSval**。
+真实栈就是这样（同一个 SYN 重传，回的 SYN-ACK 一模一样）。
+如果每次给新 ISN，客户端先收到旧 SYN-ACK、再收到新 SYN-ACK 时，
+`peer_seq` 会被两个不同的 seq 来回拉扯，ServerHello 的序号与握手包不连续。
+
+教训：**任何「等一个不会重传的包」的状态机都必须自带超时**。
+不能指望下层的 idle/PTO 兜底——它们可能压根没启动。
+
+## 46. 同一个随机函数调用两次 = TCP 序号错位
+
+`build_server_hello()` 里的加密段落长度是**随机**的（512~703，
+模仿真实证书链的量级）。服务端原来是这么写的：
+
+```rust
+let hello = build_server_hello();
+let _ = raw.send(&build_packet(..., payload: &hello));   // 发出去 L1 字节
+...
+let hello_len = build_server_hello().len() as u32;        // ← 又调了一次，拿到 L2
+let data_seq = isn.wrapping_add(1).wrapping_add(hello_len);
+```
+
+L1 ≠ L2，于是后续所有数据包的 TCP 序号都偏了 0~191 字节。
+功能上不炸（客户端按实际收到的包推导 ack，服务端不看 ack），
+但**线上字节流和序号对不上**：中间盒看到一个包的 `seq` 与上一包的
+`seq + len` 不衔接，这是伪造 TCP 的硬特征。
+
+修法：用**实际发出去的那个缓冲**的长度。
+
+教训：任何 `build_xxx()` 只要带随机长度，就绝不能再调一次取长度。
+写随机化伪装代码时，这类 bug 特别容易溜过去——因为它只在
+「长度恰好不同」时才可见，而两边逻辑看起来完全对称。
+
+## 47. TSval 必须整条连接单调，握手包也要算进去
+
+RFC 7323 的 PAWS 依赖 TSval 单调递增，真实栈用的是全局时钟。
+改造前服务端是：
+
+| 包 | TSval |
+|---|---|
+| SYN-ACK | `rand()` |
+| ServerHello | `rand()` |
+| 之后的数据包 | `TcpClock::new()` 的 `rand() + 毫秒` |
+
+三个独立随机数 → 后一个比前一个小是常态（约 50% 概率），
+时间戳类 DPI 一看就知道这不是真 TCP。
+
+另外 `TcpClock.peer_ts` 初始为 0，而 SYN 里的 TSval 明明已经知道了，
+导致连接建立后的**第一个数据包 TSecr=0**——已建立的连接上出现 TSecr=0
+同样不合理。
+
+修法：`TcpClock::new_at(base)`，握手时生成一次 TSval 贯穿全程。
+
+## 48. UDP 会话「出站任务已退出」必须删表，否则是永久黑洞
+
+服务端每个 UDP 会话一个有界通道 + 一个出站任务。任务会因为
+目标解析失败 / ICMP port unreachable / socket 绑定失败而退出，
+但主循环的会话表里那条记录还在。原来的写法：
+
+```rust
+if let Some(st) = c.udp.get_mut(&session) {
+    st.last_active = Instant::now();          // ← 先刷新活跃时间
+    st.to_target.try_send(payload)...         // ← 失败了也只是丢包
+    continue;
+}
+```
+
+两个错误叠加：
+
+1. `try_send` 失败（通道已关闭）只当成「队列满」，没删会话；
+2. `last_active` 在 `try_send` 之前刷新，**上行包会一直给死会话续命**，
+   空闲超时永远不触发。
+
+实测：向一个不可达目标持续发包，`udp_sessions` 永远停在 1。
+对客户端来说那条 `(peer, target)` 就是永久黑洞——DNS 目标暂时不可用、
+游戏服务器重启，之后再也连不上，直到客户端重启。
+
+修法：区分 `TrySendError::Closed`（删表）和 `Full`（只丢包），
+并且只在投递成功后才刷新 `last_active`。
+
+验证方法：`docs/test_udp_recover.py` —— 向服务端的关闭端口连发 8 个包，
+修好后 `udp_sessions` 会立刻回到基线（建-死-建-死循环），
+修之前会稳定停在 +1。
+
+## 49. tokio 的 `UdpSocket::try_send` 在新 socket 上会返回 WouldBlock
+
+修上面第 48 条时顺手把出站方向的 `sock.send(&d).await` 改成了
+`try_send`（理由是「UDP 不该阻塞」）。结果 **UDP 从 2/3 成功率掉到 0/6**。
+
+根因：tokio 的 `UdpSocket::try_send` 依赖 socket 在 reactor 里的可写就绪状态。
+刚 `bind` + `connect` 的 socket 还没被 poll 过，直接返回 `WouldBlock`，
+而当时那条分支的日志是 `trace!` 级别（默认看不到），于是完全静默。
+
+后果特别隐蔽：会话建好了、`connect` 成功了、日志一切正常，
+**但第一个包（也就是 DNS 查询本身）被丢掉**，客户端只看到「发出去没有回音」。
+
+教训两条：
+
+1. **UDP socket 用 `send().await`**。sendto 正常情况下不会阻塞，
+   真要阻塞时短暂等一下也比丢包好。
+2. **丢包分支的日志不要用 `trace!`**。丢包本来就难查，
+   日志级别再压到默认看不见，就等于没有日志。现在这类分支统一用 `debug!`。
+
+## 50. 测延迟必须分三层，否则会把「物理下限」当成「性能回归」
+
+用户报「延迟从 100ms 变成几百 ms」时，如果只测 `curl https://xxx`，
+你会永远查不出结论——因为**新建 TLS 连接天然需要 2 个 RTT**：
+
+```
+TLS 1.3 握手：ClientHello → ServerHello..Finished   = 1 RTT
+HTTP 请求/响应                                      = 1 RTT
+合计 = 2 RTT
+```
+
+RTT 76.6ms 的链路上，204 的**下限就是 153ms**。看到 200ms 不是 bug。
+同理，抓包里 Google 203ms / GitHub 98ms 的差异也不代表谁快谁慢——
+GitHub 快只是因为它复用了已建立的连接。
+
+正确的分层测法：
+
+| 层 | 命令 | 理论值 | 说明 |
+|---|---|---|---|
+| 0 链路 | `ping -c 20 server` | — | 拿到 RTT 基准，**必须做** |
+| 1 纯隧道 | `curl http://server_ip:port/`（目标在服务端本机） | **1 RTT** | 隧道的真实成本，等于 RTT 才是实现合格 |
+| 2 HTTPS | `curl https://target/generate_204` | **2 RTT** | TLS + HTTP 各一次往返 |
+
+脚本见 `docs/bench.sh`。判据：
+
+- 纯隧道 p50 ≈ ICMP RTT → 实现无额外开销
+- 纯隧道 p50 > ICMP RTT + 20ms → 真的有问题，继续查
+- 204 p50 ≈ 纯隧道 × 2 → 正常
+- p90 明显高于 p50 → 链路丢包，不是代理问题
+
+**丢包的放大效应要算清楚**：每丢一包 = 多等 1 RTT。一次 HTTPS 要 2~3 个
+往返，15% 丢包下 `1-0.85^3 ≈ 39%` 的连接会踩到丢包 → p90 从 81ms 跳到 246ms。
+这就是「晚高峰延迟变差」的全部原因。
+
+## 51. A/B 对照实验的四个陷阱（我全踩了一遍）
+
+用 git 旧版本编二进制做对照，方向是对的，但我连续五次得出错误结论，
+每次都因为实验设计有缺陷。记录下来，下次别再犯：
+
+**陷阱 1：在同一台机器上同时跑新旧两个服务端**
+
+服务端只有 **1 核**。两个实例抢同一核，谁被调度到谁就快，结果随机。
+正确做法：**单实例**，测完一个换另一个，用 ABBA 顺序（A→B→B→A）抵消时段漂移。
+
+**陷阱 2：用不同新鲜度的连接做对比**
+
+「新版 96ms」是在跑了几小时、`cwnd` 已被打崩到 5328（4 个包）的连接上测的；
+「旧版 78ms」是刚重启的干净连接。**这两个数不可比。**
+测量前必须：服务端和客户端都重启 → 先热身若干次 → 再采样。
+
+**陷阱 3：同时跑多个客户端进程**
+
+每个客户端都开 `AF_PACKET / SOCK_RAW` 收**全量**入站包（不绑定网卡），
+再在上层做端口过滤。4 个客户端 = 4 倍收包开销，在 1 核机上直接拖慢热路径。
+对比测试时只留一个客户端。
+
+**陷阱 4：把「我以为的改动」当成唯一变量**
+
+我看 `quic/config.rs` 的 diff 只有 DATAGRAM 两行，就断定是它。
+实际上 `datagram_send_buffer_size` / `receive_buffer_size` 只影响握手期
+传输参数（`max_datagram_frame_size`），与每包路径无关。
+用 `FLOWTLS_NO_DATAGRAM=1` 做单变量 A/B 后，开/关都是 80~81ms，假设不成立。
+
+**通用做法**：改一个变量 → 只重编 → 两端都重启 → 热身 → 采样 → 再改回去重测。
+宁可多花 3 分钟，也不要在一堆混淆变量里猜。
+
+## 52. 实验用的环境变量和配置必须「做完就撤」
+
+为了二分排查加了一个开关：
+
+```rust
+if std::env::var_os("FLOWTLS_NO_DATAGRAM").is_none() {
+    t.datagram_receive_buffer_size(Some(1024 * 1024));
+    t.datagram_send_buffer_size(1024 * 1024);
+}
+```
+
+实验做完后我重新启动客户端时**忘了不带这个变量**，于是 1080 端口跑的进程
+一直带着 `FLOWTLS_NO_DATAGRAM=1`。后果：
+
+- 客户端不通告 `max_datagram_frame_size`
+- 服务端认为对端不支持 DATAGRAM
+- **UDP 转发静默失效**：不报错、不告警、日志里一个字都没有
+- 用户表现为「DNS 能解析（走 TCP 回退）但语音/游戏不通」
+
+比崩溃更难发现，因为进程看起来完全正常。
+
+**排查方法**（进程启动后第一件事就该查这个）：
+
+```bash
+# 看运行中进程的真实环境变量
+tr '\0' '\n' < /proc/$(pgrep -x flowtls)/environ | grep -E 'FLOWTLS|RUST_LOG'
+
+# 看运行中的二进制是不是磁盘上那个
+md5sum /proc/$(pgrep -x flowtls)/exe
+md5sum ./target/x86_64-unknown-linux-musl/release/flowtls
+```
+
+**规范**：
+
+1. 实验开关一律用 `FLOWTLS_*` 前缀，方便 `grep` 一次查全。
+2. 实验结束后**立即**用不带变量的命令重启，并核对 `/proc/PID/environ`。
+3. 改配置做 A/B 时，**本地和服务端两边都要记着回退**——我这次就是
+   本地 `max_cwnd` 回退成 8MB 了，却忘了它已经被 scp 上传过，
+   服务器还停在实验用的 2MB。
+
+## 53. 版本收敛检查清单
+
+每次部署或排查完，用这套流程确认两端一致（防止旧版本/实验残留混进来）：
+
+```bash
+# 1. 源码一致（跨架构编译产物 md5 必然不同，所以比源码不比二进制）
+find src -name '*.rs' | sort | xargs md5sum | md5sum
+
+# 2. 二进制与磁盘一致（防止改了没重新部署）
+md5sum /proc/$(pgrep -x flowtls)/exe
+md5sum ./target/x86_64-unknown-linux-musl/release/flowtls   # 客户端
+# 服务端同理，在 /opt/flowtls 下执行
+
+# 3. 环境变量干净
+tr '\0' '\n' < /proc/$(pgrep -x flowtls)/environ | grep FLOWTLS
+
+# 4. 进程唯一（防止反复启停堆积，多个实例会抢 CPU 并互相干扰）
+pgrep -c -x flowtls
+
+# 5. 配置一致（本地仓库 vs 远端实际生效）
+ssh root@server 'cat /opt/flowtls/server.yaml' | diff - deploy/server-giga.yaml
+
+# 6. 两端一致性机检
+./flowtls check --server deploy/server-giga.yaml --client deploy/client-cn.yaml
+```
+
+第 5 步这次就抓到了 `max_cwnd` 2MB vs 8MB 的漂移——
+**「本地回退了配置但忘了同步服务器」是最容易犯的错**。
+
+## 54. 常用调试命令
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03
@@ -934,4 +1250,20 @@ grep "路径统计" /opt/flowtls/server.log | tail
 grep 'rtt_ms=' /tmp/ft-cn.log | grep -oE 'pending=[0-9]+' | cut -d= -f2 | sort -n | tail -1
 grep 'rtt_ms=' /tmp/ft-cn.log | grep -oE 'streams=[0-9]+' | cut -d= -f2 | sort -n | tail -1
 grep -cE 'WARN|ERROR' /tmp/ft-cn.log
+
+# UDP：看会话数（应随时间自然回落到 0）
+grep '服务端 QUIC 路径统计' /opt/flowtls/server.log | grep -oE 'udp_sessions=[0-9]+' | tail -5
+
+# UDP：看完整链路（需要 RUST_LOG=debug）
+grep -E 'UDP 已交给 QUIC|收到 UDP 回程' /tmp/ft-cn.log | tail -10
+grep -E '新建 UDP 会话|UDP 下行|UDP 回程已交给 QUIC' /opt/flowtls/server.log | tail -10
+
+# UDP 端到端测试（DNS 往返 / session 复用 / 不可达目标 / 控制连接关闭）
+python3 docs/test_udp.py
+
+# 延迟分层体检（链路基线 / 纯隧道 / HTTPS，自带判定标准）
+bash docs/bench.sh 20
+
+# 临时关闭 DATAGRAM 扩展（用于二分排查延迟/握手问题）
+FLOWTLS_NO_DATAGRAM=1 ./flowtls server -c server.yaml
 ```

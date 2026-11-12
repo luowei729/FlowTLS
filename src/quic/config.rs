@@ -97,6 +97,23 @@ fn transport_config(
     // 单连接多流是核心优势，把并发流上限调高
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(1024u32.into());
+    // ---- QUIC DATAGRAM 扩展（RFC 9221）：承载 UDP ----
+    //
+    // 只有设置了接收缓冲，quinn 才在传输参数里通告 `max_datagram_frame_size`，
+    // 对端才会认为「可以发 datagram」。不设的话 `datagrams().send()`
+    // 直接返回 `SendDatagramError::Disabled`。
+    //
+    // 1MB 接收缓冲按 1200 字节/包约 870 个包，足够吸收主循环抖动；
+    // 满了 quinn 直接丢弃最旧的——这正是我们要的 UDP 语义，不需要改。
+    // 发送侧同样的量级：它不是流控窗口，只是本地排队区，
+    // 真正发不出去时我们已经在应用层 `drop=true` 丢最旧的了。
+    //
+    // 【实验开关】`FLOWTLS_NO_DATAGRAM=1` 时不开启 DATAGRAM 扩展。
+    // 用途：排查「延迟变差是否由 DATAGRAM 扩展引起」。
+    if std::env::var_os("FLOWTLS_NO_DATAGRAM").is_none() {
+        t.datagram_receive_buffer_size(Some(1024 * 1024));
+        t.datagram_send_buffer_size(1024 * 1024);
+    }
     Arc::new(t)
 }
 

@@ -53,6 +53,25 @@ pub struct ProxyClient {
     /// 发送缓冲腾出空间时唤醒读取任务。
     /// 用事件通知而不是 sleep 轮询：轮询会把吞吐死锁在「一次读量 ÷ 轮询间隔」。
     notify: Arc<tokio::sync::Notify>,
+    /// UDP 下行路由表：session → 本地 relay 的投递通道。
+    ///
+    /// 上行方向每个 relay 任务自己持有 UDP socket，这里只负责把
+    /// QUIC DATAGRAM 里回来的包送回它所属的 relay。
+    /// 多个 SOCKS5 UDP ASSOCIATE 可能共用一个通道（每条 TCP 控制连接一个 relay）。
+    udp_routes: Arc<std::sync::Mutex<HashMap<u32, mpsc::UnboundedSender<(u32, Vec<u8>)>>>>,
+    /// UDP session id 分配器。
+    ///
+    /// 从随机值起步递增：session 只需在「一条 QUIC 连接内」唯一，
+    /// 随机起点能避免客户端重连后旧连接残留的包被误投到新会话上
+    /// （虽然服务端重连后会话表是空的，这个只是防御性设计）。
+    udp_next: Arc<std::sync::atomic::AtomicU32>,
+    /// 会话代号（epoch）：每次重连 `set_tx` 时 +1。
+    ///
+    /// 作用是把「上一个 QUIC 连接遗留的 stream 动作」隔离掉：
+    /// stream id 由 quinn 按连接分配、重连后从 0 重新开始，
+    /// 而旧本地连接的后台任务可能很久之后才发出 `Stop(0)`，
+    /// 就会误杀新连接上刚建的同号流。带 epoch 后这类动作直接丢弃。
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ProxyClient {
@@ -63,7 +82,16 @@ impl ProxyClient {
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
+            udp_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            // 随机起点，避免不同进程/不同连接撞同一批 session id
+            udp_next: Arc::new(std::sync::atomic::AtomicU32::new(rand::thread_rng().gen())),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// 当前会话代号。`pipe_stream` 在开始时记下它，后续所有动作都带着它。
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 上传方向的背压水位：超过它就暂停读本地 socket。
@@ -108,6 +136,10 @@ impl ProxyClient {
         // 否则上一轮残留的数值会立刻把新连接卡在背压等待里。
         self.inflight.store(0, std::sync::atomic::Ordering::Relaxed);
         self.blocked.store(false, std::sync::atomic::Ordering::Relaxed);
+        // 会话代号 +1：上一代遗留的 Data/Fin/Stop 动作会被事件循环丢弃，
+        // 不会误伤这一代同号的新流。
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
@@ -116,17 +148,29 @@ impl ProxyClient {
         self.tx.lock().ok().and_then(|g| g.clone())
     }
 
-    /// 打开一条 QUIC 流，返回流 ID 和下行数据通道。
+    /// 打开一条 QUIC 流，返回 `(epoch, 流 ID, 下行数据通道)`。
+    ///
+    /// epoch 必须原样带在后续的 send/fin/stop 上：它标记这条流属于哪一代连接。
     pub async fn open(
         &self,
         target: Vec<u8>,
-    ) -> Option<(StreamId, mpsc::UnboundedReceiver<Vec<u8>>)> {
+    ) -> Option<(u64, StreamId, mpsc::UnboundedReceiver<Vec<u8>>)> {
         // 先克隆出 Sender，避免 std Mutex 的 guard 跨 await
         let tx = self.sender()?;
+        // 读 epoch 必须在投递动作**之前**：这样它与事件循环处理该动作时
+        // 看到的当前 epoch 一致（不一致说明中间发生了重连，动作会被丢弃）。
+        let epoch = self.epoch();
         let (reply_tx, reply_rx) = oneshot::channel();
         // 有界通道满时在这里等待：新连接也会被背压，不会绕过水位
-        tx.send(ProxyAction::Open { target, reply: reply_tx }).await.ok()?;
-        reply_rx.await.ok().flatten()
+        tx.send(ProxyAction::Open {
+            epoch,
+            target,
+            reply: reply_tx,
+        })
+        .await
+        .ok()?;
+        let (id, rx) = reply_rx.await.ok().flatten()?;
+        Some((epoch, id, rx))
     }
 
     /// 本地 → 远端。
@@ -136,7 +180,7 @@ impl ProxyClient {
     /// 这里同时维护 `inflight`：在把数据交给通道**之前**就记账，
     /// 这样「还在通道里排队」和「已落到 st.pending」两段都被算进背压，
     /// 不会出现「通道还没满、pending 已经堆了几十 MB」的情况。
-    pub async fn send(&self, id: StreamId, data: Vec<u8>) {
+    pub async fn send(&self, epoch: u64, id: StreamId, data: Vec<u8>) {
         let n = data.len();
         self.inflight
             .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -146,7 +190,11 @@ impl ProxyClient {
                 .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
             return;
         };
-        if tx.send(ProxyAction::Data(id, data)).await.is_err() {
+        if tx
+            .send(ProxyAction::Data(epoch, id, data))
+            .await
+            .is_err()
+        {
             // 通道已关闭：这笔数据不会有人处理，退回记账
             self.inflight
                 .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
@@ -154,17 +202,73 @@ impl ProxyClient {
     }
 
     /// 本地方向结束。同样走有界通道，保证 FIN 不会插到未写完的数据前面。
-    pub async fn fin(&self, id: StreamId) {
+    pub async fn fin(&self, epoch: u64, id: StreamId) {
         if let Some(tx) = self.sender() {
-            let _ = tx.send(ProxyAction::Fin(id)).await;
+            let _ = tx.send(ProxyAction::Fin(epoch, id)).await;
         }
     }
 
     /// 彻底放弃一条流：通知对端别再写了。
     /// 本地连接异常关闭时必须调用，否则对端会一直往这条流里堆数据。
-    pub async fn stop(&self, id: StreamId) {
+    pub async fn stop(&self, epoch: u64, id: StreamId) {
         if let Some(tx) = self.sender() {
-            let _ = tx.send(ProxyAction::Stop(id)).await;
+            let _ = tx.send(ProxyAction::Stop(epoch, id)).await;
+        }
+    }
+
+    /// 注册一个 UDP 会话，返回分配的 session id。
+    ///
+    /// `down_tx` 是这个 relay 的下行通道：所有属于它的 session 回程包
+    /// 都从这里进来，relay 任务再按 session 查自己的表拿 `(peer, target)`。
+    pub fn register_udp(&self, down_tx: mpsc::UnboundedSender<(u32, Vec<u8>)>) -> u32 {
+        let id = self
+            .udp_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut g) = self.udp_routes.lock() {
+            g.insert(id, down_tx);
+        }
+        id
+    }
+
+    /// 注销一个 UDP 会话（连接关闭或超时回收时调用）。
+    pub fn unregister_udp(&self, session: u32) {
+        if let Ok(mut g) = self.udp_routes.lock() {
+            g.remove(&session);
+        }
+    }
+
+    /// 投递一帧回程 UDP 数据。
+    ///
+    /// 找不到 session 或者 relay 已经退出，就直接丢弃——
+    /// UDP 语义里「没人收」本来就该丢，不能攒着。
+    fn deliver_udp(&self, session: u32, payload: Vec<u8>) {
+        // 先克隆 Sender 再释放锁，避免持锁期间做 channel 操作
+        let tx = self
+            .udp_routes
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session).cloned());
+        if let Some(tx) = tx {
+            let _ = tx.send((session, payload));
+        }
+    }
+
+    /// 发送一帧 UDP 数据报。
+    ///
+    /// **绝不阻塞**：用 `try_send` 投递到动作通道，通道满就丢。
+    /// UDP 的发送方（本地应用）本来就不期望我们排队或者反压它，
+    /// 卡住 relay 的收包循环只会让所有会话一起掉包。
+    pub fn send_udp(&self, session: u32, target: Vec<u8>, payload: Vec<u8>) {
+        let Some(tx) = self.sender() else {
+            // 重连间隙没有活动连接：直接丢
+            return;
+        };
+        if let Err(e) = tx.try_send(ProxyAction::Udp {
+            session,
+            target,
+            payload,
+        }) {
+            tracing::trace!(session, error = %e, "UDP 动作通道满，按 UDP 语义丢弃");
         }
     }
 }
@@ -426,6 +530,10 @@ pub async fn run(cfg: ClientFile) -> Result<()> {
         // 清掉上个连接残留的包，避免旧序列号干扰新握手
         while pkt_rx.try_recv().is_ok() {}
 
+        // 记录本次会话起始时刻：用来判断「这次是短暂抖动还是真的连不上」。
+        // 之前的退避只增不减，跑满 5→10→20→40→60 之后永远停在 60 秒，
+        // 即便链路早就恢复正常，每次重连也要白等一分钟。
+        let session_start = std::time::Instant::now();
         match run_session(
             &cfg,
             &raw,
@@ -440,6 +548,12 @@ pub async fn run(cfg: ClientFile) -> Result<()> {
         {
             Ok(()) => tracing::info!("连接结束，准备重连"),
             Err(e) => tracing::warn!(error = %e, "连接异常，准备重连"),
+        }
+
+        // 会话活过 60 秒说明链路本身是好的，这次断开只是偶发抖动：
+        // 把退避打回最小值，下次再断能在一秒级恢复。
+        if session_start.elapsed() >= std::time::Duration::from_secs(60) {
+            backoff = 5;
         }
 
         // 指数退避：5s → 10s → 20s → 40s → 60s 封顶，避免频繁发包触发链路风控
@@ -556,6 +670,17 @@ async fn run_session(
     // 是否还在等 SYN-ACK。等待期间不发送任何 QUIC 数据，
     // 否则严格 NAT 会把「握手完成前的数据包」当成非法丢弃。
     let mut awaiting_syn_ack = cfg.faketcp.handshake != "none";
+    // ---- 握手重传状态 ----
+    // 跨境链路实测丢包 5%~30%，而 SYN / SYN-ACK 都只发一次：
+    // 任意一个丢了就永久卡住——因为quinn 还没开始发包，
+    // idle 定时器根本没启动，`handle_timeout` 永远不会触发。
+    // 实测过一次：客户端卡在「已发送 SYN」超过 2 分钟，进程活着但什么都不做。
+    // 修法按真实 TCP 的做法：SYN 按 1/2/4/8 秒退避重传，
+    // 总时长超过 15 秒就放弃本次会话，交给外层重连。
+    let handshake_start = Instant::now();
+    let mut next_syn_at = handshake_start + std::time::Duration::from_secs(1);
+    let mut syn_backoff = 1u64;
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     let mut last_stats = Instant::now();
 
     loop {
@@ -691,6 +816,47 @@ async fn run_session(
             // 2. QUIC 定时器（PTO、空闲超时、保活）
             _ = tick(deadline) => {
                 conn.handle_timeout(Instant::now());
+            }
+            // 2.5 握手重传 / 超时（只在等待 SYN-ACK 期间生效）
+            _ = tick(Some(next_syn_at.into())), if awaiting_syn_ack => {
+                if handshake_start.elapsed() >= HANDSHAKE_TIMEOUT {
+                    // 15 秒拿不到 SYN-ACK：链路不通或服务端没起。
+                    // 必须主动退出会话，否则这里会永远等下去（见上方注释）。
+                    tracing::warn!(
+                        waited_ms = handshake_start.elapsed().as_millis() as u64,
+                        "握手超时（SYN-ACK 未到达），放弃本次连接"
+                    );
+                    break;
+                }
+                // 重传 SYN：与真实 TCP 一致——序号不变、选项不变，
+                // 只有 TSval 推进（时间是新的）和 IP ID 递增。
+                let opts = syn_options(ctx.clock.tsval(), 0);
+                let seg = TcpSeg {
+                    seq: isn,
+                    ack: 0,
+                    flags: TCP_SYN,
+                    ip_id: ctx.ip_id,
+                    window: 65535,
+                    tsval: ctx.clock.tsval(),
+                    tsecr: 0,
+                    options: &opts,
+                    payload: &[],
+                };
+                let syn = build_packet(
+                    local_ip,
+                    server_ip,
+                    cfg.faketcp.source_port,
+                    server_port,
+                    &seg,
+                );
+                let _ = raw.send(&syn, server_ip);
+                ctx.ip_id = next_ipid(ctx.mark, ctx.ip_id);
+                tracing::info!(
+                    retry_in_secs = syn_backoff,
+                    "SYN-ACK 未到达，重传 SYN"
+                );
+                syn_backoff = (syn_backoff * 2).min(8);
+                next_syn_at = Instant::now() + std::time::Duration::from_secs(syn_backoff);
             }
             // 3. 本地代理动作
             maybe = action_rx.recv() => {
@@ -870,6 +1036,22 @@ fn drain_events(
     client: &ProxyClient,
 ) -> bool {
     let mut disconnected = false;
+    // ---- UDP 回程：先排空 QUIC DATAGRAM 接收队列 ----
+    // 必须每次事件循环都读空：quinn 的接收缓冲是有限的，
+    // 不读就会一直满，后续 datagram 被静默丢弃（UDP 语义下不算错，
+    // 但那是我们自己的处理跟不上，不是链路的问题）。
+    // `recv()` 返回 None 表示队列空，正常路径开销极小。
+    loop {
+        let Some(pkt) = conn.datagrams().recv() else {
+            break;
+        };
+        // 一帧一个包：[session u32][payload]
+        let Some((session, payload)) = proxy::udp::parse_server(&pkt) else {
+            continue;
+        };
+        tracing::debug!(session, bytes = payload.len(), "收到 UDP 回程");
+        client.deliver_udp(session, payload.to_vec());
+    }
     while let Some(ev) = conn.poll() {
         match ev {
             Event::Connected => {
@@ -1073,8 +1255,21 @@ fn handle_action(
     action: ProxyAction,
     client: &ProxyClient,
 ) {
+    // 当前会话代号：与动作里的 epoch 不一致就说明这条动作来自上一代连接。
+    // stream id 跨连接会重复使用，直接执行会误伤新连接上的同号流。
+    let cur_epoch = client.epoch();
     match action {
-        ProxyAction::Open { target, reply } => {
+        ProxyAction::Open {
+            epoch,
+            target,
+            reply,
+        } => {
+            if epoch != cur_epoch {
+                // 重连发生在 Open 投递与处理之间：这条流不存在于当前连接，
+                // 必须回 None，否则调用方会拿到一个永远不会来的流。
+                let _ = reply.send(None);
+                return;
+            }
             let Some(id) = conn.streams().open(Dir::Bi) else {
                 let _ = reply.send(None);
                 return;
@@ -1101,8 +1296,15 @@ fn handle_action(
             tracing::debug!(stream = ?id, target_len, "打开 QUIC 流");
             let _ = reply.send(Some((id, rx)));
         }
-        ProxyAction::Data(id, data) => {
+        ProxyAction::Data(epoch, id, data) => {
             let n = data.len();
+            // 陈旧动作：这条流属于上一代连接，数据已经无处可去。
+            // 必须把在途计数退回去（set_tx 已把计数器清零，
+            // 这里用 saturating 减法，不会下溢）。
+            if epoch != cur_epoch {
+                subtract_inflight(client, n);
+                return;
+            }
             // 注意：这里**不能**在开头就把 n 扣掉。
             // inflight 的语义是「已读出但还没交给 QUIC 的字节」，
             // 数据从通道取出来之后如果只是转存到 st.pending，它仍然没交给 QUIC，
@@ -1157,7 +1359,10 @@ fn handle_action(
             }
             flush_pending(conn, streams, id, client);
         }
-        ProxyAction::Fin(id) => {
+        ProxyAction::Fin(epoch, id) => {
+            if epoch != cur_epoch {
+                return;
+            }
             {
                 let Some(st) = streams.get_mut(&id) else { return };
                 if st.local_finished {
@@ -1170,7 +1375,12 @@ fn handle_action(
             }
             flush_pending(conn, streams, id, client);
         }
-        ProxyAction::Stop(id) => {
+        ProxyAction::Stop(epoch, id) => {
+            // 陈旧动作保护：重连后旧流号可能已被新流占用，
+            // 一个迟到的 Stop 会把刚建好的新流 RESET 掉（用户表现为偶发请求失败）。
+            if epoch != cur_epoch {
+                return;
+            }
             // 本地连接已经彻底关闭（浏览器取消 / curl 超时退出）：
             // 通知服务端别再往这条流写，并释放它占用的流控额度。
             // 不发的话服务端会继续读目标 socket，堆到背压高水位后
@@ -1184,6 +1394,43 @@ fn handle_action(
             let _ = conn.send_stream(id).reset(0u32.into());
             client.notify.notify_waiters();
         }
+        ProxyAction::Udp {
+            session,
+            target,
+            payload,
+        } => {
+            // UDP 走 QUIC DATAGRAM：不重传、不保序、不排队。
+            let payload_len = payload.len();
+            let mut out =
+                Vec::with_capacity(proxy::udp::HEADER_LEN + target.len() + payload_len);
+            proxy::udp::encode_client(session, &target, &payload, &mut out);
+            // 每包都查一次上限：max_size 会随路径 MTU 变化（quinn 内部估算），
+            // 超限直接丢——不切片也不做应用层分片，与 hysteria2 一致。
+            // DNS/游戏/QUIC 报文基本都在 1200 字节以内，够用。
+            let max = conn.datagrams().max_size().unwrap_or(0);
+            if out.len() > max {
+                tracing::debug!(
+                    session,
+                    len = out.len(),
+                    max,
+                    "UDP 包超出 QUIC datagram 上限，丢弃"
+                );
+                return;
+            }
+            // drop=true：发送缓冲满时丢弃最旧的排队包，保证新包能进。
+            // 语音/游戏这类实时流里「新包比旧包有价值」，
+            // 而且 UDP 本来就没有重传，留旧包毫无意义。
+            match conn.datagrams().send(out.into(), true) {
+                Ok(()) => tracing::debug!(
+                    session,
+                    len = payload_len,
+                    "UDP 已交给 QUIC"
+                ),
+                Err(e) => {
+                    tracing::debug!(session, error = %e, "QUIC datagram 发送失败，丢弃")
+                }
+            }
+        }
     }
 }
 
@@ -1193,12 +1440,18 @@ async fn spawn_inbounds(cfg: &ClientFile, client: ProxyClient) -> Result<()> {
         let addr = crate::config::parse_listen(&inb.listen)?;
         let client = client.clone();
         let auth = (inb.username.clone(), inb.password.clone());
+        // UDP relay 参数：SOCKS5 是唯一的 UDP 入口，所以开关/上限都从这里传
+        let udp = proxy::socks5::UdpOptions {
+            enabled: cfg.udp.enabled,
+            max_sessions: cfg.udp.max_sessions,
+            timeout_secs: cfg.udp.timeout_secs,
+        };
         tokio::spawn(async move {
-            if let Err(e) = proxy::socks5::run(addr, auth, client).await {
+            if let Err(e) = proxy::socks5::run(addr, auth, client, udp).await {
                 tracing::error!(error = %e, "SOCKS5 入口退出");
             }
         });
-        tracing::info!(%addr, "SOCKS5 入口已启动");
+        tracing::info!(%addr, udp = udp.enabled, "SOCKS5 入口已启动");
     }
     if let Some(inb) = &cfg.http {
         let addr = crate::config::parse_listen(&inb.listen)?;
@@ -1275,6 +1528,7 @@ async fn tick(deadline: Option<tokio::time::Instant>) {
 /// 把一条本地连接（明文 TCP 或本地 TLS）和一条 QUIC 流对接起来。
 pub async fn pipe_stream<S>(
     local: S,
+    epoch: u64,
     id: StreamId,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     client: ProxyClient,
@@ -1300,12 +1554,12 @@ where
             c1.wait_drain().await;
             match r.read(&mut buf).await {
                 Ok(0) => {
-                    c1.fin(id).await;
+                    c1.fin(epoch, id).await;
                     break;
                 }
-                Ok(n) => c1.send(id, buf[..n].to_vec()).await,
+                Ok(n) => c1.send(epoch, id, buf[..n].to_vec()).await,
                 Err(_) => {
-                    c1.fin(id).await;
+                    c1.fin(epoch, id).await;
                     break;
                 }
             }
@@ -1329,5 +1583,7 @@ where
     // 本地连接已经彻底结束：主动告诉服务端别再往这条流写。
     // 正常收完时这只是个无害的空操作，但连接被强制中断时（取消下载、
     // curl 超时、浏览器切页）它是唯一能让服务端立刻停止读目标的信号。
-    client.stop(id).await;
+    // 带上 epoch：这个收尾可能迟于重连（reader 卡在本地 read 上），
+    // 迟到时事件循环会丢弃它，避免误伤新连接上的同号流。
+    client.stop(epoch, id).await;
 }

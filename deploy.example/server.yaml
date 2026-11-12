@@ -27,3 +27,15 @@ net:
   mode: "auto"
   # 拥塞窗口初始值，仅作为自适应算法的起点，单位字节
   max_cwnd: 8388608
+
+# UDP 转发（QUIC DATAGRAM）：不可靠、不重传、不补发，与 hysteria2 的 UDP 处理一致。
+# 入口是 SOCKS5 的 UDP ASSOCIATE（浏览器 DNS、语音、游戏、QUIC 都走这里）。
+udp:
+  # 关掉后客户端发来的 UDP 数据报会被读出来直接丢弃。
+  # 服务端必须显式开启，避免被当成公网 UDP 反射器。
+  enabled: true
+  # 每条连接最多允许的并发 UDP 会话数（每个会话一个 UDP socket）。
+  # 防止单客户端耗尽文件描述符。
+  max_sessions: 256
+  # 会话空闲回收秒数。UDP 无连接，客户端消失后只能靠超时回收。
+  timeout_secs: 120

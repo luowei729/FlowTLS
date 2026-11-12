@@ -338,6 +338,23 @@ impl TcpClock {
         }
     }
 
+    /// 用指定的 TSval 基准构造。
+    ///
+    /// 为什么需要它：同一条连接里所有报文的 TSval 必须**单调不减**
+    /// （RFC 7323 的 PAWS 就靠这个丢弃旧包）。握手阶段的 SYN-ACK 和
+    /// ServerHello 由 `handle_packet` 直接发、不走 TcpClock，
+    /// 如果连接建立后再 `TcpClock::new()` 取一个随机基准，
+    /// 第一个数据包的 TSval 就可能小于前面握手包的 TSval，出现「时间戳回退」，
+    /// 这是时间戳类 DPI 最容易抓的伪造特征。
+    /// 传进来握手包用的 TSval（再 +2 留出空隙），后续就天然单调。
+    pub fn new_at(base: u32) -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+            base,
+            peer_ts: 0,
+        }
+    }
+
     /// 当前应发送的 TSval。
     /// 步长就是真实毫秒数，和 Linux 的 `tcp_time_stamp` 一致（不回退）。
     #[inline]

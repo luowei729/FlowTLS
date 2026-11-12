@@ -13,11 +13,11 @@ FlowTLS 是一个「外观是 TCP + TLS、内部是 QUIC 数据报」的代理�
 ## 架构
 
 ```
-本地入口 (SOCKS5 / HTTP / HTTPS；HTTPS 默认开启，证书自签或自定义)
+本地入口 (SOCKS5 含 UDP ASSOCIATE / HTTP / HTTPS；HTTPS 默认开启，证书自签或自定义)
         │
         ▼
 quinn-proto QUIC 状态机（单连接多流，BBR + 自适应窗口上限）
-        │  QUIC 数据报
+        │  QUIC 数据报（TCP 走双向流，UDP 走 RFC 9221 DATAGRAM）
         ▼
 FakeTCP 层（src/faketcp）
   - 伪 TLS 记录外观：17 03 03 len + nonce + ChaCha20-Poly1305(QUIC)
@@ -55,7 +55,8 @@ src/quic/
   config.rs        传输参数、自签证书
   capped.rs        带自适应窗口上限的 BBR（受 quinn MAX_CHUNKS 约束）
 src/proxy/
-  socks5.rs        RFC1928 + RFC1929
+  socks5.rs        RFC1928（CONNECT + UDP ASSOCIATE）+ RFC1929
+  udp.rs           UDP 会话帧编解码（[session][addrLen][地址][载荷]）
   http.rs          CONNECT + 普通 HTTP + Basic 认证；HTTPS 本地入口
 src/site/          内核 TCP 真网站（rustls + HTTP/1.1）
 src/rules.rs       iptables 规则检测与安装
@@ -114,6 +115,8 @@ flowtls client -c client.yaml
 ## 已知限制
 
 - FakeTCP 目前只支持 IPv4。
+- **UDP 不走重传也不分片**：QUIC DATAGRAM 语义，队列满/超 MTU 即丢（对齐 hysteria2）；
+  单包上限约 1200 字节，更大的 UDP 报文直接丢弃。
 - 需要 root 或 CAP_NET_RAW；需要 iptables（或客户端公网 IP）。
 - **必须直接持有公网 IP**：云主机只给内网地址 + NAT 映射时，网关会对 TCP 做状态检查，
   裸 SYN 会被丢弃（实测 Oracle Cloud 完全不可用）。

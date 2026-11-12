@@ -124,6 +124,22 @@ QUIC 断开 → 退避 5s → 重新握手 → 恢复
 让目标 TCP 窗口收缩，而不是把数据无限堆在内存里。
 实测长时间大流量下 `pending` 与收包队列都保持接近 0。
 
+### 8. UDP 转发（不重传，对齐 hysteria2）
+
+UDP 走 QUIC 的 **DATAGRAM 扩展（RFC 9221）**，入口是 SOCKS5 的 `UDP ASSOCIATE`：
+
+```text
+客户端 → 服务端：[session u32][addrLen u16][ATYP][ADDR][PORT][payload]
+服务端 → 客户端：[session u32][payload]
+```
+
+语义与 hysteria2 完全一致——**不重传、不保序、队列满即丢、超 MTU 即丢**，
+不做应用层分片。跨境链路 5~10% 丢包率下，DNS/WebRTC/游戏都表现正常
+（它们本来就有自己的重试机制）。
+
+注意 DNS 防泄漏要用 `socks5h://` 或 `--socks5-hostname`：域名交给服务端解析，
+走 UDP 转发；用普通 `socks5://` 则 DNS 在本地解析。
+
 ## 快速开始
 
 ### 编译
@@ -179,6 +195,10 @@ http:
   listen: "0.0.0.0:8080"
   username: "admin"
   password: "abcd1234"
+udp:
+  enabled: true           # SOCKS5 UDP ASSOCIATE（DNS / 语音 / 游戏 / HTTP3）
+  max_sessions: 256
+  timeout_secs: 120
 # HTTPS 入口默认开启（127.0.0.1:8443），证书默认自签，鉴权沿用 SOCKS5。
 # 需要局域网访问或自定义证书时再显式配置：
 # https:
@@ -226,7 +246,12 @@ sudo ./flowtls client -c client.yaml
 3. **只支持 IPv4**
    FakeTCP 层目前只处理 IPv4 报文。
 
-4. **需要 root 权限**
+4. **UDP 不做重传也不做分片**
+   这是刻意选择（UDP 语义 + 对齐 hysteria2）。单包上限约 1200 字节，
+   更大的 UDP 报文会被丢弃；5~10% 的包会在跨境链路上丢失，
+   依赖应用层自己重试。
+
+5. **需要 root 权限**
    raw socket、AF_PACKET、iptables 都需要 root。
 
 ## 项目结构
@@ -246,11 +271,15 @@ src/
 │   ├── config.rs      # quinn-proto 传输参数
 │   └── capped.rs      # 带自适应窗口上限的 BBR 控制器
 ├── proxy/
-│   ├── socks5.rs      # SOCKS5 入口（含用户名密码）
+│   ├── socks5.rs      # SOCKS5 入口（CONNECT + UDP ASSOCIATE）
+│   ├── udp.rs         # UDP 会话帧编解码（QUIC DATAGRAM 载荷）
 │   └── http.rs        # HTTP / HTTPS 入口
 ├── site/mod.rs        # 同端口伪装网站（内核 TCP + 真证书）
 ├── server.rs          # 服务端主流程
 └── client.rs          # 客户端主流程（含自动重连）
+
+docs/
+└── test_udp.py        # UDP 端到端测试（DNS / session 复用 / 连接关闭）
 ```
 
 ## 文档

@@ -98,6 +98,65 @@ ATYP: 1=IPv4(4B), 4=IPv6(16B), 3=域名(1B 长度 + nB)
 出站方向使用 `tokio::join!` 而非 `select!`：任一方向结束不能把另一方向直接 drop，
 否则会出现「客户端半关闭后目标数据没读完就发 FIN」，下载几十 KB 就中断。
 
+## 6.1 UDP 协议（QUIC DATAGRAM）
+
+UDP 不走 QUIC 流，走 **RFC 9221 DATAGRAM 扩展**。设计目标是与 hysteria2 完全一致：
+**不重传、不保序、队列满即丢、超 MTU 即丢**，不做任何应用层分片。
+
+### 线上格式
+
+```text
+客户端 → 服务端：[session u32 BE][addrLen u16 BE][ATYP][ADDR][PORT][payload]
+服务端 → 客户端：[session u32 BE][payload]
+```
+
+**上行每包都带目标地址**（多 7~9 字节）。这个冗余换来两个关键性质：
+
+1. 服务端**完全无状态地重建会话**——客户端重连后服务端是新连接、会话表为空，
+   第一个带地址的包就能自愈，不需要任何会话迁移协议；
+2. 服务端不需要记忆「这个 session 上次的目标是谁」，排查时一行日志就能看出
+   包是发给谁的。
+
+### 会话生命周期
+
+| 侧 | 键 | 值 | 回收 |
+|---|---|---|---|
+| 客户端 | `(本地应用地址, 目标地址帧)` | `session id` + 下行通道 | 120s 空闲 / 控制连接关闭 |
+| 服务端 | `session id` | UDP socket + 目标 + `last_active` | 120s 空闲 |
+
+服务端每个会话对应一个 `udp_outbound` 任务，`select!` 同时管上行（`rx.recv`）
+和下行（`sock.recv`）。会话被主循环 `remove` 后，`to_target` sender 被 drop，
+`rx.recv()` 立即返回 `None` → 任务退出 → socket 关闭。**不需要取消信号**。
+
+### 丢包策略
+
+| 位置 | 做法 |
+|---|---|
+| 客户端上行 | `tx.try_send()`，通道满即丢 |
+| 客户端 QUIC 发送 | `datagrams().send(pkt, drop=true)`，缓冲满丢最旧 |
+| 服务端上行 | `to_target.try_send()`，通道满即丢 |
+| 服务端回程 | `action_tx.try_send()`，主循环跟不上即丢 |
+| 超过 `datagrams().max_size()`（约 1200B） | 直接丢，不分片 |
+
+`drop=true` 的语义是「丢掉还在本地排队、未被 `poll_transmit` 取走的包」，
+已经进 QUIC 状态机的包不会被挤掉。
+
+### SOCKS5 入口
+
+`UDP ASSOCIATE`（RFC 1928 CMD=3）：
+
+1. 控制连接（TCP）完成认证后发 `CMD=3`，返回 `BND.ADDR:BND.PORT`；
+2. 客户端把 UDP 包发到 `BND` 地址，格式 `RSV(2)|FRAG(1)|ATYP|ADDR|PORT|payload`；
+3. `FRAG != 0` 的分片包直接丢弃（与绝大多数实现一致，不做重组）；
+4. 控制连接断开 → 整个 relay 立刻结束并注销所有 session（RFC 要求）。
+
+### MTU 影响
+
+**零影响**。datagram 是 QUIC 帧类型，与 stream 数据共用同一个 QUIC 包，
+外层 FakeTCP / AEAD / 批量发送路径一行都没改。单包上限由
+`conn.datagrams().max_size()` 每包检查（等于 `path MTU - 1RTT overhead - 帧头`，
+当前 MTU 1332 下约 1200 字节）。
+
 ## 7. 流控与背压
 
 ### 接收侧（quinn 硬限制）
@@ -159,10 +218,12 @@ quinn-proto 的接收组装器有硬编码常量 `MAX_CHUNKS = 1024`，
 - `quinn_proto::Endpoint::new(EndpointConfig, Some(ServerConfig), false, None)`
 - 入向：`endpoint.handle(now, client_addr, None, None, BytesMut, &mut buf)`
 - 新连接：`endpoint.accept(incoming, now, &mut buf, Some(server_config))`
-- 出向：`conn.poll_transmit(now, 1, &mut buf)`，**每次循环前 buf.clear()**
+- 出向：`conn.poll_transmit(now, 32, &mut buf)`，**每次循环前 buf.clear()**
 - 定时器：`conn.poll_timeout()` + `conn.handle_timeout(now)`
-- 传输参数：`initial_mtu 1340`、`receive_window 16MB`、`stream_receive_window 4MB`、
-  `send_window 16MB`、`keep_alive 10s`、`max_idle_timeout 30s`、ACK 频率 5ms
+- 传输参数：`initial_mtu 1332`、`receive_window 16MB`、`stream_receive_window 4MB`、
+  `send_window max_cwnd×2`、`keep_alive 10s`、`max_idle_timeout 30s`、ACK 频率 5ms、
+  `datagram_receive_buffer_size 1MB`
+- UDP：`conn.datagrams().send(bytes, drop=true)` / `.recv()` / `.max_size()`
 - 拥塞控制：`CappedBbr` 包装原生 BBR，只在 `window()` 处按自适应上限截断
 
 ## 11. 安全边界

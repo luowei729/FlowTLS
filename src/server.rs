@@ -25,12 +25,38 @@ use crate::faketcp::packet::{
     seq_len, syn_options, TcpClock, TcpSeg, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
 };
 use crate::faketcp::socket::{PacketBatch, RawSocket};
-use crate::proxy::decode_target;
+use crate::proxy::{decode_target, udp};
 
 /// 出站任务发回事件循环的动作
 enum ServerAction {
     Data(ConnectionHandle, StreamId, Vec<u8>),
     Fin(ConnectionHandle, StreamId),
+    /// UDP 回程：出站 UDP 任务收到目标回的包，已按 `[session][payload]` 编好，
+    /// 主循环拿到后直接丢给 `conn.datagrams().send()`。
+    ///
+    /// 走主循环而不是在任务里直接发，是因为 `datagrams()` 需要 `&mut Connection`，
+    /// 而 Connection 由主循环独占（quinn-proto 是单线程状态机）。
+    Datagram(ConnectionHandle, Vec<u8>),
+}
+
+/// 服务端一个 UDP 会话。
+///
+/// 与 TCP 流的本质区别：**完全没有背压，也没有重传**。
+/// 上行通道满就丢、下行 datagram 发不出去也丢——这正是 UDP 的语义，
+/// 也是 hysteria2 对 UDP 的处理方式。所以这里没有任何 pending / 水位 /
+/// 唤醒机制，只有一个容量很小的通道当安全网。
+struct UdpSession {
+    /// 上行：主循环 → 出站任务。容量小是有意的：
+    /// 它就是「允许积压多少个包」的上限，满了直接丢。
+    to_target: mpsc::Sender<Vec<u8>>,
+    /// 目标地址 `host:port`（仅用于日志）。
+    /// 实际解析出来的 IP 在出站任务里，主循环不需要知道。
+    target: String,
+    /// 最后一次收到上行包的时间，用于空闲回收。
+    ///
+    /// UDP 是无连接的，客户端可能直接消失、永远不发结束信号，
+    /// 只能靠「多久没收到这个 session 的包」来决定何时关 socket。
+    last_active: Instant,
 }
 
 /// 服务端单条流的状态
@@ -105,6 +131,26 @@ impl Default for ServerStream {
     }
 }
 
+/// 收到 SYN 之后的临时状态，等 QUIC 首包到达时才用得上。
+///
+/// 三样信息必须一起存：
+/// - `peer_isn`：回 SYN-ACK 的 ack 号；
+/// - `our_isn`：SYN-ACK 的 seq，ServerHello 必须紧接着它；
+/// - `ts`：SYN-ACK 用的 TSval。后续 ServerHello 和数据包的 TSval
+///   都必须 **大于等于** 它，否则时间戳类 DPI 一眼就能看出回退
+///   （真实 TCP 的 TSval 基于全局时钟，永不回退）。
+///
+/// 之前这三样散在两个 map 里，且握手包的 TSval 是各发一次随机数，
+/// 连接建的 TcpClock 又取另一个随机基准——于是「SYN-ACK 的 TSval 可能是
+/// 0x8f3a...，第一个数据包的 TSval 是 0x1c2b...」，回退概率约 50%。
+struct SynState {
+    peer_isn: u32,
+    our_isn: u32,
+    ts: u32,
+    /// 收到 SYN 的时刻，用于超时清理
+    at: Instant,
+}
+
 /// 服务端单条 QUIC 连接
 struct ServerConn {
     conn: Connection,
@@ -130,6 +176,9 @@ struct ServerConn {
     /// 纯 ACK / FIN 的复用发送缓冲（热路径数据包走 PacketBatch，不用这个）
     ctrl_buf: Vec<u8>,
     streams: HashMap<StreamId, ServerStream>,
+    /// UDP 会话表：session id → 出站 socket 任务。
+    /// 键由客户端分配，作用域是这条连接；重连后客户端会重建，服务端表清空即可。
+    udp: HashMap<u32, UdpSession>,
 }
 
 /// 服务端入口。
@@ -258,10 +307,10 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
     let obfs = Obfs::new(&cfg.password);
     let magic = cfg.faketcp.ip_id_magic;
     let mut conns: HashMap<ConnectionHandle, ServerConn> = HashMap::new();
-    // 记录每个客户端 SYN 的 ISN，以及我们回复的 SYN-ACK ISN。
-    // 标准握手要求：收到 SYN 就立即回 SYN-ACK，客户端回 ACK 后才会发数据。
-    let mut syn_seqs: HashMap<SocketAddr, u32> = HashMap::new();
-    let mut syn_isns: HashMap<SocketAddr, u32> = HashMap::new();
+    // 记录每个客户端 SYN 的状态（ISN / TSval），等 QUIC 首包到达时复用。
+    // 没有超时清理的版本会永久残留（掉线、探测、攻击都会留下条目），
+    // 因此主循环里按 60 秒回收。
+    let mut syn_pending: HashMap<SocketAddr, SynState> = HashMap::new();
     // 有界动作队列：按 quic-go 的「阻塞写」模型做背压。
     // 目标读到数据后要等队列有空位才能继续读，队列满 → 目标 TCP 接收缓冲满
     // → 目标发送变慢。这样下行数据不会在 pending 里无限堆积。
@@ -298,6 +347,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                     lost = s.path.lost_packets,
                     mtu = s.path.current_mtu,
                     streams = c.streams.len(),
+                    udp_sessions = c.udp.len(),
                     pending,
                     "服务端 QUIC 路径统计"
                 );
@@ -380,8 +430,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                         &mut endpoint,
                         &server_quic,
                         &mut conns,
-                        &mut syn_seqs,
-                        &mut syn_isns,
+                        &mut syn_pending,
                         &raw,
                         dst_ip,
                         port,
@@ -449,7 +498,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
             let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
             let window = advertised_window(unread);
             drain_transmits(c, &raw, port, &obfs, &mut send_batch, &mut scratch, window);
-            drain_events(c, &action_tx, pending_high_water);
+            drain_events(c, &action_tx, pending_high_water, &cfg.udp);
         }
         // 清理已双向结束的流：之前从不删除，长时间跑高并发（直播/测速）会一直累积，
         // 每条流的 pending / target_buf 都占用内存，最终拖慢整个事件循环。
@@ -462,6 +511,45 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                         Instant::now().duration_since(s.last_active) > Duration::from_secs(300);
                     !(done || idle)
                 });
+            // UDP 会话回收：UDP 无连接，只能靠「多久没收到包」判断死活。
+            // 移除后 `to_target` 被 drop，出站任务的 `rx.recv()` 立刻返回 None
+            // 并退出，socket 随之关闭——不需要额外的取消信号。
+            let udp_idle = Duration::from_secs(cfg.udp.timeout_secs.max(10));
+            let now = Instant::now();
+            // 先收集再删除：日志里要带上目标地址，方便排查「为什么这个会话被回收了」
+            let expired: Vec<(u32, String)> = c
+                .udp
+                .iter()
+                .filter(|(_, s)| now.duration_since(s.last_active) >= udp_idle)
+                .map(|(id, s)| (*id, s.target.clone()))
+                .collect();
+            for (id, target) in expired {
+                c.udp.remove(&id);
+                tracing::debug!(
+                    client = %c.client,
+                    session = id,
+                    %target,
+                    idle_secs = cfg.udp.timeout_secs,
+                    "UDP 会话空闲超时回收"
+                );
+            }
+        }
+        // SYN 表超时清理：客户端发了 SYN 但 QUIC 首包始终没到达
+        //（掉线、扫描器也带魔数、或客户端进程被杀），条目会永久残留。
+        // 60 秒足够覆盖正常握手（1 个 RTT），超时后按普通丢包处理。
+        {
+            let now_syn = Instant::now();
+            let before = syn_pending.len();
+            syn_pending.retain(|_, s| {
+                now_syn.duration_since(s.at) < Duration::from_secs(60)
+            });
+            if syn_pending.len() != before {
+                tracing::debug!(
+                    expired = before - syn_pending.len(),
+                    alive = syn_pending.len(),
+                    "SYN 表超时清理"
+                );
+            }
         }
         // 连接完全关闭后清理。先补一个 FIN，让拆除过程像真实 TCP。
         for c in conns.values_mut() {
@@ -483,8 +571,7 @@ fn handle_packet(
     endpoint: &mut Endpoint,
     server_cfg: &Arc<ServerConfig>,
     conns: &mut HashMap<ConnectionHandle, ServerConn>,
-    syn_seqs: &mut HashMap<SocketAddr, u32>,
-    syn_isns: &mut HashMap<SocketAddr, u32>,
+    syn_pending: &mut HashMap<SocketAddr, SynState>,
     raw: &Arc<RawSocket>,
     local_ip: std::net::Ipv4Addr,
     port: u16,
@@ -510,14 +597,38 @@ fn handle_packet(
     // 之前用 wscale=12，但伪装改造后 wscale 必须改成真实的 9，
     // 那时 wscale 就无法再区分伪包和真实 TLS 客户端了（真实 Linux 也是 9）。
     if (ip_id & mark) == mark && flags & TCP_SYN != 0 && payload.is_empty() {
-        let isn: u32 = rand::thread_rng().gen();
-        syn_seqs.insert(client, seq);
-        syn_isns.insert(client, isn);
+        // 重复 SYN（客户端重传）：复用原来的 ISN 和 TSval。
+        //
+        // 真实 TCP 栈对重传的 SYN 回**一模一样**的 SYN-ACK（ISN 不变），
+        // 客户端才能用同一个 ACK 完成握手。
+        // 如果每次都给新 ISN，客户端先收到旧 SYN-ACK、再收到新 SYN-ACK 时，
+        // peer_seq 会被两个不同的 seq 来回拉扯，ServerHello 的序号
+        // 与握手包不连续，抓包一看就是伪造。
+        // 10 秒内视为同一次握手尝试，超过就当新连接。
+        let (isn, tsval) = match syn_pending.get(&client) {
+            Some(s) if s.at.elapsed() < Duration::from_secs(10) => {
+                tracing::debug!(%client, "收到重复 SYN，复用原 ISN 回 SYN-ACK");
+                (s.our_isn, s.ts)
+            }
+            _ => {
+                let isn: u32 = rand::thread_rng().gen();
+                // TSval 只生成一次，握手后续的 ServerHello 和数据包都以它为基准，
+                // 保证同一条连接内 TSval 单调不减（真实 TCP 的 PAWS 依赖这一点）。
+                (isn, rand::thread_rng().gen::<u32>())
+            }
+        };
+        syn_pending.insert(
+            client,
+            SynState {
+                peer_isn: seq,
+                our_isn: isn,
+                ts: tsval,
+                at: Instant::now(),
+            },
+        );
         if let std::net::IpAddr::V4(dst_ip) = client.ip() {
             // SYN-ACK 的选项与真实 Linux 逐字节一致（MSS/SACK/TS/NOP/wscale 9）。
-            // TSval 用当前时刻的随机基准（真实栈也是随机偏移），
             // TSecr 回显客户端 SYN 里的 TSval（RFC 7323 要求）。
-            let tsval: u32 = rand::thread_rng().gen();
             let opts = syn_options(tsval, tsval_in.unwrap_or(0));
             let seg = TcpSeg {
                 seq: isn,
@@ -580,25 +691,36 @@ fn handle_packet(
                     Ok((ch, conn)) => {
                         // 用客户端 SYN 的 ISN 回 SYN-ACK，再把伪 ServerHello 按连续 seq 发出。
                         // 标准握手模式下 SYN-ACK 已经在收到 SYN 时发过，这里只补 ServerHello，
-                        // 复用当时的 ISN，保证客户端看到的序列号完全连续。
-                        let peer_isn = syn_seqs.get(&client).copied().unwrap_or(0);
-                        let (isn, synack_sent) = match syn_isns.get(&client).copied() {
-                            Some(v) => (v, true),
-                            None => (rand::thread_rng().gen(), false),
+                        // 复用当时的 ISN 与 TSval，保证客户端看到的序列号和时间戳都连续。
+                        let (peer_isn, isn, ts0, synack_sent) = match syn_pending.remove(&client) {
+                            Some(s) => (s.peer_isn, s.our_isn, s.ts, true),
+                            // 没走过标准握手（handshake=none 或旧客户端）：全部现取随机值
+                            None => (
+                                0,
+                                rand::thread_rng().gen(),
+                                rand::thread_rng().gen(),
+                                false,
+                            ),
                         };
+                        // ServerHello 实际发出去的长度，决定后续数据的起始 seq。
+                        // **必须用实际缓冲的长度**：`build_server_hello()` 的
+                        // 加密段落是 512~703 的随机长度，再调一次拿到的长度和
+                        // 刚才发出去的不一样，`data_seq` 就会偏掉 0~191 字节。
+                        // 后果是对端/中间盒看到的 TCP 序号与字节流对不上
+                        // （ack 与上一包的 seq+len 不衔接），是明确可检测的特征。
+                        let mut hello_len = 0u32;
                         if let std::net::IpAddr::V4(dst_ip) = client.ip() {
-                            // 兼容没走标准握手的旧客户端：没记录过 ISN 就补发 SYN-ACK。
+                            // 兼容没走标准握手的客户端：没记录过 ISN 就补发 SYN-ACK。
                             // 选项同样使用真实 Linux 形态（含时间戳、wscale 9）。
                             if !synack_sent {
-                                let tv: u32 = rand::thread_rng().gen();
-                                let opts = syn_options(tv, tsval_in.unwrap_or(0));
+                                let opts = syn_options(ts0, tsval_in.unwrap_or(0));
                                 let seg = TcpSeg {
                                     seq: isn,
                                     ack: peer_isn.wrapping_add(1),
                                     flags: TCP_SYN | TCP_ACK,
                                     ip_id: random_ipid(mark),
                                     window: 65535,
-                                    tsval: tv,
+                                    tsval: ts0,
                                     tsecr: tsval_in.unwrap_or(0),
                                     options: &opts,
                                     payload: &[],
@@ -614,7 +736,8 @@ fn handle_packet(
                                 flags: TCP_PSH | TCP_ACK,
                                 ip_id: random_ipid(mark),
                                 window: advertised_window(0),
-                                tsval: rand::thread_rng().gen(),
+                                // 比 SYN-ACK 大 1，单调
+                                tsval: ts0.wrapping_add(1),
                                 tsecr: tsval_in.unwrap_or(0),
                                 options: &[],
                                 payload: &hello,
@@ -622,13 +745,14 @@ fn handle_packet(
                             let hello_pkt =
                                 build_packet(local_ip, dst_ip, port, client.port(), &seg);
                             let _ = raw.send(&hello_pkt, dst_ip);
-                            tracing::debug!(%client, %peer_isn, "已发送 ServerHello");
+                            hello_len = hello.len() as u32;
+                            tracing::debug!(%client, %peer_isn, hello_len, "已发送 ServerHello");
                         }
-                        // 握手状态只用于建连，清理掉避免泄漏
-                        syn_seqs.remove(&client);
-                        syn_isns.remove(&client);
-                        let hello_len = build_server_hello().len() as u32;
                         let data_seq = isn.wrapping_add(1).wrapping_add(hello_len);
+                        // 起始序号之后，数据包的 TSval 从 ts0+2 起算（比 ServerHello 大 1），
+                        // 并立即记下客户端最近的 TSval，避免首个数据包回显 TSecr=0。
+                        let mut clock = TcpClock::new_at(ts0.wrapping_add(2));
+                        clock.observe(tsval_in);
                         conns.insert(
                             ch,
                             ServerConn {
@@ -641,11 +765,12 @@ fn handle_packet(
                                 // 服务端自己的 IP ID 序列，与客户端的独立
                                 ip_id: random_ipid(mark),
                                 mark,
-                                clock: TcpClock::new(),
+                                clock,
                                 ack_pending: 0,
                                 last_ack: Instant::now(),
                                 ctrl_buf: Vec::with_capacity(256),
                                 streams: HashMap::new(),
+                                udp: HashMap::new(),
                             },
                         );
                         tracing::info!(%client, "新的 QUIC 连接");
@@ -695,6 +820,10 @@ fn handle_packet(
 }
 
 /// 找到指定客户端地址对应的连接句柄。
+///
+/// **故意不做「找不到就退回第一个连接」的容错**：
+/// 那样会把一个 stateless reset / Retry 用错误的 seq 发给无关的客户端，
+/// 既无意义，又会在抓包里制造看不懂的包。找不到就不发。
 fn find_by_client(
     conns: &HashMap<ConnectionHandle, ServerConn>,
     client: SocketAddr,
@@ -703,7 +832,6 @@ fn find_by_client(
         .iter()
         .find(|(_, c)| c.client == client)
         .map(|(ch, _)| *ch)
-        .or_else(|| conns.keys().next().copied())
 }
 
 impl ServerConn {
@@ -914,7 +1042,12 @@ fn drain_events(
     c: &mut ServerConn,
     action_tx: &mpsc::Sender<ServerAction>,
     pending_high_water: usize,
+    udp_cfg: &crate::config::UdpFile,
 ) {
+    // 先把 QUIC DATAGRAM 队列排空（UDP 上行）。
+    // 必须每轮都读：quinn 的接收缓冲有限，不读就一直是满的，
+    // 后面的 datagram 会被静默丢弃。空闲时 `recv()` 立刻返回 None，开销可忽略。
+    handle_udp_datagrams(c, action_tx, udp_cfg);
     // 先无条件 accept 所有新流：Readable 可能先于 Opened 事件到达，
     // 不先建表会丢掉第一个数据包（也就是目标地址帧）
     while let Some(id) = c.conn.streams().accept(Dir::Bi) {
@@ -1101,6 +1234,209 @@ fn read_stream(
 }
 
 /// 背压高水位由配置文件 net.max_cwnd 推导（见 run 里的 pending_high_water）。
+
+/// 处理 QUIC DATAGRAM（UDP 上行）。
+///
+/// 线上格式与 hysteria2 一致：
+/// `[session u32][addrLen u16][ATYP][ADDR][PORT][payload]`
+/// 每个包都带目标地址，所以服务端**不需要**任何跨连接的会话恢复逻辑：
+/// 客户端重连后服务端是新连接、会话表是空的，第一个带地址的包就能重建会话。
+///
+/// 全程不做背压：`try_send` 失败就丢包，符合 UDP 语义。
+fn handle_udp_datagrams(
+    c: &mut ServerConn,
+    action_tx: &mpsc::Sender<ServerAction>,
+    udp_cfg: &crate::config::UdpFile,
+) {
+    if !udp_cfg.enabled {
+        // 关闭时也必须读空队列，否则 quinn 的接收缓冲一直是满的
+        while c.conn.datagrams().recv().is_some() {}
+        return;
+    }
+    loop {
+        let Some(pkt) = c.conn.datagrams().recv() else {
+            break;
+        };
+        let Some((session, target, payload)) = udp::parse_client(&pkt) else {
+            continue;
+        };
+
+        // 已有会话：直接投给出站任务
+        if let Some(st) = c.udp.get_mut(&session) {
+            let send_result = st.to_target.try_send(payload.to_vec());
+            // 只有真正投递成功才刷新活跃时间。
+            // 之前在 try_send 之前就刷新，导致「出站任务已退出」的死会话
+            // 被源源不断的上行包一直续命，永远不会被空闲超时回收——
+            // 实测向一个不可达目标持续发包时 udp_sessions 永远停在 1，
+            // 客户端那条 (peer, target) 就成了永久黑洞。
+            if send_result.is_ok() {
+                st.last_active = Instant::now();
+            }
+            // 借用到这里结束，下面可能要删条目
+            match send_result {
+                Ok(()) => tracing::debug!(
+                    client = %c.client,
+                    session,
+                    bytes = payload.len(),
+                    "UDP 上行 → 已有会话"
+                ),
+                // 通道关闭 = 出站任务已退出（目标解析失败 / ICMP 不可达 /
+                // socket 绑定失败）。必须删掉条目，让下一个包重新建会话，
+                // 否则这条会话永远发不出去。
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    c.udp.remove(&session);
+                    tracing::debug!(
+                        client = %c.client,
+                        session,
+                        "UDP 出站任务已退出，删除会话（下个包重建）"
+                    );
+                }
+                // 通道满 = 目标侧发得太慢或主循环跟不上，按 UDP 语义丢这个包，
+                // 但会话本身是健康的，保留。
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!(session, "UDP 上行队列满，丢弃")
+                }
+            }
+            continue;
+        }
+
+        // 新会话：受 max_sessions 限制，防止单个客户端耗尽文件描述符
+        if c.udp.len() >= udp_cfg.max_sessions {
+            tracing::trace!(
+                client = %c.client,
+                session,
+                limit = udp_cfg.max_sessions,
+                "UDP 会话数已达上限，丢弃新会话"
+            );
+            continue;
+        }
+        let Some((host, port)) = decode_target(target) else {
+            continue;
+        };
+
+        // 容量 64：约 64 个包（~80KB）的抖动余量。
+        // 它就是「服务端允许为一个会话积压多少」，满了直接丢。
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        // 第一个包不能丢：先塞进通道再 spawn，保证建会话的第一个请求能到目标
+        let first = payload.to_vec();
+        if tx.try_send(first).is_err() {
+            continue;
+        }
+        tracing::debug!(client = %c.client, session, %host, port, "新建 UDP 会话");
+        tokio::spawn(udp_outbound(
+            c.ch,
+            session,
+            host.clone(),
+            port,
+            rx,
+            action_tx.clone(),
+        ));
+        c.udp.insert(
+            session,
+            UdpSession {
+                to_target: tx,
+                target: format!("{host}:{port}"),
+                last_active: Instant::now(),
+            },
+        );
+    }
+}
+
+/// 一个 UDP 会话的收发任务。
+///
+/// 一个任务同时管两个方向：`select!` 让上行和下行都及时，
+/// 会话结束时（主循环 drop 掉 `to_target`）`rx.recv()` 返回 None 立刻退出。
+///
+/// 与 TCP 出站任务的差别：
+/// - 没有 `pending` / 水位 / 背压，读写都是「尽力而为」；
+/// - 任何失败（目标不可达、发送缓冲满）都只是丢包，不结束整条连接。
+async fn udp_outbound(
+    ch: ConnectionHandle,
+    session: u32,
+    host: String,
+    port: u16,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    action_tx: mpsc::Sender<ServerAction>,
+) {
+    // 解析目标：域名走系统解析器。失败就直接返回，主循环那边
+    // 会在下一次超时回收时把这个 session 清掉（后续包也会因为通道关闭被丢）。
+    let Ok(mut addrs) = tokio::net::lookup_host((host.as_str(), port)).await else {
+        tracing::debug!(%host, port, "UDP 目标解析失败");
+        return;
+    };
+    let Some(dst) = addrs.next() else {
+        tracing::debug!(%host, port, "UDP 目标无可用地址");
+        return;
+    };
+
+    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "UDP socket 绑定失败");
+            return;
+        }
+    };
+    // connect 之后内核只会把该目标发来的包交给我们，
+    // 天然防住「任意源地址注入」；send 也不需要每次指定地址。
+    if let Err(e) = sock.connect(dst).await {
+        tracing::debug!(%dst, error = %e, "UDP connect 失败");
+        return;
+    }
+    tracing::debug!(session, %dst, "UDP 会话已建立");
+
+    let mut buf = vec![0u8; 65536];
+    // 回程帧缓冲复用，稳态零分配
+    let mut out = Vec::with_capacity(2048);
+    loop {
+        tokio::select! {
+            // 上行：主循环 → 目标
+            maybe = rx.recv() => {
+                match maybe {
+                    // 主循环已经把这个会话回收/丢弃
+                    None => break,
+                    Some(d) => {
+                        // 这里必须用 `send().await`，不能用 `try_send`。
+                        // tokio 的 `UdpSocket::try_send` 依赖 socket 的可写就绪状态，
+                        // 刚创建/刚 connect 的 socket 在 reactor 里还没被 poll 过，
+                        // 会直接返回 WouldBlock —— 结果就是「会话建好了，第一个包
+                        // （也就是 DNS 查询本身）被静默丢掉」，表现为 UDP 100% 收不到回程。
+                        // UDP 的 sendto 在正常情况下不会阻塞，真要阻塞时短暂等一下
+                        // 也比丢包好；失败就直接丢（UDP 不重传）。
+                        match sock.send(&d).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!(session, error = %e, "UDP 发往目标失败，丢弃");
+                            }
+                        }
+                    }
+                }
+            }
+            // 下行：目标 → 主循环
+            r = sock.recv(&mut buf) => {
+                match r {
+                    Ok(n) => {
+                        udp::encode_server(session, &buf[..n], &mut out);
+                        // try_send：主循环跟不上就丢包，绝不阻塞这个任务
+                        match action_tx.try_send(ServerAction::Datagram(ch, out.clone())) {
+                            Ok(()) => tracing::debug!(
+                                session,
+                                bytes = n,
+                                "UDP 下行 → 主循环"
+                            ),
+                            Err(_) => tracing::debug!(session, "UDP 回程队列满，丢弃"),
+                        }
+                    }
+                    // ICMP 不可达之类的错误：会话已经没有意义，退出
+                    Err(e) => {
+                        tracing::debug!(session, error = %e, "UDP 接收失败，会话结束");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    tracing::debug!(session, "UDP 会话任务退出");
+}
 
 /// 彻底抛弃一条流：清空 pending、断开与出站任务的联系、给对端发 RESET。
 /// 必须在不使用 streams 借用的作用域里调用。
@@ -1297,7 +1633,108 @@ fn handle_action(
             }
             flush_pending(c, id);
         }
+        ServerAction::Datagram(ch, pkt) => {
+            let Some(c) = conns.get_mut(&ch) else {
+                tracing::debug!("UDP 回程连接已失效，丢弃");
+                return;
+            };
+            // drop=true：发送缓冲满就丢最旧的排队包。
+            // UDP 没有重传，保住新包比留住旧包有意义（实时流的共识）。
+            match c.conn.datagrams().send(pkt.into(), true) {
+                Ok(()) => tracing::debug!(
+                    client = %c.client,
+                    "UDP 回程已交给 QUIC"
+                ),
+                // TooLarge 是常态：目标的 UDP 响应可能远大于 MTU，
+                // 按 UDP 语义直接丢弃，不做应用层分片（与 hysteria2 一致）。
+                Err(e) => tracing::debug!(
+                    client = %c.client,
+                    error = %e,
+                    "服务端 datagram 发送失败，丢弃"
+                ),
+            }
+        }
     }
+}
+
+/// 连接目标 TCP。
+///
+/// **不缓存任何东西**：每次请求都现解析，和改造前的语义完全一致。
+///
+/// 唯一的变化是「多个地址怎么试」。tokio 的 `TcpStream::connect(&addr)` 对解析出
+/// 多个地址的域名是**顺序重试**的：头一个地址不可达就要等它自己超时
+/// （内核 SYN 重传 3~21 秒）才会试下一个。
+/// `www.gstatic.com` / `www.youtube.com` 实测解析出 16 个地址，
+/// 只要头一个当时不通，这条请求就会卡几百毫秒到几秒。
+/// 这里是改成**并发连所有地址、取最先成功的那个**（Happy Eyeballs 的思路），
+/// 不涉及任何缓存或复用，只是不再排队等超时。
+async fn connect_target(host: &str, port: u16) -> std::io::Result<(TcpStream, usize)> {
+    /// 并发尝试的地址上限：再多只是白占 fd，对降低延迟没有帮助
+    const MAX_PARALLEL: usize = 4;
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // 已经是 IP 就直接连，跳过解析
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let t = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((ip, port)))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "连接目标超时")
+            })??;
+        return Ok((t, 1));
+    }
+
+    // 域名：现解析（不缓存），拿到全部地址
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), format!("解析 {host} 失败: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{host} 没有可用地址"),
+        ));
+    }
+    let n = addrs.len();
+
+    // 单个地址：直接连，省掉 spawn 的开销
+    if n == 1 {
+        let t = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addrs[0]))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "连接目标超时")
+            })??;
+        return Ok((t, n));
+    }
+
+    // 多地址：并发连，谁先成功用谁。
+    // JoinSet 在 drop 时会 abort 掉其余任务，所以没成功的连接会被立刻取消，
+    // 不会泄漏 fd，也不会在后台继续做无用的 SYN 重传。
+    let mut set = tokio::task::JoinSet::new();
+    for a in addrs.iter().take(MAX_PARALLEL) {
+        let a = *a;
+        set.spawn(async move {
+            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(a)).await
+        });
+    }
+    let mut last_err: Option<std::io::Error> = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(Ok(t))) => return Ok((t, n)),
+            Ok(Ok(Err(e))) => last_err = Some(e),
+            Ok(Err(_)) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "连接目标超时",
+                ))
+            }
+            Err(e) => {
+                last_err = Some(std::io::Error::other(format!("连接任务失败: {e}")))
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("所有目标地址都连接失败")
+    }))
 }
 
 /// 出站任务：连接目标，双向搬运数据。
@@ -1316,15 +1753,27 @@ async fn outbound(
     high_water: usize,
 ) {
     let addr = format!("{host}:{port}");
-    let tcp = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            tracing::debug!(%addr, error = %e, "出站连接失败");
-            let _ = action_tx.send(ServerAction::Fin(ch, id)).await;
-            return;
+    let t_conn = Instant::now();
+    let tcp = match connect_target(&host, port).await {
+        Ok((t, naddr)) => {
+            // 出站连接耗时是延迟抖动的主要来源之一，记在 debug 里方便排查。
+            // 「隧道本身很快但某些站点慢」这类问题，第一件事就是看这里：
+            // 域名解析（服务端做）+ 目标 TCP 握手都在这一段。
+            tracing::debug!(
+                %addr,
+                connect_ms = t_conn.elapsed().as_millis() as u64,
+                addrs = naddr,
+                "出站连接完成"
+            );
+            t
         }
-        Err(_) => {
-            tracing::debug!(%addr, "出站连接超时");
+        Err(e) => {
+            tracing::debug!(
+                %addr,
+                error = %e,
+                connect_ms = t_conn.elapsed().as_millis() as u64,
+                "出站连接失败"
+            );
             let _ = action_tx.send(ServerAction::Fin(ch, id)).await;
             return;
         }

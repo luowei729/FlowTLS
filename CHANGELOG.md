@@ -1,5 +1,290 @@
 # CHANGELOG
 
+## 2026-11-13 00:15 (北京时间)
+
+### 版本收敛：两端统一到最新版，清理全部旧版本残留
+
+用户要求「确保服务器和客户端都是新版本，清理老版本防止混乱」。
+
+**发现并修复两个真实问题**：
+
+1. **客户端带着实验残留环境变量**
+   1080 端口的进程（PID 1510553）二进制确实是新版，但继承了我昨晚做
+   DATAGRAM 单变量 A/B 实验时的 `FLOWTLS_NO_DATAGRAM=1`。
+   这会让客户端不通告 `max_datagram_frame_size` → **UDP 转发完全失效**。
+   排查方法：
+
+   ```bash
+   tr '\0' '\n' < /proc/$(pgrep -x flowtls)/environ | grep FLOWTLS
+   ```
+
+   已用干净环境重启，UDP 恢复（20/20 通过）。
+
+2. **服务端配置漂移（max_cwnd 2MB vs 8MB）**
+   昨晚 A/B 实验时把本地配置 sed 成 2097152 并 scp 到服务器，
+   之后本地回退了却**忘记同步回服务器**。
+   而实验已经证明 2MB 比 8MB 差（p50 209→303ms，cwnd 被压到 85~266KB，
+   低于 BDP 934KB）。已重新同步并重启，`win_cap=8388608` 确认生效。
+
+**清理清单**：
+
+| 位置 | 清理前 | 清理后 |
+|---|---|---|
+| 服务端 `flowtls.bak.*` | 25 个（128MB） | **1 个**（`bak.last` 回滚点） |
+| 本地 `target/` | 2.1GB（debug 1.3G + release 610M + musl 277M） | **8.3MB**（仅留 musl 二进制） |
+| 本地实验残留 | `/tmp/flowtls.old`、`deploy/*-old.yaml` | 已删除 |
+| git worktree | `/tmp/ft-old` | 已 remove |
+
+**验证可复现构建**：删掉 `deps`/`build` 后重新编译，产物 md5
+`aea07ada761cf9d80a518ba25bba7e07` 与运行中进程完全一致。
+
+**最终状态**：
+
+| 项 | 客户端 | 服务端 |
+|---|---|---|
+| 二进制 md5 | `aea07ad`（x86_64-musl） | `907bd10`（aarch64） |
+| 源码 md5 | `dc20626` | `dc20626`（一致） |
+| 环境变量 | 干净 | 干净 |
+| `max_cwnd` | 8388608 | 8388608（已修正） |
+| 进程数 | 1 | 1 |
+
+实测：UDP 20/20 通过，纯隧道 80/81/82ms（= 1 个 RTT，理论最优）。
+
+**教训**（写进 DEVTIPS 53）：实验用的环境变量和配置**必须记录并在实验后清理**。
+`FLOWTLS_NO_DATAGRAM=1` 这种开关一旦忘了撤销，功能会静默失效
+（UDP 不通但不报错），比崩溃更难发现。
+
+## 2026-11-12 23:40 (北京时间)
+
+### 延迟排查：用旧版本二进制做对照实验，结论是「没有回归」
+
+用户反馈「改完后延迟几百 ms，之前基本 100 左右」。用 git 里的旧版本
+（`d887793`，17:13 那版，即改动前的状态）编译出对照二进制，
+建独立通道（服务端 9443 + 客户端 44333/11080）与新版本并行对比。
+
+**最终结论：不存在性能回归。**
+
+| 测试项 | 结果 | 判定 |
+|---|---|---|
+| ICMP 链路（绕过代理） | 74.0 / 74.9 / 76.2，mdev 0.48 | 链路稳定 |
+| **纯隧道**（目标=服务端本机，无 DNS 无 TLS） | **min 81 / p50 81~82** | = 1 个 RTT，**理论最优** |
+| 204 HTTPS | min 170 / p50 172~174 | 2 RTT 是物理下限（153ms），接近最优 |
+| 旧版本纯隧道（同条件对照） | 78~79 | 差距 3ms，在噪声内 |
+
+**关键认知：204/HTTPS 的 200ms 不是性能问题，是物理下限。**
+
+```
+TLS 1.3 握手 = 1 RTT（ClientHello → ServerHello..Finished）
+HTTP 请求/响应 = 1 RTT
+合计 = 2 RTT = 153ms（RTT 76.6ms）
+```
+
+截图里 Google 203ms / YouTube 210ms 正是这个量级；GitHub 98ms 是因为
+检测工具复用了已建立的连接。**任何代理都无法把「新建 TLS 连接」做到 1 RTT。**
+
+**排查过程中排除了三个假设**（都有数据）：
+
+1. **不是窗口过大**：把 `max_cwnd` 从 8MB 降到 2MB（BDP 的 2.2 倍）后
+   p50 从 209ms 恶化到 303ms，cwnd 被压到 85~266KB（低于 BDP 934KB），
+   吞吐与延迟双输。已回退到 8MB。
+2. **不是目标连接耗时**：服务端实测 `connect_ms = 4~10`（`www.gstatic.com`
+   解析出 16 个地址），完全不是瓶颈。
+3. **不是 DATAGRAM 扩展**：加 `FLOWTLS_NO_DATAGRAM=1` 开关做单变量 A/B，
+   开/关都是 80~81ms。
+
+**真正的变量是链路丢包（晚高峰 15~20%）**：
+每丢一个包 = 多等 1 RTT = +76ms。一次 HTTPS 连接需要 2~3 个往返，
+按 15% 丢包算 `1-0.85^3 ≈ 39%` 的连接会踩到一次丢包，于是 p90 从 81ms
+跳到 246ms。**这是链路属性，不是代理实现问题。**
+
+**过程中自己制造的三个测量陷阱**（都写进 DEVTIPS 50）：
+
+1. 在**同一台 1 核服务器**上同时跑新旧两个服务端做对比 —— CPU 争抢污染结果。
+2. 用**已运行数小时的旧连接**测基线 —— cwnd 已被打崩到 4 个包，与刚重启的
+   干净连接不可比。
+3. 同时跑 4 个客户端进程 —— 每个都开 AF_PACKET 收全量包，互相干扰。
+
+**保留的两项改动**（有价值，不是实验残留）：
+
+- `connect_target()`：多地址域名改为**并发连接取最快**（Happy Eyeballs 思路）。
+  tokio 的 `TcpStream::connect(&str)` 对多地址是顺序重试，头一个地址不通
+  就要等内核 SYN 超时。**不做任何缓存**，语义与改动前一致。
+- `FLOWTLS_NO_DATAGRAM=1` 环境变量：临时关闭 DATAGRAM 扩展，用于二分排查。
+
+**新增 `docs/bench.sh`**：三层延迟体检（链路基线 / 纯隧道 / HTTPS），
+自带判定标准，可随时自己复测：
+
+```bash
+bash docs/bench.sh        # 20 次
+bash docs/bench.sh 50     # 更精确
+```
+
+## 2026-11-12 21:55 (北京时间)
+
+### 全量代码审查：修复 11 个缺陷（含 2 个实测复现的致命故障）
+
+对 7736 行代码逐文件审查，除静态阅读外还做了三次现场复现。
+按严重程度排序：
+
+**P0：客户端会永久卡死**
+
+1. **SYN 只发一次，且握手阶段没有超时兜底**。
+   严格 NAT 要求先完成三次握手，所以握手期间不发送任何 QUIC 包；
+   而 quinn 的 idle 定时器要等首次发包后才启动。
+   两者叠加 → SYN 或 SYN-ACK 丢一次就永久停在「已发送 SYN」，
+   不重传、不超时、不重连。**实测卡死 2 分 43 秒**（手工重启才恢复）。
+   修复：SYN 按 1/2/4/8 秒退避重传，15 秒未握手成功则放弃本次会话交给外层重连。
+   服务端配套：**对重传的 SYN 复用原 ISN + TSval**（与真实 TCP 一致），
+   否则客户端会收到两个不同 seq 的 SYN-ACK，序号被来回拉扯。
+
+**P1：协议外观破绽**
+
+2. **ServerHello 长度错位**：`build_server_hello()` 的加密段长度随机（512~703），
+   代码却**又调了一次**取长度去算 `data_seq`，后续所有 TCP 序号偏 0~191 字节。
+   中间盒看到 `seq` 与上一包 `seq+len` 不衔接 → 伪造特征。改用实际发送长度。
+3. **TSval 在握手阶段非单调**：SYN-ACK、ServerHello、数据包各取一个独立随机数，
+   约 50% 概率出现时间戳回退（RFC 7323 的 PAWS 明确禁止）。
+   且首个数据包 `TSecr=0`（客户端 SYN 的 TSval 明明已知）。
+   修复：`TcpClock::new_at()`，握手生成一次 TSval 贯穿全程，并立刻 observe 对端时间戳。
+4. **SNI 是裸 IP**：默认部署用 IP 连接，伪 ClientHello 就把 IP 填进 SNI，
+   违反 RFC 6066，任何 DPI 都能一眼命中。修复：SNI 是 IP 时省略该扩展
+   （与真实浏览器用 IP 直连的行为一致）。
+
+**P1：功能缺陷**
+
+5. **UDP 死会话永久黑洞**（实测复现）：出站任务退出后会话条目留在表里，
+   且 `last_active` 在 `try_send` **之前**刷新 —— 上行包不断给死会话续命，
+   空闲超时永不触发。向不可达目标持续发包时 `udp_sessions` 永停在 1，
+   客户端那条 `(peer, target)` 从此再也发不出去。修复：区分 `Closed`（删表）
+   和 `Full`（仅丢包），只在投递成功时刷新活跃时间。
+6. **重连后旧流收尾误杀新流**：stream id 由 quinn 按连接分配、重连从 0 重来；
+   `pipe_stream` 的收尾（`stop`）可能迟于重连（reader 卡在本地 `read` 上）。
+   一个迟到的 `Stop(0)` 会把新连接上刚建的同号流 RESET。
+   修复：动作带 epoch，跨代动作一律丢弃。
+7. **HTTP 普通请求路径缺 FIN/STOP**：双向都是「未完成」，流要等 5 分钟空闲回收，
+   服务端出站任务一直挂着 —— 资源泄漏。修复：发完请求补 `fin`，响应写完补 `stop`。
+8. **重连退避永不重置**：`backoff` 只增不减，跑满 60 秒后**永久停在 60**，
+   哪怕链路早就恢复正常。修复：会话活过 60 秒就把退避打回 5 秒。
+
+**P2：安全与健壮性**
+
+9. **SOCKS5 UDP relay 未校验来源**：relay socket 无认证（UDP 无连接），
+   同网段任何人都能在猜到端口后白嫖代理。修复：只接受与 TCP 控制连接同源 IP 的包。
+10. `find_by_client` 找不到连接时**回退到第一个连接**，会把 stateless reset
+    用错误的 seq 发给无关客户端。改为找不到就不发。
+11. 服务端 UDP 上行 `try_send` → `send().await`（见下条），
+    UDP 异常日志从 `trace` 提到 `debug`。
+
+**审查过程中自己引入又修掉的回归**（值得记一笔）：
+把 UDP 出站方向的 `sock.send().await` 改成 `try_send`（理由是「UDP 不该阻塞」），
+结果 UDP 成功率从 2/3 直接掉到 **0/6**。原因是 tokio 的 `UdpSocket::try_send`
+依赖 socket 在 reactor 里的可写就绪状态，刚 bind+connect 的 socket 直接返回
+`WouldBlock`，而那分支日志是 `trace` 级别 → 完全静默。
+"会话建好了、connect 成功了、日志全正常，但第一个包（DNS 查询本身）被丢掉"。
+
+**审查未改动的项**（已记录，收益递减）：
+
+- `handle_incoming` / `handle_packet` 每包 `Vec::with_capacity(2048)`、
+  `parse_records` 每包一个 Vec、`Obfs::open` 每记录一次分配 —— 热路径可复用缓冲。
+- 客户端 `blocked` 标志是全局的：一条流阻塞会暂停所有本地读取（保守但正确）。
+- `site` 模块对 POST 请求返回 405 后不读完请求体，连接会挂到 30 秒超时。
+
+**验证**：
+
+| 项目 | 结果 |
+|---|---|
+| 单元测试 | 20/20 通过，`cargo build` 零告警 |
+| UDP 端到端 | 5/5 轮通过（DNS 往返 / session 复用 / 不可达目标 / 控制连接关闭） |
+| UDP 会话回收 | `udp_sessions` 由 1 回到 0（修复前会挂满 120 秒） |
+| SYN 重传 | 实测首次 SYN-ACK 丢失，1 秒后重传成功（不再卡死） |
+| TCP 回归 | 204 = 0.41s，单流 60 Mbps（当前链路丢包 14%，属链路波动） |
+| 两端告警 | 服务端 0，客户端仅重连 WARN |
+
+新增 `docs/test_udp_recover.py`（会话回收验证）、`docs/test_udp_stale.py`。
+
+## 2026-11-12 21:05 (北京时间)
+
+### 新增 UDP 代理：QUIC DATAGRAM 承载，不重传不补发（对齐 hysteria2）
+
+之前完全没有 UDP 通路：SOCKS5 只认 `CONNECT`，服务端出站只有 `TcpStream::connect`，
+`TransportConfig` 也没开 RFC 9221 的 DATAGRAM 扩展。结果是 DNS 必须靠 TCP 回退、
+HTTP/3 用不了、语音/游戏/WireGuard 完全不通。
+
+**设计原则：完全参照 hysteria2 对 UDP 的处理——不做任何可靠性补偿。**
+
+| 方面 | 行为 |
+|---|---|
+| 传输 | QUIC DATAGRAM（RFC 9221），不可靠、不保序 |
+| 丢包 | 就是丢了，**不重传、不补发** |
+| 队列满 | `try_send` / `drop=true`，直接丢弃最新的或最旧的，**不背压** |
+| 超 MTU | 直接丢，**不做应用层分片** |
+| 会话回收 | 空闲超时（默认 120s），UDP 无连接只能靠超时 |
+
+**线上格式**（与 hysteria2 的 `ParseUDPPacket` 一致）：
+
+```text
+客户端 → 服务端：[session u32][addrLen u16][ATYP][ADDR][PORT][payload]
+服务端 → 客户端：[session u32][payload]
+```
+
+上行每包都带目标地址。多占 7~9 字节，换来服务端**完全无状态地重建会话**：
+客户端重连后服务端是新连接、会话表是空的，第一个带地址的包就能自愈，
+不需要任何会话迁移协议。
+
+**入口**：SOCKS5 `UDP ASSOCIATE`（RFC 1928 CMD=3），
+数据面在独立的 UDP socket 上跑 RFC 1928 的 `RSV|FRAG|ATYP|ADDR|PORT|payload` 帧。
+控制连接（TCP）只做保活：它一断，整个 relay 立刻结束并注销所有 session。
+
+**改动**：
+
+| 文件 | 内容 |
+|---|---|
+| `src/proxy/udp.rs`（新增 140 行） | 会话帧编解码 + 4 个单元测试 |
+| `src/proxy/mod.rs` | SOCKS5 UDP 头编解码（`parse_socks5_udp` / `build_socks5_udp`） |
+| `src/proxy/socks5.rs` | `CMD=3` 分支：bind UDP socket、session 表、上下行 select 循环 |
+| `src/quic/config.rs` | `datagram_receive_buffer_size(1MB)` + `datagram_send_buffer_size(1MB)` |
+| `src/client.rs` | `ProxyAction::Udp`、`udp_routes` 路由表、`drain_events` 收 datagram |
+| `src/server.rs` | `UdpSession` 表、`udp_outbound` 单任务双向 select、`ServerAction::Datagram` |
+| `src/config.rs` | `udp` 配置节（`enabled` / `max_sessions` / `timeout_secs`） |
+| `src/check.rs` | UDP 开关两端一致性、会话上限非 0、SOCKS5 入口提示 |
+| `docs/test_udp.py`（新增） | 端到端测试：DNS 往返、session 复用、不可达目标、控制连接关闭 |
+
+**实测**：
+
+| 项目 | 结果 |
+|---|---|
+| DNS 往返（8.8.8.8 / 1.1.1.1） | 61~64 字节响应，RTT ≈ 84ms |
+| 连续 20 个查询 | 18~20/20 收到（跨境链路 5~10% 丢包，UDP 不重传属正常） |
+| 6 轮完整测试 | 全通过 |
+| 不可达目标 | 静默超时，relay 不崩 |
+| 控制连接关闭 | relay 立即失效 |
+| TCP 回归 | 204 = 0.18s，单流下载 80~89 Mbps，无退化 |
+| 单元测试 | 20 个全过（新增 6 个） |
+
+**关键实现细节**：
+
+1. **服务端一个会话一个任务**：`udp_outbound` 用 `select!` 同时管上行（`rx.recv`）
+   和下行（`sock.recv`）。会话回收时主循环 `remove` 掉 `to_target`，
+   `rx.recv()` 立即返回 `None` → 任务退出 → socket 关闭。**不需要取消信号**。
+2. **客户端 session id 从随机值递增**：避免客户端重启后与残留会话撞车。
+3. **`drop=true` 而不是 `Blocked`**：quinn 的 `Datagram::send(data, drop)`，
+   传 `true` 时缓冲满会丢最旧的排队包。实时流里「新包比旧包值钱」，
+   而 UDP 本来就没有重传，留旧包毫无意义。
+4. **MTU 零影响**：datagram 是 QUIC 帧类型，走现有 `poll_transmit` 路径，
+   外层 FakeTCP/AEAD/批量发送一行都没改。单包上限由 `datagrams().max_size()`
+   每包检查（约 1200 字节），超了直接丢。
+
+**踩过的坑**（写进 DEVTIPS 44）：
+
+测试脚本一开始要求「20 个包零丢包」，结果每次都在第 12~13 轮卡 10 秒超时。
+误以为是实现 bug，查了半天服务端/客户端日志，最后发现是**跨境链路 5~10% 的
+真实丢包**——UDP 本来就不该要求不丢包。改成「先全发再按事务 ID 对账」后稳定通过。
+
+**另一个坑**：服务端重启后的 30 秒内跑测试必然失败。客户端要等 `idle_timeout`
+才发现断连并重连，这期间它还在往旧连接发 datagram，服务端 `conns` 里
+没有对应 `ConnectionHandle`，`ServerAction::Datagram` 的 `get_mut(&ch)`
+直接返回 None 丢弃。这不是 bug，是 QUIC 的正常收敛过程。
+
 ## 2026-11-12 17:13 (北京时间)
 
 ### 新增 `flowtls check` 子命令 + 窗口上限 4MB→8MB（单流 +25%）

@@ -174,7 +174,7 @@ where
             .await?;
 
         let target = encode_target(&host, port);
-        let Some((id, rx)) = client.open(target).await else {
+        let Some((epoch, id, rx)) = client.open(target).await else {
             return Ok(());
         };
         tracing::debug!(%peer, %host, port, "HTTP CONNECT 已打开流");
@@ -182,9 +182,9 @@ where
         let extra = buf[head_end..].to_vec();
         if !extra.is_empty() {
             // send 已改为 async + 有界队列，这里 await 让背压生效
-            client.send(id, extra).await;
+            client.send(epoch, id, extra).await;
         }
-        pipe_stream(s, id, rx, client).await;
+        pipe_stream(s, epoch, id, rx, client).await;
         return Ok(());
     }
 
@@ -222,10 +222,16 @@ where
     payload.extend_from_slice(&buf[head_end..]);
 
     let target = encode_target(&host, port);
-    let Some((id, rx)) = client.open(target).await else {
+    let Some((epoch, id, rx)) = client.open(target).await else {
         return Ok(());
     };
-    client.send(id, payload).await;
+    client.send(epoch, id, payload).await;
+    // 请求已经全部发出，必须补一个 FIN：
+    // 1. 服务端据此发出空 Vec，把目标 TCP 的写端 shutdown，
+    //    目标才会认为请求完整（有些服务端会一直等 body 结束）；
+    // 2. 不补 FIN 的话双向都「未完成」，流只能等 5 分钟空闲回收，
+    //    服务端的出站任务也会一直挂着，是实实在在的资源泄漏。
+    client.fin(epoch, id).await;
     // 请求体由上面的 payload 发出，这里不再从本地读，只把响应写回
     let mut r = s;
     let mut resp = rx;
@@ -238,6 +244,9 @@ where
         }
     }
     let _ = r.flush().await;
+    // 主动通知服务端释放这条流（本地响应写完后不再需要），
+    // 与 CONNECT 路径的 pipe_stream 保持同一套收尾语义。
+    client.stop(epoch, id).await;
     Ok(())
 }
 
