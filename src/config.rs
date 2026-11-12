@@ -45,8 +45,11 @@ pub struct FakeTcpFile {
     /// 用来标记「这是我们自己的 SYN」的 IP ID，避开内核协议栈
     #[serde(default = "default_magic")]
     pub ip_id_magic: u16,
-    /// symbolic：发裸 SYN 表演；none：不发 SYN（要求客户端有公网 IP）
+    /// symbolic：发裸 SYN 表演；none：不发 SYN（要求客户端有公网 IP）。
+    /// 服务端会读它（决定是否等三次握手），客户端也读，
+    /// 这里的 allow 只为兼容只跑服务端的场景下单边编译告警。
     #[serde(default = "default_handshake")]
+    #[allow(dead_code)]
     pub handshake: String,
     /// 服务端对外公网 IP。
     /// 云主机在 NAT 后面时，路由探测只能拿到内网地址（如 10.x），
@@ -56,7 +59,11 @@ pub struct FakeTcpFile {
 }
 
 fn default_magic() -> u16 {
-    0xF107
+    // 默认标记来自 `faketcp::packet::IPID_MARK`，避免两处各写一个魔数。
+    // 高字节是 iptables 的分流依据，低字节无实际用途（只影响初始 IP ID）。
+    // 部署时建议改成每台机器不同的值（例如按口令派生），
+    // 这样 DPI 无法用一条通用规则命中所有实例。
+    crate::faketcp::packet::IPID_MARK | 0x07
 }
 fn default_handshake() -> String {
     "symbolic".to_string()

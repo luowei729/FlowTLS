@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 use crate::config::{parse_listen, ServerFile};
 use crate::faketcp::codec::{build_server_hello, parse_records, Obfs, REC_APPDATA};
 use crate::faketcp::packet::{
-    build_packet, build_packet_into, build_packet_opts, parse_frame, SYN_OPTIONS, TCP_ACK,
-    TCP_PSH, TCP_SYN,
+    advertised_window, build_packet, build_packet_into, next_ipid, parse_frame, random_ipid,
+    seq_len, syn_options, TcpClock, TcpSeg, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
 };
 use crate::faketcp::socket::{PacketBatch, RawSocket};
 use crate::proxy::decode_target;
@@ -59,6 +59,12 @@ struct ServerStream {
     /// 实测表现就是单流下到 6~8MB 后 curl 报
     /// "transfer closed with ... bytes remaining to read"。
     write_blocked: Arc<std::sync::atomic::AtomicBool>,
+    /// 该流已被放弃（对端 STOP_SENDING / 我们主动 reset）。
+    /// 出站任务的读取协程必须能看到它并立即退出：
+    /// 只把 `to_tcp` 置 None 不够，那个协程等的是原子计数、不看 channel，
+    /// 会一直等到 30 秒兜底超时才放弃
+    /// （日志里「背压等待超过 30 秒，放弃该流」就是漏了这个信号）。
+    abandon: Arc<std::sync::atomic::AtomicBool>,
     /// 目标地址帧累积缓冲
     target_buf: Vec<u8>,
     /// 目标地址是否已经解析完毕
@@ -87,6 +93,7 @@ impl Default for ServerStream {
             pending_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             write_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            abandon: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             target_buf: Vec::new(),
             target_ready: false,
             local_finished: false,
@@ -110,8 +117,18 @@ struct ServerConn {
     seq: u32,
     /// 最近一次收到客户端的序列号
     peer_seq: u32,
-    /// 当前 IP ID：真实流量递增，固定值容易被 DPI 标记
+    /// IP ID 当前值：高字节是配置派生的分流标记，低字节递增
     ip_id: u16,
+    /// 分流标记高字节（来自 `faketcp.ip_id_magic`），每个部署不同
+    mark: u16,
+    /// TCP 时间戳时钟：数据包必须带 TS，且 TSecr 要回显客户端最近一次的 TSval
+    clock: TcpClock,
+    /// 待确认的数据段数（延迟确认用）
+    ack_pending: u32,
+    /// 上次发送纯 ACK 的时刻（40ms 兜底）
+    last_ack: Instant,
+    /// 纯 ACK / FIN 的复用发送缓冲（热路径数据包走 PacketBatch，不用这个）
+    ctrl_buf: Vec<u8>,
     streams: HashMap<StreamId, ServerStream>,
 }
 
@@ -166,7 +183,16 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
     // 超过后收包线程阻塞，由内核 socket 缓冲区兜底丢包（QUIC 会重传）。
     // 之前用 unbounded，高包速率下内存会无限上涨，且主循环每轮只处理一个包，
     // 队列越积越长，ACK 延迟拖到几秒，表现为「上传为 0、整条连接卡死」。
-    let (pkt_tx, mut pkt_rx) = mpsc::channel::<(u32, SocketAddr, std::net::Ipv4Addr, u16, u8, Option<u8>, Vec<u8>)>(8192);
+    let (pkt_tx, mut pkt_rx) = mpsc::channel::<(
+        u32,
+        SocketAddr,
+        std::net::Ipv4Addr,
+        u16,
+        u8,
+        Option<u8>,
+        Option<u32>,
+        Vec<u8>,
+    )>(8192);
     let raw_recv = raw.clone();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
@@ -189,6 +215,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                                 p.ip_id,
                                 p.flags,
                                 p.wscale,
+                                p.tsval,
                                 p.payload.to_vec(),
                             ))
                             .is_err()
@@ -331,8 +358,16 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                 let Some(first) = maybe else { break };
                 // 批量处理：除刚取到的包外，把队列里已到达的一起消化，
                 // 每轮最多 256 个。单包一轮在测速上传时会产生严重积压。
-                let mut batch: Vec<(u32, SocketAddr, std::net::Ipv4Addr, u16, u8, Option<u8>, Vec<u8>)> =
-                    Vec::with_capacity(256);
+                let mut batch: Vec<(
+                    u32,
+                    SocketAddr,
+                    std::net::Ipv4Addr,
+                    u16,
+                    u8,
+                    Option<u8>,
+                    Option<u32>,
+                    Vec<u8>,
+                )> = Vec::with_capacity(256);
                 batch.push(first);
                 while batch.len() < 256 {
                     match pkt_rx.try_recv() {
@@ -340,7 +375,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                         Err(_) => break,
                     }
                 }
-                for (seq, client, dst_ip, ip_id, flags, wscale, payload) in batch {
+                for (seq, client, dst_ip, ip_id, flags, wscale, tsval_in, payload) in batch {
                     handle_packet(
                         &mut endpoint,
                         &server_quic,
@@ -357,9 +392,27 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                         ip_id,
                         flags,
                         wscale,
+                        tsval_in,
                         &payload,
                         &action_tx,
                     );
+                }
+                // 反向纯 ACK：上传方向也要让中间盒看到正常的 TCP 确认流。
+                // 与客户端同一套延迟确认规则：累计 2 段立即确认，或超 40ms 兜底。
+                let ack_list: Vec<ConnectionHandle> = conns
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.ack_pending >= 2
+                            || (c.ack_pending > 0
+                                && c.last_ack.elapsed() >= Duration::from_millis(40))
+                    })
+                    .map(|(h, _)| *h)
+                    .collect();
+                for h in ack_list {
+                    if let Some(c) = conns.get_mut(&h) {
+                        let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
+                        c.send_pure_ack(&raw, port, advertised_window(unread));
+                    }
                 }
             }
             // 2. QUIC 定时器
@@ -392,7 +445,10 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
 
         // 每条连接都要把 QUIC 待发包排空，并处理事件
         for c in conns.values_mut() {
-            drain_transmits(c, &raw, port, &obfs, &mut send_batch, &mut scratch);
+            // 通告窗口按「待发字节数」动态计算，恒为 65535 是明显的伪造特征
+            let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
+            let window = advertised_window(unread);
+            drain_transmits(c, &raw, port, &obfs, &mut send_batch, &mut scratch, window);
             drain_events(c, &action_tx, pending_high_water);
         }
         // 清理已双向结束的流：之前从不删除，长时间跑高并发（直播/测速）会一直累积，
@@ -407,7 +463,13 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                     !(done || idle)
                 });
         }
-        // 连接完全关闭后清理
+        // 连接完全关闭后清理。先补一个 FIN，让拆除过程像真实 TCP。
+        for c in conns.values_mut() {
+            if c.conn.is_drained() {
+                let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
+                c.send_fin(&raw, port, advertised_window(unread));
+            }
+        }
         conns.retain(|_, c| !c.conn.is_drained());
     }
 
@@ -432,33 +494,44 @@ fn handle_packet(
     client: SocketAddr,
     ip_id: u16,
     flags: u8,
-    wscale: Option<u8>,
+    _wscale: Option<u8>,
+    tsval_in: Option<u32>,
     payload: &[u8],
     action_tx: &mpsc::Sender<ServerAction>,
 ) {
+    // 分流标记高字节：来自配置，与客户端一致
+    let mark = crate::faketcp::packet::ipid_mark(magic);
+
     // 纯 SYN：标准握手第一步，立即回 SYN-ACK。
     // 严格 NAT/状态防火墙只放行 SYN-ACK 之后的数据包，不回 SYN-ACK 的话
     // 客户端后续的 ClientHello 和 QUIC Initial 会被直接丢弃。
-    // 识别用 TCP 选项里的 wscale=12，不再用 IP ID：
-    // 实测客户端的 NAT 会把 IP ID 改写成 0x0000，魔数判断完全失效。
-    // 正常浏览器/扫描器的 SYN 的 wscale 是 8~9，不会误伤。
-    if wscale == Some(12) && flags & TCP_SYN != 0 && payload.is_empty() {
+    //
+    // 判别依据是 IP ID 高字节（配置派生的标记）。
+    // 之前用 wscale=12，但伪装改造后 wscale 必须改成真实的 9，
+    // 那时 wscale 就无法再区分伪包和真实 TLS 客户端了（真实 Linux 也是 9）。
+    if (ip_id & mark) == mark && flags & TCP_SYN != 0 && payload.is_empty() {
         let isn: u32 = rand::thread_rng().gen();
         syn_seqs.insert(client, seq);
         syn_isns.insert(client, isn);
         if let std::net::IpAddr::V4(dst_ip) = client.ip() {
-            let synack = build_packet_opts(
-                local_ip,
-                dst_ip,
-                port,
-                client.port(),
-                isn,
-                seq.wrapping_add(1),
-                TCP_SYN | TCP_ACK,
-                magic & 0xFF00,
-                SYN_OPTIONS,
-                &[],
-            );
+            // SYN-ACK 的选项与真实 Linux 逐字节一致（MSS/SACK/TS/NOP/wscale 9）。
+            // TSval 用当前时刻的随机基准（真实栈也是随机偏移），
+            // TSecr 回显客户端 SYN 里的 TSval（RFC 7323 要求）。
+            let tsval: u32 = rand::thread_rng().gen();
+            let opts = syn_options(tsval, tsval_in.unwrap_or(0));
+            let seg = TcpSeg {
+                seq: isn,
+                ack: seq.wrapping_add(1),
+                flags: TCP_SYN | TCP_ACK,
+                ip_id: random_ipid(mark),
+                // SYN-ACK 阶段同样用 65535（缩放因子在 ESTABLISHED 后才生效）
+                window: 65535,
+                tsval,
+                tsecr: tsval_in.unwrap_or(0),
+                options: &opts,
+                payload: &[],
+            };
+            let synack = build_packet(local_ip, dst_ip, port, client.port(), &seg);
             let _ = raw.send(&synack, dst_ip);
         }
         tracing::info!(%client, "标准握手：已回 SYN-ACK");
@@ -514,30 +587,48 @@ fn handle_packet(
                             None => (rand::thread_rng().gen(), false),
                         };
                         if let std::net::IpAddr::V4(dst_ip) = client.ip() {
-                            // 兼容没走标准握手的旧客户端：没记录过 ISN 就补发 SYN-ACK
+                            // 兼容没走标准握手的旧客户端：没记录过 ISN 就补发 SYN-ACK。
+                            // 选项同样使用真实 Linux 形态（含时间戳、wscale 9）。
                             if !synack_sent {
-                                let synack = build_packet_opts(
-                                    local_ip, dst_ip, port, client.port(), isn,
-                                    peer_isn.wrapping_add(1), TCP_SYN | TCP_ACK,
-                                    magic & 0xFF00, SYN_OPTIONS, &[],
-                                );
+                                let tv: u32 = rand::thread_rng().gen();
+                                let opts = syn_options(tv, tsval_in.unwrap_or(0));
+                                let seg = TcpSeg {
+                                    seq: isn,
+                                    ack: peer_isn.wrapping_add(1),
+                                    flags: TCP_SYN | TCP_ACK,
+                                    ip_id: random_ipid(mark),
+                                    window: 65535,
+                                    tsval: tv,
+                                    tsecr: tsval_in.unwrap_or(0),
+                                    options: &opts,
+                                    payload: &[],
+                                };
+                                let synack =
+                                    build_packet(local_ip, dst_ip, port, client.port(), &seg);
                                 let _ = raw.send(&synack, dst_ip);
                             }
                             let hello = build_server_hello();
-                            let hello_pkt = build_packet(
-                                local_ip, dst_ip, port, client.port(), isn.wrapping_add(1),
-                                peer_isn.wrapping_add(1), TCP_PSH | TCP_ACK,
-                                (magic & 0xFF00) | 1, &hello,
-                            );
+                            let seg = TcpSeg {
+                                seq: isn.wrapping_add(1),
+                                ack: peer_isn.wrapping_add(1),
+                                flags: TCP_PSH | TCP_ACK,
+                                ip_id: random_ipid(mark),
+                                window: advertised_window(0),
+                                tsval: rand::thread_rng().gen(),
+                                tsecr: tsval_in.unwrap_or(0),
+                                options: &[],
+                                payload: &hello,
+                            };
+                            let hello_pkt =
+                                build_packet(local_ip, dst_ip, port, client.port(), &seg);
                             let _ = raw.send(&hello_pkt, dst_ip);
                             tracing::debug!(%client, %peer_isn, "已发送 ServerHello");
                         }
                         // 握手状态只用于建连，清理掉避免泄漏
                         syn_seqs.remove(&client);
                         syn_isns.remove(&client);
-                        let data_seq = isn
-                            .wrapping_add(1)
-                            .wrapping_add(build_server_hello().len() as u32);
+                        let hello_len = build_server_hello().len() as u32;
+                        let data_seq = isn.wrapping_add(1).wrapping_add(hello_len);
                         conns.insert(
                             ch,
                             ServerConn {
@@ -547,7 +638,13 @@ fn handle_packet(
                                 local_ip,
                                 seq: data_seq,
                                 peer_seq: peer_isn.wrapping_add(1),
-                                ip_id: (magic & 0xFF00) | 2,
+                                // 服务端自己的 IP ID 序列，与客户端的独立
+                                ip_id: random_ipid(mark),
+                                mark,
+                                clock: TcpClock::new(),
+                                ack_pending: 0,
+                                last_ack: Instant::now(),
+                                ctrl_buf: Vec::with_capacity(256),
                                 streams: HashMap::new(),
                             },
                         );
@@ -558,10 +655,16 @@ fn handle_packet(
             }
             Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
                 if let Some(c) = conns.get_mut(&ch) {
-                    // ack 只增不减：乱序时回退的 ack 会被中间设备当成非法包
-                    let next = seq.wrapping_add(payload.len() as u32);
+                    // 记录客户端时间戳：所有回包的 TSecr 都要回显它
+                    c.clock.observe(tsval_in);
+                    // ack 只增不减：乱序时回退的 ack 会被中间设备当成非法包。
+                    // seq_len 会把 SYN/FIN 各算 1 个序号，与真实 TCP 一致。
+                    let next = seq.wrapping_add(seq_len(flags, payload.len()));
                     if next.wrapping_sub(c.peer_seq) < 0x8000_0000 {
                         c.peer_seq = next;
+                    }
+                    if !payload.is_empty() {
+                        c.ack_pending += 1;
                     }
                     c.conn.handle_event(ev);
                 }
@@ -603,68 +706,6 @@ fn find_by_client(
         .or_else(|| conns.keys().next().copied())
 }
 
-/// 处理表演性质的 SYN：回 SYN-ACK + 伪 ServerHello。
-/// 返回值仅用于日志。
-fn handle_perfunctory_syn(
-    raw: &Arc<RawSocket>,
-    local_ip: std::net::Ipv4Addr,
-    port: u16,
-    magic: u16,
-    peer_seq: u32,
-    client: SocketAddr,
-    ip_id: u16,
-    flags: u8,
-    payload: &[u8],
-) -> Option<u32> {
-    // 三重条件：IP ID 必须是我们约定的魔数、flags 含 SYN、零载荷。
-    // 缺一不可，否则会干扰正常的 TCP 网站连接。
-    if ip_id != magic || flags & TCP_SYN == 0 || !payload.is_empty() {
-        return None;
-    }
-    let isn: u32 = rand::thread_rng().gen();
-    // SYN-ACK：ack = 对端 seq + 1
-    let synack = build_packet(
-        local_ip,
-        match client.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return None,
-        },
-        port,
-        client.port(),
-        isn,
-        peer_seq.wrapping_add(1),
-        TCP_SYN | TCP_ACK,
-        magic,
-        &[],
-    );
-    let _ = raw.send(&synack, match client.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => return None,
-    });
-
-    // 紧跟一个伪 ServerHello，完成「表演握手」的观感
-    let hello = build_server_hello();
-    let pkt = build_packet(
-        local_ip,
-        match client.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return None,
-        },
-        port,
-        client.port(),
-        isn.wrapping_add(1),
-        peer_seq.wrapping_add(1),
-        TCP_PSH | TCP_ACK,
-        magic,
-        &hello,
-    );
-    let _ = raw.send(&pkt, match client.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => return None,
-    });
-    Some(peer_seq)
-}
-
 impl ServerConn {
     /// 把一个 QUIC 数据报封装成 TLS 记录 + TCP 包，写入 `out` 后由调用方批量发送。
     ///
@@ -680,31 +721,100 @@ impl ServerConn {
         record: &mut Vec<u8>,
         out: &mut Vec<u8>,
         payload: &[u8],
+        window: u16,
     ) -> Option<std::net::Ipv4Addr> {
         // 外层 AEAD：写进复用缓冲，不分配
         obfs.seal_into(record, payload);
         let std::net::IpAddr::V4(dst_ip) = self.client.ip() else {
             return None;
         };
+        let seg = TcpSeg {
+            seq: self.seq,
+            ack: self.peer_seq,
+            flags: TCP_PSH | TCP_ACK,
+            ip_id: self.ip_id,
+            window,
+            tsval: self.clock.tsval(),
+            tsecr: self.clock.peer_ts,
+            options: &[],
+            payload: record,
+        };
+        build_packet_into(out, self.local_ip, dst_ip, port, self.client.port(), &seg);
+        // TCP 语义：序列号按载荷推进，让中间盒看到的流是连续的
+        self.seq = self.seq.wrapping_add(seq_len(TCP_PSH | TCP_ACK, record.len()));
+        self.ip_id = next_ipid(self.mark, self.ip_id);
+        Some(dst_ip)
+    }
+
+    /// 发一个纯 ACK（无载荷）。
+    /// 真实 TCP 是双向确认的，下载方向必须有反向纯 ACK，否则一眼就是伪造。
+    ///
+    /// 用 `ctrl_buf` 复用缓冲：纯 ACK 占全部包量的 22.5%，
+    /// 163Mbps 时每秒约 3400 个，每包一次 `build_packet` 就是每秒 3400 次
+    /// malloc/free——在 1 核机器上是可观的用户态开销。
+    fn send_pure_ack(&mut self, raw: &Arc<RawSocket>, port: u16, window: u16) {
+        self.ack_pending = 0;
+        self.last_ack = Instant::now();
+        let std::net::IpAddr::V4(dst_ip) = self.client.ip() else {
+            return;
+        };
+        let seg = TcpSeg {
+            seq: self.seq,
+            ack: self.peer_seq,
+            flags: TCP_ACK,
+            ip_id: self.ip_id,
+            window,
+            tsval: self.clock.tsval(),
+            tsecr: self.clock.peer_ts,
+            options: &[],
+            payload: &[],
+        };
+        // take 出来避免同时借用 self 和 self.ctrl_buf
+        let mut buf = std::mem::take(&mut self.ctrl_buf);
         build_packet_into(
-            out,
+            &mut buf,
             self.local_ip,
             dst_ip,
             port,
             self.client.port(),
-            self.seq,
-            self.peer_seq,
-            TCP_PSH | TCP_ACK,
-            self.ip_id,
-            &[],
-            record,
+            &seg,
         );
-        // TCP 语义：序列号按载荷推进，让中间盒看到的流是连续的
-        self.seq = self.seq.wrapping_add(record.len() as u32);
-        // IP ID 在 magic 高字节内递增
-        let base = self.ip_id & 0xFF00;
-        self.ip_id = base | ((self.ip_id.wrapping_add(1)) & 0x00FF);
-        Some(dst_ip)
+        let _ = raw.send(&buf, dst_ip);
+        self.ctrl_buf = buf;
+        // 纯 ACK 不占序号，只推进 IP ID
+        self.ip_id = next_ipid(self.mark, self.ip_id);
+    }
+
+    /// 发 FIN 拆除连接。真实 TCP 断开一定有 FIN（或 RST），
+    /// 旧实现是静默消失，抓包里「连接凭空蒸发」也是明显特征。
+    fn send_fin(&mut self, raw: &Arc<RawSocket>, port: u16, window: u16) {
+        let std::net::IpAddr::V4(dst_ip) = self.client.ip() else {
+            return;
+        };
+        let seg = TcpSeg {
+            seq: self.seq,
+            ack: self.peer_seq,
+            flags: TCP_FIN | TCP_ACK,
+            ip_id: self.ip_id,
+            window,
+            tsval: self.clock.tsval(),
+            tsecr: self.clock.peer_ts,
+            options: &[],
+            payload: &[],
+        };
+        let mut buf = std::mem::take(&mut self.ctrl_buf);
+        build_packet_into(
+            &mut buf,
+            self.local_ip,
+            dst_ip,
+            port,
+            self.client.port(),
+            &seg,
+        );
+        let _ = raw.send(&buf, dst_ip);
+        self.ctrl_buf = buf;
+        self.seq = self.seq.wrapping_add(1);
+        self.ip_id = next_ipid(self.mark, self.ip_id);
     }
 
     /// 单包发送：只用于 Retry / stateless reset 这类低频冷路径。
@@ -718,7 +828,8 @@ impl ServerConn {
     ) {
         let mut record = Vec::with_capacity(2048);
         let mut pkt = Vec::with_capacity(2048);
-        if let Some(dst_ip) = self.build_datagram(port, obfs, &mut record, &mut pkt, payload) {
+        if let Some(dst_ip) = self.build_datagram(port, obfs, &mut record, &mut pkt, payload, advertised_window(0))
+        {
             if let Err(e) = raw.send(&pkt, dst_ip) {
                 tracing::warn!(error = %e, "发送失败");
             }
@@ -738,6 +849,7 @@ fn drain_transmits(
     obfs: &Obfs,
     batch: &mut PacketBatch,
     buf: &mut Vec<u8>,
+    window: u16,
 ) {
     let std::net::IpAddr::V4(dst_ip) = c.client.ip() else {
         return;
@@ -774,6 +886,7 @@ fn drain_transmits(
                 &mut batch.record,
                 &mut batch.bufs[n],
                 &batch.plain[off..end],
+                window,
             )
             .is_none()
             {
@@ -846,6 +959,12 @@ fn drain_events(
                     s.local_finished = true;
                     s.to_tcp = None;
                     s.pending.clear();
+                    // 唤醒可能正卡在背压水位上的出站读取协程，让它立即退出。
+                    // 只把 to_tcp 置 None 不够：那个协程等的是原子计数，不会看 channel。
+                    s.pending_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+                    s.write_blocked.store(false, std::sync::atomic::Ordering::Relaxed);
+                    s.abandon.store(true, std::sync::atomic::Ordering::Relaxed);
+                    s.drain_notify.notify_waiters();
                 }
                 let _ = c.conn.send_stream(id).reset(0u32.into());
             }
@@ -938,6 +1057,7 @@ fn read_stream(
                         st.pending_bytes.clone(),
                         st.drain_notify.clone(),
                         st.write_blocked.clone(),
+                        st.abandon.clone(),
                         pending_high_water,
                     ));
                 }
@@ -991,6 +1111,8 @@ fn reset_stream(c: &mut ServerConn, id: StreamId, why: &str) {
         // 配额被强制清零也要唤醒出站任务，否则它会一直卡在等待里直到 50ms 兜底
         st.write_blocked
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 标记放弃：出站读取协程看到它才不会再从目标 socket 读数据
+        st.abandon.store(true, std::sync::atomic::Ordering::Relaxed);
         st.drain_notify.notify_waiters();
         st.target_buf.clear();
         st.to_tcp = None;
@@ -1022,7 +1144,10 @@ fn flush_pending(c: &mut ServerConn, id: StreamId) {
             Err(WriteError::Stopped(code)) => {
                 // 对端已经丢弃这条流（发了 STOP_SENDING / RESET）：
                 // 剩下的数据永远送不出去，必须丢掉，但要留日志。
-                tracing::warn!(
+                // 这是**正常路径**（浏览器取消下载、客户端请求超时退出），
+                // 不是故障，所以用 debug 而不是 warn——否则正常使用就会刷屏，
+                // 把真正的异常淹没掉。
+                tracing::debug!(
                     stream = ?id,
                     code = %code,
                     dropped = st.pending.len(),
@@ -1129,7 +1254,8 @@ fn handle_action(
                         }
                         Err(WriteError::Stopped(code)) => {
                             // 流已被对端丢弃：这批数据送不出去了
-                            tracing::warn!(
+                            // 同上：对端主动放弃属于正常路径，用 debug
+                            tracing::debug!(
                                 stream = ?id,
                                 code = %code,
                                 dropped = data.len(),
@@ -1186,6 +1312,7 @@ async fn outbound(
     pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
     drain_notify: Arc<tokio::sync::Notify>,
     write_blocked: Arc<std::sync::atomic::AtomicBool>,
+    abandon: Arc<std::sync::atomic::AtomicBool>,
     high_water: usize,
 ) {
     let addr = format!("{host}:{port}");
@@ -1215,11 +1342,17 @@ async fn outbound(
     let addr_reader = addr.clone();
     let notify = drain_notify.clone();
     let blocked = write_blocked.clone();
+    let abandoned = abandon.clone();
     let reader = async move {
         let mut buf = [0u8; 16384];
         // 连续背压等待的轮数（最多 50ms 一轮），用于 30 秒超时
         let mut stalled = 0u32;
         loop {
+            // 流已被放弃（客户端发了 STOP_SENDING / 我们主动 reset）：
+            // 立即退出，不再从目标 socket 读任何数据。
+            if abandoned.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             // 端到端背压，两个条件任一成立就停下：
             // 1) 我们自己暂存的 pending 超水位；
             // 2) quinn 的发送缓冲满了（write 返回 Blocked 或只写进一部分）。
@@ -1230,6 +1363,10 @@ async fn outbound(
             while pending_bytes.load(std::sync::atomic::Ordering::Relaxed) > high_water
                 || blocked.load(std::sync::atomic::Ordering::Relaxed)
             {
+                // 已被放弃：不必再等水位，直接退出
+                if abandoned.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 // 先拿 notified() 再做一次检查，避免「检查后、await 前」
                 // 刚好被写空导致丢失通知而白等 50ms。
                 let wait = notify.notified();

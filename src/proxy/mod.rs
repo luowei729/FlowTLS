@@ -20,6 +20,13 @@ pub enum ProxyAction {
     Data(quinn_proto::StreamId, Vec<u8>),
     /// 本地方向结束（FIN）
     Fin(quinn_proto::StreamId),
+    /// 彻底放弃一条流：发 STOP_SENDING + RESET，告诉对端别再往这条流写。
+    ///
+    /// 本地连接被强制关闭时（浏览器取消下载、curl 超时退出）必须发这个：
+    /// 否则服务端不知道客户端已经不再收数据，会把目标 socket 继续读下去，
+    /// 一直堆到背压高水位，然后干等 30 秒兜底超时才放弃
+    /// （日志里那些「背压等待超过 30 秒，放弃该流」就是漏发造成的）。
+    Stop(quinn_proto::StreamId),
 }
 
 /// SOCKS5 风格的地址编码。

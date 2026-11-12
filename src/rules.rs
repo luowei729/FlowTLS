@@ -28,18 +28,24 @@ fn iptables(args: &[String]) -> Result<bool> {
 }
 
 /// 构造服务端规则。
-/// 只保留一条：用 IP ID 魔数匹配我们自己的所有伪造包。
-/// 不能用 conntrack INVALID 规则：它会在 raw 表早期误伤正常 SYN，
-/// 导致同端口的真网站无法完成 TCP 握手。
+/// 只保留一条：把发往监听端口的伪包在内核 TCP 栈之前 DROP。
+///
+/// 匹配依据是 IP ID 高字节，取值来自配置的 `faketcp.ip_id_magic`。
+/// **不能写死常量**：写死一个固定值意味着任何 DPI 只要加一条
+/// 「IP ID 高字节 == 某值」的通用规则就能命中所有部署。
+/// 从配置派生后，每个部署的特征不同，检测方必须逐条链路采集。
+///
+/// 标记范围刻意保持很窄（只固定高字节 = 256 个值，0.4%）：
+/// 这里 DROP 的包内核看不到，对外表现为「完全无响应」。
+/// 范围放宽到高 4 位（6%）会让端口探测行为前后不一致，反而更容易暴露。
+///
+/// offset 4 读的是「IP ID(2) + Flags/Frag(2)」四字节：
+/// Frag 固定 0x4000（DF），掩掉 IP ID 低字节与 MF/offset。
 fn server_rules(port: u16, magic: u16) -> Vec<Vec<String>> {
     let port = port.to_string();
-    let _ = magic; // 保留参数兼容旧调用；识别特征已改为 TCP 选项
-    // 用 TCP 选项里的窗口缩放因子（wscale=12）识别伪包。
-    // 实跟踪发现：客户端的 NAT 会把 IP ID 改写成 0x0000，
-    // 旧版按 IP ID 匹配的 u32 规则在真实链路上根本不命中。
-    // 偏移：IP 头 20 + TCP 头 26（MSS 4 字节 + SACK 2 字节之后）= 46，
-    // WS 选项固定为 03 03 0c 01（shift=12）。
-    let magic_expr = "46&0xFFFFFFFF=0x03030C01".to_string();
+    // 与 packet.rs 的 ipid_mark / build_packet_into 保持一致：只保留高字节
+    let mark = magic & 0xFF00;
+    let magic_expr = format!("0x4&0xff00ffff=0x{mark:04x}4000");
     vec![vec![
         "-t".into(), "raw".into(), "-A".into(), "PREROUTING".into(),
         "-p".into(), "tcp".into(), "--dport".into(), port,
@@ -70,9 +76,8 @@ pub fn ensure_server(port: u16, magic: u16) -> Result<()> {
 /// 2. 直接 DROP 服务端发来的魔数包，避免内核为每个包回一个 RST。
 ///    AF_PACKET 在 netfilter 之前收包，DROP 不影响 raw 层。
 pub fn ensure_client(source_port: u16, server_port: u16, magic: u16) -> Result<()> {
-    let _ = magic; // 识别特征改为五元组，不再依赖会被 NAT 改写的 IP ID
     // OUTPUT：屏蔽 RST
-    let mut out_rule: Vec<String> = vec![
+    let out_rule: Vec<String> = vec![
         "-A".into(), "OUTPUT".into(),
         "-p".into(), "tcp".into(),
         "--sport".into(), source_port.to_string(),
@@ -88,14 +93,22 @@ pub fn ensure_client(source_port: u16, server_port: u16, magic: u16) -> Result<(
     }
 
     // INPUT：服务端发来的包交给 raw 层，内核不要处理。
-    // 按源/目标端口匹配（服务端端口 → 客户端伪源端口），
-    // 不再用 IP ID：NAT 回程同样可能改写它。
+    // 用「源端口 + IP ID 高字节标记」匹配：服务端所有回包的标记一致。
+    // 标记同样来自配置（与 ensure_server 同源），不写死。
+    let mark = magic & 0xFF00;
     let mut in_rule: Vec<String> = vec![
-        "-A".into(), "INPUT".into(),
-        "-p".into(), "tcp".into(),
-        "--sport".into(), server_port.to_string(),
-        "--dport".into(), source_port.to_string(),
-        "-j".into(), "DROP".into(),
+        "-A".into(),
+        "INPUT".into(),
+        "-p".into(),
+        "tcp".into(),
+        "--sport".into(),
+        server_port.to_string(),
+        "-m".into(),
+        "u32".into(),
+        "--u32".into(),
+        format!("0x4&0xff00ffff=0x{mark:04x}4000"),
+        "-j".into(),
+        "DROP".into(),
     ];
     let mut in_check = in_rule.clone();
     in_check[0] = "-C".into();
@@ -118,7 +131,7 @@ pub fn check_server(port: u16, magic: u16) -> bool {
 
 /// 只检查客户端规则是否存在。
 pub fn check_client(source_port: u16) -> bool {
-    let mut rule: Vec<String> = vec![
+    let rule: Vec<String> = vec![
         "-C".into(), "OUTPUT".into(),
         "-p".into(), "tcp".into(),
         "--sport".into(), source_port.to_string(),
@@ -126,4 +139,50 @@ pub fn check_client(source_port: u16) -> bool {
         "-j".into(), "DROP".into(),
     ];
     iptables(&rule).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// iptables u32 的右值必须带 `0x` 前缀。
+    /// 内核解析器用的是 `simple_strtoul(..., base=0)`，只有带 0x 才按十六进制，
+    /// 否则 "f1004000" 会解析失败（返回 0），规则永不命中——
+    /// 表现为「服务端内核回 RST 把连接打断」，但日志里看不出任何异常。
+    #[test]
+    fn server_rule_expr_has_hex_prefix() {
+        let rules = server_rules(8443, 0xF107);
+        let joined = rules[0].join(" ");
+        assert!(
+            joined.contains("--u32"),
+            "服务端规则必须用 u32 匹配 IP ID"
+        );
+        // 取 "--u32" 后面紧跟的那个值，不硬编码下标
+        let pos = rules[0]
+            .iter()
+            .position(|a| a == "--u32")
+            .expect("规则里应有 --u32");
+        let expr = &rules[0][pos + 1];
+        assert!(
+            expr.starts_with("0x4&0xff00ffff=0x"),
+            "u32 右值必须带 0x 前缀，实际是 {expr}"
+        );
+    }
+
+    /// 标记值必须来自配置：换 magic 就要换出不同的规则，
+    /// 这样每个部署的特征不同，DPI 无法写通用规则。
+    #[test]
+    fn server_rule_follows_magic() {
+        let a = server_rules(8443, 0xF107)[0].join(" ");
+        let b = server_rules(8443, 0x1E07)[0].join(" ");
+        assert_ne!(a, b, "不同 magic 必须生成不同规则");
+        assert!(b.contains("0x1e004000"), "标记高字节应来自 magic: {b}");
+    }
+
+    /// 客户端 INPUT 规则同样要跟随 magic
+    #[test]
+    fn client_rule_follows_magic() {
+        let expr = format!("0x4&0xff00ffff=0x{:04x}4000", 0x2A00u16);
+        assert_eq!(expr, "0x4&0xff00ffff=0x2a004000");
+    }
 }

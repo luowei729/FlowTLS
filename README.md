@@ -234,13 +234,14 @@ sudo ./flowtls client -c client.yaml
 ```
 src/
 ├── main.rs            # 入口与日志初始化
-├── cli.rs             # 命令行（server / client）
+├── cli.rs             # 命令行（server / client / check / rules）
+├── check.rs           # 配置校验：两端一致性、证书真实解析、规则
 ├── config.rs          # 配置结构与默认值
 ├── rules.rs           # iptables 规则管理
 ├── faketcp/
-│   ├── socket.rs      # AF_PACKET 收包 + IPPROTO_RAW 发包
-│   ├── packet.rs      # IP/TCP 头构造、校验和、选项解析
-│   └── codec.rs       # 伪 TLS 记录、HKDF + ChaCha20-Poly1305
+│   ├── socket.rs      # AF_PACKET 收发 + sendmmsg 批量发送
+│   ├── packet.rs      # IP/TCP 头构造、校验和、TS/wscale 选项
+│   └── codec.rs       # 伪 TLS 记录/ClientHello、HKDF + ChaCha20-Poly1305
 ├── quic/
 │   ├── config.rs      # quinn-proto 传输参数
 │   └── capped.rs      # 带自适应窗口上限的 BBR 控制器

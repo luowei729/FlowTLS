@@ -2,6 +2,7 @@
 //!
 //! 子命令与 hysteria2 保持一致：server / client / install-rules / version。
 
+mod check;
 mod cli;
 mod client;
 mod config;
@@ -11,6 +12,8 @@ mod quic;
 mod rules;
 mod server;
 mod site;
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -35,19 +38,39 @@ fn main() -> Result<()> {
         }
         Commands::InstallRules(args) => {
             init_logging();
+            let (port, source_port, magic) = resolve_rule_args(&args)?;
             match args.role {
-                Role::Server => rules::ensure_server(args.port, 0xF107)?,
-                Role::Client => rules::ensure_client(args.source_port, args.port, 0xF107)?,
+                Role::Server => rules::ensure_server(port, magic)?,
+                Role::Client => rules::ensure_client(source_port, port, magic)?,
             }
-            println!("规则已安装");
+            println!("规则已安装（端口 {port}, 标记 0x{:04x}）", magic & 0xFF00);
             Ok(())
         }
-        Commands::CheckRules => {
+        Commands::CheckRules(args) => {
             init_logging();
-            let server = rules::check_server(8443, 0xF107);
-            let client = rules::check_client(44300);
-            println!("server 规则: {}", if server { "已存在" } else { "缺失" });
-            println!("client 规则: {}", if client { "已存在" } else { "缺失" });
+            let (port, source_port, magic) = resolve_rule_args(&args)?;
+            let ok = match args.role {
+                Role::Server => rules::check_server(port, magic),
+                Role::Client => rules::check_client(source_port),
+            };
+            println!(
+                "{} 规则（端口 {port}, 标记 0x{:04x}）: {}",
+                match args.role {
+                    Role::Server => "server",
+                    Role::Client => "client",
+                },
+                magic & 0xFF00,
+                if ok { "已存在" } else { "缺失" }
+            );
+            Ok(())
+        }
+        Commands::Check(args) => {
+            // 不初始化日志：check 直接 println 人类可读报告，
+            // 混入带时间戳的日志反而难读
+            let ok = check::run(args.server.as_deref(), args.client.as_deref())?;
+            if !ok {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::Version => {
@@ -55,6 +78,57 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 解析 install-rules / check-rules 的参数。
+///
+/// 优先级：命令行 → 配置文件 → 内置默认值。
+/// **不能只写内置默认值**：分流标记现在是配置派生的（DEVTIPS 38），
+/// 写死 `0xF107` 会让规则与实际标记不匹配，规则静默失效。
+/// 这是之前真实踩过的坑，所以让两个 rules 子命令都从配置读。
+fn resolve_rule_args(args: &cli::RuleArgs) -> Result<(u16, u16, u16)> {
+    // 按角色选默认配置文件名
+    let default_name = match args.role {
+        Role::Server => "server.yaml",
+        Role::Client => "client.yaml",
+    };
+    let path = args
+        .config
+        .clone()
+        .or_else(|| Some(default_name.into()).filter(|p: &PathBuf| p.exists()));
+
+    let mut port = if matches!(args.role, Role::Server) { 8443 } else { 8443 };
+    let mut source_port = 44300u16;
+    let mut magic = crate::faketcp::packet::IPID_MARK | 0x07;
+
+    if let Some(p) = path {
+        match args.role {
+            Role::Server => {
+                let cfg = config::ServerFile::load(&p)?;
+                port = config::parse_listen(&cfg.listen)?.port();
+                magic = cfg.faketcp.ip_id_magic;
+            }
+            Role::Client => {
+                let cfg = config::ClientFile::load(&p)?;
+                let (_, sp) = config::parse_host_port(&cfg.server)?;
+                port = sp;
+                source_port = cfg.faketcp.source_port;
+                magic = cfg.faketcp.ip_id_magic;
+            }
+        }
+        println!("从 {} 读取：端口 {port}, 标记 0x{:04x}", p.display(), magic & 0xFF00);
+    }
+
+    if let Some(v) = args.port {
+        port = v;
+    }
+    if let Some(v) = args.source_port {
+        source_port = v;
+    }
+    if let Some(v) = args.magic {
+        magic = v;
+    }
+    Ok((port, source_port, magic))
 }
 
 /// 初始化日志。默认 info，可用 RUST_LOG 覆盖。

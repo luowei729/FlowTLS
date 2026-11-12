@@ -43,6 +43,7 @@ quinn-proto QUIC → 出站 TCP（带 pending 字节背压）
 ```
 src/main.rs        CLI 入口
 src/cli.rs         子命令定义
+src/check.rs       配置校验（两端一致性 / 证书 / 规则）
 src/config.rs      YAML 配置
 src/client.rs      客户端事件循环、流表、本地入口装配
 src/server.rs      服务端事件循环、流表、出站任务
@@ -69,6 +70,12 @@ docs/DESIGN.md     协议细节
 cargo build                     # debug
 cargo test                      # 单元测试
 cargo build --release --target x86_64-unknown-linux-musl   # 静态二进制
+```
+
+配置校验（改配置后、重启前必跑，退出码 1 = 有错误）：
+
+```bash
+./target/debug/flowtls check --server server.yaml --client client.yaml
 ```
 
 本机联调：

@@ -1,5 +1,367 @@
 # CHANGELOG
 
+## 2026-11-12 17:13 (北京时间)
+
+### 新增 `flowtls check` 子命令 + 窗口上限 4MB→8MB（单流 +25%）
+
+**1. `flowtls check`：把「两端不一致导致静默失效」的坑变成显式检查**
+
+这个项目里有几处「两端必须一致、否则静默失效」的约束，排查成本极高，
+而且失败现象都不指向真实原因（DEVTIPS 28 / 38 记录的都是这类）：
+
+| 不一致项 | 现象 |
+|---|---|
+| `password` | 外层 AEAD 全部解密失败，服务端只看到「收到 raw 包 conns=0」 |
+| `ip_id_magic` | iptables 打不中伪包 → 内核回 RST → 连接建不起来 |
+| 端口 | SYN 发到没人监听的地方，日志里只有「已发送 SYN，等待 SYN-ACK」 |
+
+新增子命令（`src/check.rs`），只做只读检查、不改任何文件：
+
+```bash
+flowtls check --server server.yaml --client client.yaml
+flowtls check --client deploy/client-cn.yaml     # 只查一端
+```
+
+检查项：
+- **两端一致性**（核心）：password、`ip_id_magic` 高字节、端口
+- 服务端：listen 可解析、证书/私钥**能被 rustls 实际解析**（不只是文件存在）、
+  `local_ip` 合法、`site.dir` 存在
+- 客户端：`server` 可解析、`source_port` 非 0、各入口 listen 可解析、
+  入口是否缺鉴权
+- 两端：`net.mode` / `max_cwnd` 合理区间、iptables 规则是否按该 magic 安装
+- 提醒：`ip_id_magic` 仍是编译默认值（所有未改配置的部署特征相同）、
+  `handshake=none` 的前提、443 端口的已知问题
+
+输出按「通过/警告/错误」分组，**退出码 0=无错误、1=有错误**，可直接放进 CI。
+实测能正确抓出故意改坏的配置（password + magic 双不一致 → 2 个错误）。
+
+同时修了两个**同源 bug**：`install-rules` / `check-rules` 之前硬编码 `0xF107`，
+与配置派生的 magic 不匹配（上一轮改造后的遗留）。现在两个子命令都从配置读取：
+
+```bash
+flowtls install-rules server --config server.yaml
+flowtls check-rules server --config server.yaml
+```
+
+**2. `net.max_cwnd` 4MB → 8MB**
+
+之前用 4MB 的原因（高丢包 + MTU 塌到 1200 导致 MAX_CHUNKS 空洞超限）已经修掉了，
+现在实测 8MB 安全且明显更快：
+
+| 并发 | 4MB | 8MB |
+|---|---|---|
+| 单流 40s | 109 Mbps | **136 Mbps（+25%）** |
+| 单流 60s | — | 135 Mbps（14.6 MB/s） |
+| 2 流 | 167 Mbps | — |
+| 4 流 | 164 Mbps | — |
+| 8 流 20s | 164 Mbps | **175 Mbps** |
+| 8 流 30s | — | 173 Mbps |
+
+稳定性验证（60s 单流 + 30s 8 流并发）：客户端与服务端 **0 WARN**、
+**0 次 `too many gaps`**、`loss_pct=0`、`mtu` 恒 1332。
+
+安全性来自自适应上限：`safe_cap = 1024×1308/丢包率×0.7`，
+丢包 20% 时自动压到 4.7MB、30% 压到 3.1MB。
+所以配置里的 8MB 只是「天花板」，高丢包时不会真的用到，
+不用担心 MAX_CHUNKS 空洞超限。
+
+**3. 其它**
+
+- 删除 `check-rules` 在 `main.rs` 里的 8443/44300 硬编码
+- `RuleArgs` 的 `--port` / `--source-port` 改为可选，缺省从配置推导
+
+**实测汇总（国内家宽 → 新加坡 ARM 1 核）：**
+
+| 指标 | 数值 |
+|---|---|
+| 单流 200MB 下载 | 完整，135~136 Mbps |
+| 单流 60s 长跑 | 14.6 MB/s |
+| 上传 100MB | 7.5~8.5s（≈ 96~107 Mbps） |
+| 8 流并发 | 173~175 Mbps |
+| `204` 延迟 | 0.21~0.23s |
+| 两端 WARN/ERROR | **0** |
+| 单元测试 | **14 passed** |
+| 编译告警 | **0** |
+
+## 2026-11-12 16:53 (北京时间)
+
+### TLS 层伪装修复：ClientHello 74→555 字节，CCS 后不再发明文
+
+前几轮只查了 TCP 层，这次复查 TLS 层，抓到三处一眼可辨的违规。
+用真实 Chrome 的握手做对照（`16 03 01 06 a3` = 记录 1699 字节）。
+
+**1. ClientHello 只有 74 字节 / 2 个扩展（真实 1699 字节 / 10+ 扩展）**
+
+改造前的完整内容：
+```
+16 03 01 00 4a          record: handshake, 74 字节
+01 00 00 46             ClientHello, 70 字节
+03 03 <32 random>
+00                      session_id 长度 0        ← 真实浏览器发 32 字节
+00 04 13 01 13 02       只有 2 个 cipher suite
+01 00
+00 19                   extensions 共 25 字节     ← 真实是 400+ 字节
+  0000 ... SNI
+  002b ... supported_versions
+```
+
+缺失的扩展里有两个是**致命**的：
+- **`key_share` / `supported_groups`**：TLS 1.3 的必需扩展。
+  没有 key_share 的 ClientHello，服务端根本无法完成密钥交换，
+  任何懂 TLS 的 DPI 一眼判定「这不是真客户端」。
+- **`early_data`**：我们发完 ClientHello 立刻发 ApplicationData（QUIC 数据），
+  没有 early_data 就是明文可见的协议违规（ClientHello 之后不可能有 0-RTT 数据）。
+  加上它之后，「ClientHello → 立即 ApplicationData」变成合规的 0-RTT 流程。
+
+重建为 Chrome 风格（`src/faketcp/codec.rs`）：
+- `session_id`：32 字节随机（middlebox 兼容）
+- cipher suites：GREASE + 3 个 TLS 1.3 + 4 个 ECDHE
+- 扩展（按 Chrome 顺序）：GREASE、server_name、extended_master_secret、
+  renegotiation_info、supported_groups、ec_point_formats、session_ticket、
+  ALPN(h2/http1.1)、status_request、signature_algorithms、
+  signed_certificate_timestamp、key_share、psk_key_exchange_modes、
+  supported_versions、**early_data**、padding、**pre_shared_key（必须最后）**
+- GREASE（RFC 8701）：真实浏览器的固定特征，没有反而可疑
+- padding 到 512±48 字节，避免固定长度本身成为新特征
+
+**2. CCS 之后发明文握手记录（协议违规）**
+
+改造前服务器握手的序列：
+```
+16 03 03 ... ServerHello
+14 03 03 00 01 01  CCS
+16 03 03 ... Finished    ← 明文！但 CCS 之后必须全是 0x17 加密记录
+```
+
+真实 TLS 1.3 里 `ChangeCipherSpec` 之后的所有握手消息都必须加密。
+现在改为 `16 03 03` → `14 03 03` → `17 03 03 <586 字节随机密文>`，
+长度取真实证书链量级（EncryptedExtensions + Certificate + CertVerify + Finished）。
+ServerHello 也补了 `supported_versions` + `key_share` 扩展（TLS 1.3 必需）。
+
+**实测（国内家宽 → 新加坡 ARM 1 核）：**
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| ClientHello 记录长度 | **74 字节** | **550 字节**（TCP 包 555~599） |
+| ClientHello 扩展数 | 2 | 17 |
+| `key_share` / `early_data` | ❌ / ❌ | ✅ / ✅ |
+| `session_id` | 空 | 32 字节 |
+| CCS 后记录类型 | **0x16 明文** | **0x17 加密**（586 字节）|
+| 服务器握手响应 | ~90 字节，3 条记录 | **724 字节**，`16/14/17` 三条 |
+| 单流 200MB | 17.1~18.1 MB/s | 16.9~17.8 MB/s（2/2 完整）|
+| 上传 100MB | 7.7s | 7.6s |
+| 8 流并发 | 170~178 Mbps | 171 Mbps（服务端 77%） |
+| 两端 WARN/ERROR | 0 | **0** |
+| 单元测试 | 12 | **14**（新增 ClientHello 结构 + 服务器序列测试）|
+
+> 说明：ClientHello 每次连接多约 500 字节，只发生在建连时，对吞吐无影响。
+
+## 2026-11-12 16:42 (北京时间)
+
+### 分流标记改为配置派生（可换特征）+ 控制包复用缓冲 + 日志级别修正
+
+**1. `ip_id_magic` 之前根本没生效**
+
+配置里有 `faketcp.ip_id_magic: 0xF107`，但代码里 `IPID_MARK = 0xF100` 是写死的常量，
+iptables 规则也写死 `0xf1004000`。也就是说**所有部署的 IP ID 特征完全相同**，
+任何 DPI 加一条「IP ID 高字节 == 0xF1」的通用规则就能一次性命中全部实例。
+
+改成全链路从配置派生：
+- `packet::ipid_mark(magic)` → `next_ipid(mark, cur)` / `random_ipid(mark)`
+- `SendCtx` / `ServerConn` 增加 `mark` 字段
+- `rules::server_rules` / `ensure_client` 用 magic 生成 u32 表达式
+- `config::default_magic()` 改为引用 `packet::IPID_MARK`，消除两处魔数
+
+> **差点踩的坑**：`format!("{mark:04x}")` 生成的右值没有 `0x` 前缀。
+> iptables u32 的右值走 `simple_strtoul(..., base=0)`，`f1004000` 按十进制解析失败
+> → 返回 0 → **规则永不命中**。症状极隐蔽：规则存在、计数为 0、连接被内核 RST 打断
+> 但日志看不出异常。已加单元测试 `server_rule_expr_has_hex_prefix` 锁住。
+
+**2. 迁移验证：特征从 0xF1 换成 0x1E**
+
+两端 `ip_id_magic` 改成 `0x1E07` 重启后：
+- 新规则自动添加：`0x4&0xff00ffff=0x1e004000`（两端各一条）
+- 抓包确认 IP ID 变成 `0x1E76, 0x1E77...`
+- **删掉旧规则 `0xf1004000` 后连接仍正常**（200MB 完整下载），
+  证明新标记独立生效 —— 这一步才是真正的验证
+- 顺手清理了服务端遗留的旧版 wscale 分流规则 `0x2e&0xffffffff=0x3030c01`
+
+**3. 控制包复用缓冲**
+
+`send_pure_ack` / `send_fin` 之前每包一次 `build_packet` → 一次 `Vec` 分配。
+纯 ACK 占全部包量的 22.5%，163Mbps 时每秒约 3400 次 malloc/free。
+改为 `ctrl_buf: Vec<u8>` 复用（`mem::take` 绕过借用冲突），稳态零分配。
+
+实测收益 ≈ 0（52 字节 malloc 走 tcache，约 20ns，3400 次/s 可忽略）。
+CPU/Mbps 效率维持在 2.2 Mbps per %CPU，说明瓶颈在 QUIC 状态机本身而非分配。
+保留此改动（无害且为将来更大缓冲铺路），并在 DEVTIPS 记录了这个结论。
+
+**4. 正常路径日志降级**
+
+`对端已停止该流，丢弃待发数据` 在浏览器取消下载 / `curl --max-time` 时
+每次都会出现，是设计内的正常路径。`warn!` 导致正常使用就刷屏
+（一次 4 流中断刷 14 条），把真正的异常淹没。改为 `debug!`。
+
+**实测（国内家宽 → 新加坡 ARM 1 核，magic=0x1E07）：**
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| IP ID 特征 | 所有部署都是 `0xF1xx` | 配置派生，当前 `0x1Exx` |
+| 换 magic 后旧规则失效验证 | — | **通过**（删旧规则仍正常） |
+| 单流 200MB | 16.0~16.3 MB/s | **17.1~18.1 MB/s** |
+| 8 流并发 | 163~172 Mbps | 170~178 Mbps |
+| 服务端 CPU | 68~79% | 57~80%（波动，效率持平） |
+| 上传 100MB | 7.5~8.5s | 7.7s |
+| 服务端 WARN（4 流中断） | 14 条 | **0 条** |
+| 客户端 WARN/ERROR | 0 | **0** |
+| 单元测试 | 9 | **12**（新增 3 个规则测试） |
+| 编译告警 | 7 条 | **0 条** |
+
+## 2026-11-12 16:09 (北京时间)
+
+### 修客户端上传方向背压（pending 78MB → 1.06MB）+ 中断后立即释放流
+
+上一轮伪装改造时复盘浏览器测速日志，发现客户端 `pending` 峰值 **78MB**。
+排查后是两处缺失，都已修复并实测验证。
+
+**1. 客户端上传方向从来就没有真正的背压**
+
+上传路径有三层缓冲，但只有第一层有背压：
+
+| 层 | 上限 | 之前有背压？ |
+|---|---|---|
+| `mpsc::channel(1024)` | 1024 × 16KB ≈ 16MB | 只有通道满时才阻塞 |
+| quinn `send_window` | max_cwnd×2 = 8MB | ❌ 应用层看不见 |
+| `StreamState.pending` | **无上限** | ❌ |
+
+78MB ≈ 16 + 8 + 54（无上限那层堆出来的）。服务端早就修过同样的问题
+（`pending_bytes` / `write_blocked` / `Notify`），客户端一直没同步。
+
+修复（`src/client.rs`）：
+
+- `ProxyClient` 增加 `inflight`（原子计数）、`blocked`（quinn 缓冲满）、
+  `notify`（腾空时唤醒）。语义是「已从本地 socket 读出、但还没交给 QUIC 的全部字节」，
+  **同时覆盖通道在途和 `st.pending` 两段**——这正是之前失效的关键。
+- `send()` 在把数据交给通道**之前**记账；`handle_action` / `flush_pending`
+  只在 `write()` 真正被 quinn 接收了多少才扣多少。
+- `write()` 返回 `Blocked` 或只写进一部分 → 置 `blocked`；
+  `Writable` 事件 / pending 清空 → 清标志并 `notify_waiters()`。
+- `pipe_stream` 读取前先 `wait_drain()`：超过 1MB 水位就停在这里不读本地 socket，
+  浏览器/测速端被 TCP 窗口反向限速。
+- 被清理的流、`Stopped` 事件清掉的 pending，都要同步退掉 `inflight`，
+  否则残留数值会永久占着配额把后续流卡死（用 `saturating_sub` 防下溢）。
+- 重连时（`set_tx`）把计数器归零。
+
+> 中途踩了个坑：第一版在 `handle_action` 开头就把整笔字节从 `inflight` 扣掉，
+> 数据只是转存到 `st.pending` 而已。结果 `inflight` 显示 1MB、
+> `pending` 实际堆到 **36MB**，背压等于没做。只有「真正写进 quinn」才能扣。
+
+**2. 客户端中断后不发 STOP_SENDING，服务端干等 30 秒**
+
+本地连接被强制关闭时（浏览器取消下载、`curl --max-time` 退出），
+`pipe_stream` 只是结束，没有告诉对端别再写了。服务端于是继续读目标 socket，
+堆到背压高水位，然后等满 30 秒兜底超时才放弃——每次中断刷 3~4 条
+`背压等待超过 30 秒，放弃该流`。
+
+修复：
+- `ProxyAction::Stop(StreamId)` + `ProxyClient::stop()`，
+  `pipe_stream` 结束后调用 → `recv_stream().stop()` + `send_stream().reset()`。
+- 服务端 `ServerStream` 增加 `abandon` 标志：`Stopped` 事件和 `reset_stream`
+  都置位并 `notify_waiters()`，出站任务的读取协程在背压等待循环里检查它后立即退出。
+  只把 `to_tcp` 置 None 不够——那个协程等的是原子计数，不看 channel。
+
+**实测（国内家宽 → 新加坡 ARM 1 核）：**
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 客户端 `pending` 峰值（100MB 上传） | **78 MB** | **1.06 MB** |
+| 客户端 `inflight` 峰值 | — | 1.06 MB（精确停在水位） |
+| 上传 100MB | — | 7.5~8.5s（≈ 99 Mbps） |
+| 下载 200MB ×2 | 完整 | **2/2 完整**，16.0~16.3 MB/s |
+| 中断后服务端 30 秒超时告警 | 每次中断 3~4 条 | **0 条**（12 秒和 37 秒两次检查均为 0） |
+| 客户端 WARN/ERROR | 21 条（历史） | **0** |
+| 8 流下载 | 160~174 Mbps | 163 Mbps（服务端 68%、客户端 117%） |
+| MTU | 恒 1332 | 恒 1332 |
+
+中断时服务端会打一条 `对端已停止该流，丢弃待发数据 dropped=1064960`，
+`dropped` 正好等于一个背压高水位——这是设计内的正确行为，不再是超时。
+
+## 2026-11-12 15:23 (北京时间)
+
+### 伪装改造：TCP 层对齐真实 HTTPS（TS 选项 0%→100%、纯 ACK 0→22%、wscale 12→9）
+
+起因：用 tcpdump 把我们的流量和**同一台服务器的真实 HTTPS（443）**并排对比，
+一次抓出 8 处可识别特征。按危险程度：缺 TCP 时间戳 > 数据阶段零纯 ACK >
+窗口恒 65535 > 无 FIN > wscale=12 > SYN 选项形态 > IP ID 循环 > 载荷长度固定。
+
+**1. 补上 TCP 时间戳选项（最关键）**
+
+改造前数据包的 TCP 头是 20 字节、零选项——一条双向传几万个包却没有一个 TS，
+任何 DPI 一条规则就能判定为伪造（现代 OS 默认全开 `tcp_timestamps`）。
+
+现在每个数据包/纯 ACK 都带 12 字节 `nop,nop,TS val <tsval> ecr <tsecr>`：
+- `TSval` = 随机基准 + 连接已过去的毫秒数，单调递增
+- `TSecr` 回显对端最近一次的 TSval（RFC 7323 要求）
+- SYN 的 `TSecr` 保持 0（符合规范）
+
+**2. SYN/SYN-ACK 选项改成真实 Linux 布局**
+
+```
+改造前：mss 1460, sackOK, wscale 12, nop, nop, nop
+改造后：mss 1460, sackOK, TS val <随机> ecr 0, nop, wscale 9
+```
+与抓到的真实握手 `mss 1460,sackOK,TS val 227498442 ecr 0,nop,wscale 9` 逐字节同构。
+`wscale` 从 12 改成真实的 9（12 意味着 256MB 窗口，真实系统不会这么声明）。
+
+**3. 延迟确认：数据阶段补纯 ACK**
+
+真实 TCP 是双向确认的，下载方向必须有反向纯 ACK。按 RFC 1122 实现：
+每 2 个数据段回 1 个，或距上次确认超 40ms 兜底。
+实测纯 ACK 占总包 **22.5%**（真实 HTTPS 抓包 24%）。
+> 第一版做成「每批一个」，实测纯 ACK 占到 42%，CPU 抬了数倍——务必用延迟确认。
+
+**4. 窗口动态化**
+
+`(接收缓冲 16MB - 未消费字节) >> wscale`。空载 32768，有积压平滑下降。
+抓包里能看到 32748 / 32751 / 32757 / 32765 / 32768 的自然波动。
+SYN 阶段仍用 65535（缩放因子在 ESTABLISHED 后才生效）。
+
+**5. 补 FIN 拆除**
+
+会话结束/断线重连前发 `FIN|ACK`（同样带 TS 选项）。实测已抓到
+`Flags [F.], cksum correct, options [nop,nop,TS val .. ecr ..]`。
+
+**6. IP ID 保持窄标记（有意为之）**
+
+TCP 选项全部改回真实值后，iptables 只能在 IP ID 上放静态标记。
+范围**刻意保持窄**（高字节 0xF1，256 个值 = 0.4% 探测无响应）：
+iptables 会把标记包直接 DROP，范围放宽到高四位（6%）会让端口探测行为
+前后不一致，反而更容易暴露。残留的「256 周期锯齿」已记入待办。
+
+**7. 配套改动**
+
+- QUIC MTU 1340 → **1332**（每包多 12 字节 TS，总包 1417，与改造前 1413 持平）
+- `rules.rs` 服务端匹配依据从 wscale 改回 IP ID 高字节（wscale 现在是真实值，不能再当指纹）
+- 客户端 INPUT 规则改为 `--sport 8443` + IP ID（原来的 `--dport 伪源端口` 在 NAT 改写端口后计数为 0）
+- 删除无人调用的 `handle_perfunctory_syn` 死代码
+
+**实测（国内家宽 → 新加坡 ARM 1 核）：**
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| 报文带 TS 比例 | **0/120** | **120/120** |
+| 数据阶段纯 ACK | 0 个 | 90/400 ≈ 22.5% |
+| 窗口取值 | 恒 65535 | 32748~32768 波动 |
+| SYN 选项 | 缺 TS、wscale 12 | `mss,sackOK,TS,nop,wscale 9` |
+| FIN 拆除 | 无 | `Flags [F.]` + TS |
+| 单流 200MB | 3/3 完整 | **3/3 完整**，15.4~16.5 MB/s |
+| 8 流并发 | 184 Mbps | 160~174 Mbps（-8%，TS+纯ACK 的代价） |
+| 服务端 CPU | 22~78%（波动大） | 74~78% |
+
+代价说明：每个包多 12 字节头 + 22% 的纯 ACK 包，吞吐下降约 8%、CPU 上升。
+这是伪装必须付的成本——「缺 TS」这个特征一旦被利用就是直接封禁。
+改造后服务端 78% CPU 对应 174 Mbps，仍有余量。
+
 ## 2026-11-12 14:42 (北京时间)
 
 ### 修复 MTU 塌陷 + 三处背压/收尾 bug，单流 200MB 从「下到 6MB 就断」到 4/4 完整

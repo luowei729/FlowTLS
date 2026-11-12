@@ -7,7 +7,7 @@
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +17,7 @@ pub const REC_CCS: u8 = 0x14;
 pub const REC_APPDATA: u8 = 0x17;
 
 /// 一条解析出来的 TLS 记录视图
+#[allow(dead_code)] // version 保留：核对记录头是否为 0x0303 时要看
 pub struct TlsRecord<'a> {
     pub typ: u8,
     pub version: u16,
@@ -138,37 +139,215 @@ pub fn parse_records(mut buf: &[u8]) -> Vec<TlsRecord<'_>> {
     out
 }
 
-/// 构造一个结构合法的最小 TLS ClientHello（含 SNI）。
-/// 只求 DPI 看起来合理，不参与真实握手，因此不追求完整扩展集。
+/// 写一个 TLS 扩展：类型(2) + 长度(2) + 内容
+fn push_ext(out: &mut Vec<u8>, typ: u16, body: &[u8]) {
+    out.extend_from_slice(&typ.to_be_bytes());
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+/// GREASE 值（RFC 8701）：形如 `0x?a?a`。
+/// Chrome 会在 cipher suite 列表、extensions 列表、supported_groups、
+/// key_share 等处插入 GREASE，用来强制实现必须正确忽略未知值。
+/// 真实的 ClientHello 里几乎一定有它，没有反而显得可疑。
+fn grease() -> u16 {
+    const GREASE: [u16; 16] = [
+        0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa,
+        0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+    ];
+    GREASE[rand::thread_rng().gen_range(0..GREASE.len())]
+}
+
+/// ClientHello 的目标总长度（含 5 字节记录头）。
+///
+/// 实测真实 Chrome 的 ClientHello 是 1699 字节（带 X25519Kyber768 混合 key share），
+/// 而改造前我们只有 74 字节——**23 倍差距**。任何「ClientHello 小于 200 字节」
+/// 的规则都能直接命中。这里取 512 附近的常见区间（不含 PQ 的传统浏览器量级），
+/// 用 padding 扩展补齐，大小每次略有随机避免固定长度成为新特征。
+const CLIENT_HELLO_TARGET: usize = 512;
+
+/// 构造一个结构完整的 TLS 1.3 ClientHello（Chrome 风格）。
+///
+/// 改造前只有 74 字节、2 个扩展（SNI + supported_versions），缺了：
+/// - `session_id`（TLS 1.2 middlebox 兼容，Chrome/Firefox 都发 32 字节）
+/// - `key_share` / `supported_groups`（**TLS 1.3 必需**，没有它根本握不了手）
+/// - `signature_algorithms`（TLS 1.3 必需）
+/// - `ALPN`、`status_request`、`ec_point_formats` 等常规扩展
+/// - **`early_data`**：我们发完 ClientHello 立刻发 ApplicationData（QUIC 数据），
+///   没有 early_data 这就是明文可见的协议违规（ClientHello 后不可能有 0-RTT 数据）。
+///   加上它之后「ClientHello → 立即 ApplicationData」就变成了合规的 0-RTT 流程。
+///
+/// 另外补了 GREASE（RFC 8701）和 padding：前者是真实浏览器的固定特征，
+/// 后者让长度落在真实区间内。
 pub fn build_client_hello(sni: &str) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
     let name = sni.as_bytes();
-    // SNI 扩展内容：server_name_list(2) + type(1) + name_len(2) + name
-    let mut sni_body = Vec::with_capacity(5 + name.len());
-    sni_body.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
-    sni_body.push(0); // host_name
-    sni_body.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    sni_body.extend_from_slice(name);
 
-    let mut exts = Vec::new();
-    // SNI 扩展
-    exts.extend_from_slice(&[0x00, 0x00]);
-    exts.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
-    exts.extend_from_slice(&sni_body);
-    // supported_versions：声明支持 TLS 1.3 / 1.2
-    exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03]);
+    // ---- 扩展列表 ----
+    let mut exts: Vec<u8> = Vec::with_capacity(480);
 
-    let mut hs = Vec::new();
-    hs.push(0x03); // ClientHello
-    hs.push(0x03);
+    // GREASE 扩展必须放在第一个（Chrome 的习惯）
+    push_ext(&mut exts, grease(), &[]);
+
+    // server_name (0x0000)
+    let mut sn = Vec::with_capacity(5 + name.len());
+    sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // server_name_list 长度
+    sn.push(0); // host_name
+    sn.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    sn.extend_from_slice(name);
+    push_ext(&mut exts, 0x0000, &sn);
+
+    // extended_master_secret (0x0017)：空体，表示支持
+    push_ext(&mut exts, 0x0017, &[]);
+
+    // renegotiation_info (0xff01)：长度 1 的 0（安全重协商）
+    push_ext(&mut exts, 0xff01, &[0x00]);
+
+    // supported_groups (0x000a)：GREASE + x25519 + secp256r1 + secp384r1
+    let mut groups = Vec::new();
+    let g_body: Vec<u8> = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&grease().to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x1d, 0x00, 0x17, 0x00, 0x18]);
+        v
+    };
+    groups.extend_from_slice(&(g_body.len() as u16).to_be_bytes());
+    groups.extend_from_slice(&g_body);
+    push_ext(&mut exts, 0x000a, &groups);
+
+    // ec_point_formats (0x000b)：只支持 uncompressed
+    push_ext(&mut exts, 0x000b, &[0x01, 0x00]);
+
+    // session_ticket (0x0023)：空体表示支持
+    push_ext(&mut exts, 0x0023, &[]);
+
+    // ALPN (0x0010)：h2 + http/1.1
+    let mut alpn = Vec::new();
+    alpn.extend_from_slice(&12u16.to_be_bytes());
+    alpn.extend_from_slice(&[0x02, b'h', b'2']);
+    alpn.extend_from_slice(&[0x08]);
+    alpn.extend_from_slice(b"http/1.1");
+    push_ext(&mut exts, 0x0010, &alpn);
+
+    // status_request (0x0005)：OCSP stapling，结构 = status_type(1) + responder_id_list(2) + request_extensions(2)
+    push_ext(&mut exts, 0x0005, &[0x01, 0x00, 0x00, 0x00, 0x00]);
+
+    // signature_algorithms (0x000d)：TLS 1.3 必需
+    let mut sigalgs = Vec::new();
+    let schemes: [u16; 8] = [
+        0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+    ];
+    sigalgs.extend_from_slice(&((schemes.len() * 2) as u16).to_be_bytes());
+    for s in schemes {
+        sigalgs.extend_from_slice(&s.to_be_bytes());
+    }
+    push_ext(&mut exts, 0x000d, &sigalgs);
+
+    // signed_certificate_timestamp (0x0012)：空体表示支持
+    push_ext(&mut exts, 0x0012, &[]);
+
+    // key_share (0x0033)：GREASE 空 share + x25519 真实长度的随机 share。
+    // 没有这个扩展，TLS 1.3 服务端会直接拒绝，是「这不是真客户端」的铁证。
+    let mut shares = Vec::new();
+    {
+        let mut entries = Vec::new();
+        // GREASE share（长度 1，内容 0）
+        let g = grease();
+        entries.extend_from_slice(&g.to_be_bytes());
+        entries.extend_from_slice(&1u16.to_be_bytes());
+        entries.push(0);
+        // x25519 share：32 字节随机
+        entries.extend_from_slice(&[0x00, 0x1d]);
+        entries.extend_from_slice(&32u16.to_be_bytes());
+        let mut kx = [0u8; 32];
+        rng.fill_bytes(&mut kx);
+        entries.extend_from_slice(&kx);
+        shares.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        shares.extend_from_slice(&entries);
+    }
+    push_ext(&mut exts, 0x0033, &shares);
+
+    // psk_key_exchange_modes (0x002d)：psk_dhe_ke（与 early_data 配套必需）
+    push_ext(&mut exts, 0x002d, &[0x01, 0x01]);
+
+    // supported_versions (0x002b)：TLS 1.3 + 1.2
+    push_ext(&mut exts, 0x002b, &[0x04, 0x03, 0x04, 0x03, 0x03]);
+
+    // ---- 以下两个是为「ClientHello 后立刻发数据」服务的 ----
+
+    // early_data (0x002a)：空体。声明愿意发 0-RTT 数据。
+    push_ext(&mut exts, 0x002a, &[]);
+
+    // padding (0x0015)：先把长度补齐，再写必须位于最后的 pre_shared_key。
+    // 目标总长 CLIENT_HELLO_TARGET ± 小幅随机，避免固定长度本身成为特征。
+    {
+        // 已知固定部分的长度（不含 extensions 内容和 padding 自身）
+        // 5 记录头 + 4 握手头 + 2 legacy_version + 32 random + (1+32) session_id
+        // + (2 + suites) + 2 compression + 2 extensions_len
+        let suites_len = 16usize; // GREASE + 7 个真实套件，见下方
+        let fixed = 5 + 4 + 2 + 32 + 33 + 2 + suites_len + 2 + 2;
+        let target = CLIENT_HELLO_TARGET + rng.gen_range(0..48);
+        // padding 扩展自身占 4 字节头，pre_shared_key 还在后面，先预留
+        let psk_len = 4 + (2 + 2 + 96 + 4) + (2 + 1 + 32); // 见下方构造
+        let avail = target.saturating_sub(fixed + exts.len() + psk_len + 4);
+        if avail > 0 {
+            push_ext(&mut exts, 0x0015, &vec![0u8; avail]);
+        }
+    }
+
+    // pre_shared_key (0x0029)：RFC 8446 要求它是**最后一个**扩展。
+    // 结构与 early_data 配套：identity 是伪造的 ticket，
+    // binder 是随机字节（DPI 没有 PSK 无法验证 binder 真伪）。
+    {
+        let ticket_len = 96usize;
+        let mut psk = Vec::with_capacity(4 + ticket_len + 4 + 2 + 33 + 4);
+        // identities: 长度(2) + [ identity 长度(2) + ticket + age(4) ]
+        psk.extend_from_slice(&((2 + ticket_len + 4) as u16).to_be_bytes());
+        psk.extend_from_slice(&(ticket_len as u16).to_be_bytes());
+        let mut ticket = vec![0u8; ticket_len];
+        rng.fill_bytes(&mut ticket);
+        psk.extend_from_slice(&ticket);
+        psk.extend_from_slice(&rng.gen::<u32>().to_be_bytes()); // obfuscated_ticket_age
+        // binders: 长度(2) + [ binder 长度(1) + 32 字节 ]
+        psk.extend_from_slice(&(1 + 32u16).to_be_bytes());
+        psk.push(32);
+        let mut binder = [0u8; 32];
+        rng.fill_bytes(&mut binder);
+        psk.extend_from_slice(&binder);
+        push_ext(&mut exts, 0x0029, &psk);
+    }
+
+    // ---- 拼 ClientHello 主体 ----
+    let mut hs = Vec::with_capacity(64 + exts.len());
+    hs.extend_from_slice(&[0x03, 0x03]); // legacy_version
     let mut random = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut random);
+    rng.fill_bytes(&mut random);
     hs.extend_from_slice(&random);
-    hs.push(0); // session_id 长度 0
-    hs.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]); // TLS1.3 套件
-    hs.extend_from_slice(&[0x01, 0x00]); // 压缩方法 null
+    // legacy_session_id：Chrome/Firefox 都发 32 字节，用于 middlebox 兼容。
+    // 改造前这里是空的（0 长度），本身就是个不常见的做法。
+    hs.push(32);
+    let mut sid = [0u8; 32];
+    rng.fill_bytes(&mut sid);
+    hs.extend_from_slice(&sid);
+    // cipher suites：GREASE + TLS 1.3 三个 + 常见 ECDHE 四个
+    hs.extend_from_slice(&16u16.to_be_bytes());
+    for cs in [
+        grease(),
+        0x1301, // TLS_AES_128_GCM_SHA256
+        0x1302, // TLS_AES_256_GCM_SHA384
+        0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        0xc02b, // ECDHE_ECDSA_AES_128_GCM
+        0xc02f, // ECDHE_RSA_AES_128_GCM
+        0xc02c, // ECDHE_ECDSA_AES_256_GCM
+        0xc030, // ECDHE_RSA_AES_256_GCM
+    ] {
+        hs.extend_from_slice(&cs.to_be_bytes());
+    }
+    hs.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods: null
     hs.extend_from_slice(&(exts.len() as u16).to_be_bytes());
     hs.extend_from_slice(&exts);
 
+    // ---- 握手头 + 记录头 ----
     let mut body = Vec::with_capacity(4 + hs.len());
     body.push(0x01); // handshake 类型：client_hello
     body.push(((hs.len() >> 16) & 0xff) as u8);
@@ -179,52 +358,87 @@ pub fn build_client_hello(sni: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + body.len());
     out.push(REC_HANDSHAKE);
     out.push(0x03);
-    out.push(0x01); // ClientHello 用 TLS1.0 记录版本，和真实浏览器一致
+    out.push(0x01); // ClientHello 的记录版本用 TLS1.0，和真实浏览器一致
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(&body);
     out
 }
 
-/// 构造一段象征性的服务器握手响应。
-/// 包含 ServerHello + ChangeCipherSpec + Finished，纯表演，不参与状态。
+/// 构造服务器侧的握手响应（ServerHello + CCS + 加密握手记录）。
+///
+/// 改造前这里在 CCS 之后发的是 **0x16 明文** 的假 Finished 记录。
+/// 真实 TLS 1.3 里 ChangeCipherSpec 之后再出现明文握手记录是**协议违规**：
+/// ServerHello 之后的所有握手消息（EncryptedExtensions / Certificate /
+/// CertificateVerify / Finished）都必须包在 0x17 加密记录里，DPI 一看就知道。
+///
+/// 现在按真实顺序构造：
+/// ```text
+/// 16 03 03 <len>  02 ...             ServerHello（明文，含 key_share）
+/// 14 03 03 00 01 01                  ChangeCipherSpec（middlebox 兼容）
+/// 17 03 03 <len>  <随机密文>          加密的握手消息（长度取真实量级）
+/// ```
+/// 密文内容用随机字节：DPI 没有会话密钥无法验证，长度与真实证书链量级一致即可。
 pub fn build_server_hello() -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut rng = rand::thread_rng();
+    let mut out = Vec::with_capacity(900);
 
-    // ServerHello：TLS1.2 记录版本，随机 32 字节 + 套件 + 空扩展
-    let mut hs = Vec::with_capacity(38);
-    hs.extend_from_slice(&[0x03, 0x03]);
+    // ---- ServerHello ----
+    let mut hs = Vec::with_capacity(90);
+    hs.extend_from_slice(&[0x03, 0x03]); // legacy_version
     let mut random = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut random);
+    rng.fill_bytes(&mut random);
     hs.extend_from_slice(&random);
-    hs.push(0); // session_id 长度
+    // legacy_session_id_echo：必须回显客户端的 session_id。
+    // 我们无法真的读到客户端的（ClientHello 是本地构造的、没保存），
+    // 但真实客户端会发 32 字节，这里同样给 32 字节随机值保持长度一致。
+    hs.push(32);
+    let mut sid = [0u8; 32];
+    rng.fill_bytes(&mut sid);
+    hs.extend_from_slice(&sid);
     hs.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-    hs.push(0); // 压缩方法
-    hs.extend_from_slice(&[0x00, 0x00]); // 扩展长度 0
-    let mut body = vec![0x02];
-    body.extend_from_slice(&((hs.len() >> 16) as u8).to_le_bytes());
-    body.extend_from_slice(&((hs.len() >> 8) as u8).to_le_bytes());
+    hs.push(0x00); // legacy_compression_method
+
+    // 扩展：supported_versions + key_share（都是 TLS 1.3 必需）
+    let mut exts = Vec::with_capacity(48);
+    push_ext(&mut exts, 0x002b, &[0x03, 0x04]); // supported_versions = TLS1.3
+    {
+        // key_share：x25519 + 32 字节"公钥"
+        let mut ks = Vec::with_capacity(36);
+        ks.extend_from_slice(&[0x00, 0x1d]);
+        ks.extend_from_slice(&32u16.to_be_bytes());
+        let mut pk = [0u8; 32];
+        rng.fill_bytes(&mut pk);
+        ks.extend_from_slice(&pk);
+        push_ext(&mut exts, 0x0033, &ks);
+    }
+    hs.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    hs.extend_from_slice(&exts);
+
+    let mut body = Vec::with_capacity(4 + hs.len());
+    body.push(0x02); // handshake 类型：server_hello
+    body.push(((hs.len() >> 16) & 0xff) as u8);
+    body.push(((hs.len() >> 8) & 0xff) as u8);
     body.push((hs.len() & 0xff) as u8);
     body.extend_from_slice(&hs);
+
     out.push(REC_HANDSHAKE);
     out.extend_from_slice(&[0x03, 0x03]);
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(&body);
 
-    // ChangeCipherSpec：TLS1.2 握手完成的典型信号
+    // ---- ChangeCipherSpec（TLS 1.3 为 middlebox 兼容保留）----
     out.extend_from_slice(&[REC_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]);
 
-    // Finished：随机的握手记录，让包序列看起来完整
-    let mut fin = vec![0x14u8];
-    let mut fin_body = [0u8; 36];
-    rand::thread_rng().fill_bytes(&mut fin_body);
-    fin.extend_from_slice(&((fin_body.len() >> 16) as u8).to_le_bytes());
-    fin.extend_from_slice(&((fin_body.len() >> 8) as u8).to_le_bytes());
-    fin.push((fin_body.len() & 0xff) as u8);
-    fin.extend_from_slice(&fin_body);
-    out.push(REC_HANDSHAKE);
+    // ---- 加密的握手消息（EncryptedExtensions + Certificate + CertVerify + Finished）----
+    // 用 0x17 记录类型 + 随机密文。长度取 500~700 的量级：
+    // 一张 ECDSA 自签证书链 + 三个签名结构的实际大小就在这个范围。
+    let enc_len = 512 + rng.gen_range(0..192);
+    let mut enc = vec![0u8; enc_len];
+    rng.fill_bytes(&mut enc);
+    out.push(REC_APPDATA);
     out.extend_from_slice(&[0x03, 0x03]);
-    out.extend_from_slice(&(fin.len() as u16).to_be_bytes());
-    out.extend_from_slice(&fin);
+    out.extend_from_slice(&(enc_len as u16).to_be_bytes());
+    out.extend_from_slice(&enc);
 
     out
 }
@@ -285,5 +499,102 @@ mod tests {
         let recs = parse_records(&ch);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].typ, REC_HANDSHAKE);
+    }
+
+    /// 遍历 ClientHello 的扩展，返回 (类型, 内容) 列表。
+    fn hello_extensions(hs_body: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        // hs_body 是 ClientHello 的 handshake 消息体（不含 4 字节握手头）
+        let mut i = 2 + 32; // legacy_version + random
+        let sid_len = hs_body[i] as usize;
+        i += 1 + sid_len;
+        let cs_len = u16::from_be_bytes([hs_body[i], hs_body[i + 1]]) as usize;
+        i += 2 + cs_len;
+        i += 1 + hs_body[i] as usize; // compression methods
+        let ext_total = u16::from_be_bytes([hs_body[i], hs_body[i + 1]]) as usize;
+        i += 2;
+        let end = i + ext_total;
+        let mut out = Vec::new();
+        while i + 4 <= end {
+            let typ = u16::from_be_bytes([hs_body[i], hs_body[i + 1]]);
+            let len = u16::from_be_bytes([hs_body[i + 2], hs_body[i + 3]]) as usize;
+            i += 4;
+            out.push((typ, hs_body[i..i + len].to_vec()));
+            i += len;
+        }
+        assert_eq!(i, end, "扩展长度必须与声明一致");
+        out
+    }
+
+    /// ClientHello 必须结构完整且像真实浏览器：
+    /// 有 session_id、TLS 1.3 必需扩展，且 pre_shared_key 必须是最后一个。
+    #[test]
+    fn client_hello_looks_real() {
+        let ch = build_client_hello("test.example.com");
+        // 744 字节 = 记录头 5 + 握手头 4 + ClientHello 本体。
+        // 改造前只有 79 字节，真实浏览器 300~1700，这里落在 512~600。
+        assert!(
+            ch.len() >= 512 && ch.len() < 620,
+            "ClientHello 长度应在真实区间内，实际 {}",
+            ch.len()
+        );
+
+        let hs = &ch[5..];
+        assert_eq!(hs[0], 0x01, "必须是 ClientHello");
+        let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
+        assert_eq!(hs_len, hs.len() - 4, "握手长度必须自洽");
+        let body = &hs[4..];
+
+        // session_id 必须是 32 字节（Chrome/Firefox 都这样）
+        assert_eq!(body[2 + 32], 32, "session_id 长度应为 32");
+
+        let exts = hello_extensions(body);
+        let types: Vec<u16> = exts.iter().map(|(t, _)| *t).collect();
+        for need in [
+            0x0000u16, // server_name
+            0x000a,    // supported_groups
+            0x000b,    // ec_point_formats
+            0x000d,    // signature_algorithms
+            0x0010,    // ALPN
+            0x002b,    // supported_versions
+            0x002d,    // psk_key_exchange_modes
+            0x0033,    // key_share  ← 缺了它 TLS 1.3 根本握不了手
+            0x002a,    // early_data ← 让「ClientHello 后立刻发数据」合规
+        ] {
+            assert!(types.contains(&need), "缺少扩展 0x{need:04x}: {types:?}");
+        }
+        // RFC 8446：pre_shared_key 必须是最后一个扩展
+        assert_eq!(
+            *types.last().unwrap(),
+            0x0029,
+            "pre_shared_key 必须是最后一个扩展"
+        );
+
+        // key_share 里必须有 x25519（0x001d）的 32 字节 share
+        let ks = &exts.iter().find(|(t, _)| *t == 0x0033).unwrap().1;
+        assert!(
+            ks.windows(4).any(|w| w == [0x00, 0x1d, 0x00, 0x20]),
+            "key_share 必须包含 x25519/32 字节"
+        );
+    }
+
+    /// 服务器握手序列必须合规：CCS 之后不能再出现明文握手记录（0x16）。
+    /// 真实 TLS 1.3 在 ServerHello 之后的所有握手消息都是 0x17 加密记录，
+    /// 改造前这里发的是 0x16 明文 Finished，属于协议违规。
+    #[test]
+    fn server_hello_sequence_is_valid() {
+        let sh = build_server_hello();
+        let recs = parse_records(&sh);
+        let types: Vec<u8> = recs.iter().map(|r| r.typ).collect();
+        assert_eq!(
+            types,
+            vec![REC_HANDSHAKE, REC_CCS, REC_APPDATA],
+            "服务器握手序列应为 ServerHello → CCS → 加密记录"
+        );
+        // 密文长度要落在真实证书链的量级（不能是几十字节的假数据）
+        assert!(
+            recs[2].payload.len() >= 500,
+            "加密握手记录太短，实际 {}",
+            recs[2].payload.len()
+        );
     }
 }

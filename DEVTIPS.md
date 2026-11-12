@@ -579,7 +579,346 @@ FIN 一旦越过还没写出的数据，对端就提前看到流结束。
 正确做法：`Fin` 只登记 `fin_pending = true`，
 由 `flush_pending` 在 `pending.is_empty()` 时执行真正的 `finish()`。
 
-## 35. 常用调试命令
+## 35. 伪装的 8 处可识别特征：抓包对照真实 HTTPS 才看得出来
+
+伪装成 HTTPS 不能只看「有 `17 03 03` 记录头」，TCP 层必须真的像一条 TCP 连接。
+用 `tcpdump` 把我们的流量和**同一台服务器的真实 HTTPS**（443 端口）并排对比，
+一次就暴露出 8 处差异。按危险程度排序：
+
+### 改造前 vs 真实 HTTPS
+
+| # | 特征 | 真实 HTTPS | 改造前 | 危险 |
+|---|---|---|---|---|
+| 1 | TCP 时间戳 | 每个包都有 `nop,nop,TS val .. ecr ..` | **一个都没有** | 🔴 最强指纹 |
+| 2 | 数据阶段纯 ACK | 有（约 22% 的包） | **0 个** | 🔴 |
+| 3 | 窗口值 | 122/128/62636，随缓冲变化 | **恒 65535** | 🔴 |
+| 4 | 拆除 | 有 FIN | **0 个**（静默消失） | 🟠 |
+| 5 | wscale | 9 | **12**（且这是分流指纹） | 🟠 |
+| 6 | SYN 选项 | `mss 1460,sackOK,TS val .. ecr 0,nop,wscale 9` | `mss,sackOK,wscale 12,nop×3` | 🟠 |
+| 7 | IP ID | 7700,7701,7702…（16 位递增） | **0xF100~0xF1FF 循环** | 🟡 |
+| 8 | 载荷长度 | 受拥塞窗口影响，杂乱 | 11 个包精确 1373 字节 | 🟡 |
+
+**为什么 #1 是致命的**：现代 Linux / Windows / macOS / Android 默认全部开启
+`tcp_timestamps`。一条双向传了几万个包、却连一个 TS 都没有的 TCP 连接，
+在真实世界里不存在。任何 DPI 一条规则（「连接包数 > N 且 TS 数 == 0」）就能判死。
+`openssl`/`curl` 抓包对比 5 秒就能确认。
+
+### 改造要点
+
+1. **每个数据包/纯 ACK 带 12 字节 TS 选项**：`01 01 08 0a <TSval><TSecr>`。
+   - `TSval = 随机基准 + 连接已过去的毫秒数`，单调递增（真实栈也是）
+   - `TSecr` 回显对端最近一次的 TSval（RFC 7323 要求，不匹配会被中间盒丢弃）
+2. **SYN/SYN-ACK 选项改成真实 Linux 的 20 字节布局**：
+   ```
+   02 04 05 b4            MSS 1460
+   04 02                  SACK permitted
+   08 0a <tsval> <tsecr>  TS（SYN 的 TSecr 必须为 0）
+   01                     NOP
+   03 03 09               wscale 9
+   ```
+3. **延迟确认**：每 2 个数据段回 1 个纯 ACK，或距上次确认超 40ms 兜底。
+   不要「每批一个」——实测那样纯 ACK 会占到总包的 **42%**，
+   真实 TCP 是 22% 左右，而且每包一次 `Vec` 分配 + `sendto` 把 CPU 抬了数倍。
+4. **窗口按真实语义计算**：`(接收缓冲总量 - 未消费字节) >> wscale`。
+   16MB 缓冲空载时正好 32768（真实 Linux 在 16MB `tcp_rmem` 下就是这个值），
+   有积压时平滑下降，抓包里能看到 32748 / 32751 / 32757 / 32765 / 32768 这种自然波动。
+   **SYN 阶段仍用 65535**（缩放因子要 ESTABLISHED 后才生效）。
+5. **FIN**：会话结束/断线重连前补一个 `FIN|ACK`（同样带 TS 选项）。
+
+### MTU 要跟着让出 12 字节
+
+每个包多了 12 字节 TS 选项，QUIC 载荷必须从 1340 降到 **1332**：
+`1332 + 33(外层) + 20(IP) + 32(TCP) = 1417`，与改造前的 1413 基本持平。
+若保持 1340，总包会到 1425，逼近服务端通告 MSS 1400 对应的 1440 上限，没有余量。
+
+### 分流标记的取舍（重要）
+
+TCP 选项全部改回真实值后，iptables 只能在 **IP ID** 上放静态标记。
+标记范围**不能随便放大**：iptables 会把这些包 DROP，内核看不到就没有任何响应。
+- 高字节固定 0xF1 → 256/65536 = **0.4%** 的普通端口探测会「无响应」
+- 高四位固定 0xF  → 4096/65536 = **6%**，异常率高 15 倍，会让探测行为前后不一致
+
+所以刻意保持窄范围。残留特征：单连接 IP ID 以 256 为周期锯齿递增。
+彻底消除需要换掉 iptables 的匹配依据（例如把口令派生的 12 bit 放进 SYN 的
+TSval 低位、TSecr 保持 0 以符合 RFC 7323），已记入 PROJECT_PLAN。
+
+## 36. 背压记账：只有「真正写进 quinn」的字节才能从水位里扣掉
+
+上传方向的背压很容易做成假的。三条缓冲一个都不能漏：
+动作通道、quinn 内部的 `send_window`、我们自己的 `pending`。
+
+```rust
+// 错：一进 handle_action 就扣掉整笔
+client.inflight.fetch_sub(n, Relaxed);
+let Some(st) = streams.get_mut(&id) else { return };
+match conn.send_stream(id).write(&data) {
+    Ok(m) if m < data.len() => st.pending.extend_from_slice(&data[m..]),  // 数据还在这儿！
+    ...
+}
+```
+
+这样 `inflight` 只反映「通道里还没被取出」的部分，`pending` 完全隐身。
+实测 `inflight` 显示 1MB，`pending` 实际堆到 **36MB**，背压等于没做。
+
+正确做法——**只扣 quinn 真正接收的量**：
+
+```rust
+match conn.send_stream(id).write(&data) {
+    Ok(m) if m == data.len() => { subtract_inflight(client, m); /* 全部收下 */ }
+    Ok(m)                     => { subtract_inflight(client, m); st.pending.extend_from_slice(&data[m..]); }
+    Err(WriteError::Blocked)  => { /* 一个字节都没收，不扣 */ st.pending.extend_from_slice(&data); }
+    Err(_)                    => { subtract_inflight(client, n); /* 流已死，整笔退回 */ }
+}
+```
+
+`flush_pending` 同理：累加本轮 `accepted`，循环结束后一次性扣。
+
+还有三个容易漏的退账点，漏一个就会永久卡住后续所有流：
+- 流被 `streams.retain` 清理时，`pending` 里残留的字节要退；
+- `Stopped` 事件清空 `pending` 时，被清掉的部分要退；
+- 重连时（`set_tx`）计数器要归零。
+
+扣减一律用 `fetch_update` + `saturating_sub`：清零之后队列里可能还有在途数据，
+直接 `fetch_sub` 会下溢成 `usize::MAX`，背压就彻底失效了。
+
+水位取值与服务端一致：`max_cwnd / 4` clamp 到 512KB~1MB。
+100ms RTT 下 1MB 已足够跑满 80Mbps，再多只是把数据堆在内存里排队。
+
+## 37. 对端停止时，光把 Sender 置 None 唤不醒等背压的协程
+
+出站任务的读取协程等待的是**原子计数**（`pending_bytes` / `write_blocked`），
+不看 channel。所以 `Stopped` 事件里只写 `st.to_tcp = None` 是不够的：
+目标 socket 那边不会收到任何信号，协程会一直在水位上等到 30 秒兜底超时。
+
+必须显式给一个「放弃」信号：
+
+```rust
+// ServerStream 增加
+abandon: Arc<AtomicBool>,
+
+// Stopped 事件 / reset_stream 里
+s.pending_bytes.store(0, Relaxed);
+s.write_blocked.store(false, Relaxed);
+s.abandon.store(true, Relaxed);
+s.drain_notify.notify_waiters();   // 唤醒等待者
+
+// 出站读取协程的背压等待循环里
+if abandoned.load(Relaxed) { return; }
+```
+
+客户端侧对应的是：本地连接被强制关闭时（浏览器取消、`curl --max-time` 退出）
+必须发 `STOP_SENDING` + `RESET_STREAM`，否则服务端不知道你不再收了。
+`pipe_stream` 在 `join!` 结束后调用 `client.stop(id).await` 即可。
+
+判断修复成功的标志：中断后服务端只打一条
+`对端已停止该流，丢弃待发数据 dropped=<水位值>`，
+而不是刷 `背压等待超过 30 秒，放弃该流`。
+
+## 38. 分流标记必须来自配置，不能写死在代码里
+
+iptables 需要一个「静态可匹配」的特征来把伪包挡在内核 TCP 栈之外。
+TCP 选项在伪装改造后必须与真实 Linux 一致（TS、wscale 9），不能再当指纹，
+所以标记只能落在 **IP ID 高字节**上。
+
+**关键：这个值必须从 `faketcp.ip_id_magic` 派生，不能写死。**
+
+```rust
+// 错：写死意味着任何 DPI 加一条「IP ID 高字节 == 0xF1」的规则
+// 就能一次性命中所有部署。
+let mark = 0xF100;
+
+// 对：每个部署的标记不同，检测方必须逐条链路采集学习
+let mark = cfg.faketcp.ip_id_magic & 0xFF00;
+```
+
+### iptables u32 的右值必须带 `0x` 前缀（差点踩坑）
+
+```rust
+// 错：内核解析器是 simple_strtoul(..., base=0)，
+// "f1004000" 按十进制解析失败 → 返回 0 → 规则永不命中。
+// 症状极具迷惑性：连接能建但一直被内核 RST 打断，
+// 日志里看不出任何异常（规则存在、计数为 0）。
+let expr = format!("0x4&0xff00ffff={mark:04x}4000");
+
+// 对
+let expr = format!("0x4&0xff00ffff=0x{mark:04x}4000");
+```
+
+已加单元测试 `server_rule_expr_has_hex_prefix` 锁住这一点。
+
+### 改标记的迁移步骤（已验证）
+
+改 `ip_id_magic` 会同时影响线上一字节和 iptables 匹配式，
+**两端必须一起改**，否则内核回 RST、连接永远建不起来：
+
+1. 两端配置改成同一个新值（例如 `0x1E07`）
+2. 重启两端；新规则会被自动添加（旧的还在，不影响）
+3. 确认连通正常：`curl --socks5-hostname ... https://www.gstatic.com/generate_204`
+4. 抓包核对 IP ID 已变成新值：`tcpdump -i eth0 -n -c 4 -v 'tcp port 8443'`
+5. **清理旧规则**（这一步才是真正的验证——旧规则删掉后连接仍正常，
+   说明新规则独立生效）：
+
+```bash
+# 客户端
+iptables -D INPUT -p tcp --sport 8443 -m u32 \
+  --u32 "0x4&0xff00ffff=0x<旧值>4000" -j DROP
+# 服务端
+iptables -t raw -D PREROUTING -p tcp --dport 8443 -m u32 \
+  --u32 "0x4&0xff00ffff=0x<旧值>4000" -j DROP
+```
+
+### 为什么标记范围必须窄
+
+这里 DROP 的包内核看不到，对外表现为「完全无响应」。
+标记只固定高字节 = 256/65536 = 0.4% 的端口探测会无响应，与正常丢包率难以区分；
+固定高 4 位 = 4096/65536 = 6%，会让探测行为前后不一致，反而更容易暴露。
+所以牺牲一点可见性换探测行为一致。
+
+残留的「单连接 IP ID 以 256 周期锯齿递增」需要换掉 iptables 匹配依据才能消除
+（把口令派生的 12 bit 放进 SYN 的 TSval 低位、TSecr 保持 0 以符合 RFC 7323）。
+
+## 39. 正常路径的日志不要用 WARN
+
+`对端已停止该流，丢弃待发数据` 在浏览器取消下载、`curl --max-time` 超时时
+**每次都会出现**，完全正常。用 `warn!` 的结果是正常使用就刷屏，
+真正的异常被淹没（实测一次 4 流中断刷 14 条）。
+
+判断标准：这条日志在不做任何异常操作时会不会出现？
+会 → `debug!` / `info!`；只在真实故障时出现 → `warn!` / `error!`。
+
+## 40. 只看 TCP 层不够：TLS 层有三处一眼可辨的违规
+
+伪装成 HTTPS 时分两个层次检查，缺一个都会被抓：
+
+| 层 | 检查手段 | 典型问题 |
+|---|---|---|
+| TCP | `tcpdump` 看 flags/options/窗口 | 缺时间戳、窗口恒定、无 FIN |
+| **TLS** | 看记录类型序列、ClientHello 结构、长度 | **缺 key_share、CCS 后明文、ClientHello 过小** |
+
+抓真实 Chrome 握手对照最直观：
+```bash
+tcpdump -i any -n -s 0 -w /tmp/real.pcap \
+  'tcp port 443 and tcp[((tcp[12] & 0xf0) >> 2):1] = 0x16'
+curl -s -o /dev/null https://www.cloudflare.com/
+tcpdump -r /tmp/real.pcap -n -X | grep -oE '1603 01[0-9a-f]{4}'
+# → 1603 0106 a3   记录 1699 字节
+```
+
+### 坑一：ClientHello 必须含 `key_share`
+
+改造前我们的 ClientHello 只有 74 字节、2 个扩展（SNI + supported_versions）。
+缺少 `key_share` 的 TLS 1.3 ClientHello **在协议上根本无法完成握手** ——
+服务端拿不到客户端的 ECDHE 公钥，无从派生密钥。
+不需要解密，只看扩展列表就能判定「这不是真客户端」。
+
+必须有的 TLS 1.3 扩展：`supported_versions`、`key_share`、`supported_groups`、
+`signature_algorithms`。真实浏览器还会有 `ALPN`、`status_request`、
+`ec_point_formats`、`psk_key_exchange_modes`、`session_ticket`、
+`extended_master_secret`、`renegotiation_info`，以及 GREASE（RFC 8701）。
+
+长度也要对：真实 Chrome 是 1699 字节（带 PQ 混合 key share），
+传统浏览器 300~600。**74 字节这个量级在真实世界里不存在。**
+
+### 坑二：ClientHello 后立刻发数据必须声明 `early_data`
+
+我们的设计是「ClientHello + QUIC 数据同批发出」以省一个 RTT。
+但 TLS 1.3 里 ClientHello 之后**不允许**出现 ApplicationData，
+除非 ClientHello 里有 `early_data` 扩展（0-RTT）。
+
+没有 `early_data` 就是明文可见的协议违规：
+「一个没请求 0-RTT 的客户端，发完 ClientHello 立刻发加密应用数据」。
+
+修法：在 ClientHello 里加 `early_data`（空体）+
+`psk_key_exchange_modes`（`psk_dhe_ke`）+ `pre_shared_key`（伪造 ticket +
+随机 binder）。binder 是随机字节也没关系——DPI 没有 PSK，无法验证真伪。
+注意 RFC 8446 要求 **`pre_shared_key` 必须是最后一个扩展**，可以校验。
+
+### 坑三：CCS 之后不能出现明文握手记录
+
+```text
+错：16 03 03 ... ServerHello
+    14 03 03 00 01 01  CCS
+    16 03 03 ... Finished     ← 明文，违规
+
+对：16 03 03 ... ServerHello
+    14 03 03 00 01 01  CCS
+    17 03 03 ... 加密数据      ← 586 字节随机密文
+```
+
+真实 TLS 1.3 在 `ChangeCipherSpec` 之后，所有握手消息
+（EncryptedExtensions / Certificate / CertificateVerify / Finished）
+都包在 0x17 记录里加密传输。在 CCS 后再看到 0x16 明文是明确的违规信号。
+
+密文用随机字节即可（DPI 无密钥无法验证），但**长度要对**：
+一张 ECDSA 自签证书链 + 三个签名结构约 500~700 字节，
+发几十字节的"加密数据"同样可疑。
+
+### 回归测试要锁住这些结构
+
+```rust
+#[test] fn client_hello_looks_real()        // 长度区间 + 必需扩展 + psk 在最后
+#[test] fn server_hello_sequence_is_valid() // 记录类型必须是 [0x16, 0x14, 0x17]
+```
+
+## 41. 两端不一致的问题「静默失效」，所以要有机检
+
+这个项目有三处「两端必须一致」的强约束，不一致时的现象**完全指向别处**：
+
+| 不一致项 | 现象 | 第一反应会去查什么 |
+|---|---|---|
+| `password` | 服务端只看到 `收到 raw 包 ... conns=0` | 握手逻辑、NAT、iptables |
+| `ip_id_magic` | 内核回 RST，连接建不起来 | 防火墙、端口、证书 |
+| 端口 | 停在「已发送 SYN，等待 SYN-ACK」 | 网络可达性、运营商封锁 |
+
+三条我们都实际踩过（DEVTIPS 28 / 38）。人工排查一次要几十分钟，
+而机器检查是毫秒级——所以 `flowtls check` 是必需品而非锦上添花。
+
+```bash
+flowtls check --server server.yaml --client client.yaml   # 两端一起查（推荐）
+flowtls check --client deploy/client-cn.yaml              # 只查一端
+flowtls check    # 自动探测当前目录的 server.yaml / client.yaml
+```
+
+设计要点：
+
+1. **只读**。不写文件、不动 iptables，随时可以跑。
+2. **退出码有意义**：0=无错误、1=有错误 → 能直接放进 CI / 部署脚本的
+   `&&` 链里。
+3. **证书要真解析**，不能只 `exists()`：
+   路径对但文件是空的时候，服务端会静默回退到自签证书，
+   伪装网站从此不被浏览器信任，而进程没有任何报错。
+   ```rust
+   rustls_pemfile::certs(&mut data.as_slice())   // 真的解析一遍
+   ```
+4. **查「配置默认值」**：`ip_id_magic` 还是编译默认值时给警告。
+   所有没改过配置的部署特征相同，一个通用 DPI 规则就能全打掉（见第 38 条）。
+
+`install-rules` / `check-rules` 也从配置读 magic 了。之前它们硬编码
+`0xF107`，改造后 magic 变成配置派生，这两个子命令就静默失效了——
+同一个坑换了个地方，说明「常量散落多处」本身就是缺陷源。
+
+## 42. 窗口上限 8MB 现在安全了，但安全的前提是自适应逻辑还在
+
+`net.max_cwnd` 从 4MB 调到 8MB，单流从 109 → 136 Mbps（+25%），8 流 164 → 175。
+
+之前不敢用 8MB 是因为会撞 quinn 的 `MAX_CHUNKS = 1024` 空洞上限而断连。
+但那时的根因是 **PMTUD 把 MTU 误降到 1200**（第 31 条）——
+包变小 10%，同样窗口下的空洞数增加 11.7%，才超限。MTU 修好后 8MB 就没问题了。
+
+关键：8MB 只是**天花板**，真正生效的上限是自适应的：
+
+```rust
+let safe_cap = ((1024.0 * 1308.0) / loss.max(0.01) * 0.7) as u64;
+let upper = safe_cap.clamp(1536 * 1024, 8 * 1024 * 1024).min(cfg_cap);
+```
+
+丢包 20% → 4.7MB，30% → 3.1MB，1% → 8MB（被 cfg_cap 拦住）。
+所以**别在改配置时把这段自适应删掉**，否则高丢包 + 大窗口必然断连。
+
+验证方式：60s 单流 + 30s 8 流并发，检查
+`grep -c 'too many gaps'` 必须为 0。
+
+## 43. 常用调试命令
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03
