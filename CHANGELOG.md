@@ -1,5 +1,174 @@
 # CHANGELOG
 
+## 2026-11-12 14:42 (北京时间)
+
+### 修复 MTU 塌陷 + 三处背压/收尾 bug，单流 200MB 从「下到 6MB 就断」到 4/4 完整
+
+浏览器测速后复盘日志，发现四个串联的 bug，都已修复并部署验证。
+
+**1. 国际线路正常丢包被误判成路径 MTU 变小（`src/quic/config.rs`）**
+
+日志里 `mtu` 从 1340 塌到 1200 后再没爬回来，丢包率随之飙到 21~51%。
+
+根因在 quinn 的 `BlackHoleDetector`：`BLACK_HOLE_THRESHOLD = 3`，
+只要连续 4 个「可疑丢包突发」（突发里所有包都大于 `min_mtu`，且之后没有
+更大的包被 ACK），就判定路径 MTU 变小，把 `current_mtu` 直接打回
+`min_mtu`（默认 1200）。国际线路丢包本来就是常态，这个启发式必然误判。
+MTU 掉到 1200 后每包少装 140 字节有效载荷（-10.4%），包数增加 11.7%，
+丢包概率进一步上升，形成恶性循环。
+
+修复：`t.mtu_discovery_config(None)` + `t.min_mtu(1340)` 双保险。
+我们的路径 MTU 是自己算出来的（5 字节记录头 + 12 nonce + 16 tag + 40 IP/TCP
+= 1413），没有需要探测的变量，PMTUD 只会带来误判。
+实测修复后 50 次采样全部 `mtu=1340`，`loss_pct=0`。
+
+**2. `ReadableError::ClosedStream` 被当成「流卡死」，误杀目标连接**
+
+`recv.read()` 返回 `Err(ClosedStream)` 只表示「流已不在接收表 / 已读空 / 已停止」，
+这是 `Readable` 事件重复投递时的正常状态。但两端代码都把任何 `Err` 当成致命错误，
+执行 `stop()` 并把 `to_tcp`/`to_write` 置空 —— 而 `to_tcp` 一断，出站任务立刻退出、
+目标 TCP 连接被关闭，正在下载的流直接截断。
+
+实测 curl 报 `transfer closed with 203699359 bytes remaining to read`，
+200MB 单流只能下到 6~8MB。客户端日志里 21 次
+`recv.read 失败，停止该流释放窗口` 全是误报。
+
+修复：`ClosedStream` 什么都不做（等下一个 `Readable`）；
+`IllegalOrderedRead` 只记日志；真正的 `ReadError::Reset` 走正常 EOF 路径。
+
+**3. quinn 内部 `send_window` 是看不见的 16MB 缓冲**
+
+`pending_bytes` 只统计我们自己暂存的数据，quinn 还有个按连接算的
+`send_window`（原来固定 16MB）。目标是本地回环服务（几百 MB/s）时，
+出站任务会先无声灌满这 16MB，再灌满 `pending`，最后触发
+「pending 超过上限」保护把流 reset。这解释了为什么修完第 2 点后
+截断点从 8MB 前移到 25MB —— 只是把缓冲加厚了。
+
+修复三件事：
+- `send_window` 改成 `max_cwnd × 2`（clamp 到 2~16MB），让它在写爆之前就返回
+  `Blocked` / 部分写入；
+- 新增 `write_blocked` 标志：`write()` 返回 `Blocked` 或只写进一部分就置位，
+  出站任务与 `pending` 水位一起检查，`Writable` 事件到达时清除并 `notify`；
+- `pending_bytes` 语义改为「从目标 socket 读出、但还没交给 QUIC 的全部字节」，
+  把还在 `action_tx` 通道里排队的那段（1024×16KB≈16MB）也算进去。
+  用 `fetch_update` + `saturating_sub` 防下溢（`reset_stream` 会清零计数器）。
+
+**4. FIN 越过未写出的数据，末尾丢约 1MB**
+
+`ServerAction::Fin` / `ProxyAction::Fin` 处理时先 `flush_pending` 再**无条件**
+`finish()`。一旦 `pending` 还有残留（正好一个背压高水位 ≈1MB），
+FIN 就跑到数据前面，客户端提前看到流结束：
+`transfer closed with 1014706 bytes remaining`。
+
+修复：新增 `fin_pending` 标志，`Fin` 只登记意图，
+真正 `finish()` 由 `flush_pending` 在 `pending` 清空时执行。两端都改。
+
+**实测（国内家宽 → 新加坡 ARM 1 核，服务端 busybox httpd 作纯净源）：**
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 单流 200MB 完整下载 | **0/4**（断在 6~25MB） | **4/4 全成功** |
+| 单流吞吐 | — | 15.8~16.9 MB/s（127~135 Mbps） |
+| 8 流并发 | 146~199 Mbps（`mtu` 会塌到 1200） | 184 Mbps，`mtu` 恒 1340 |
+| `mtu` 采样 | 73 次 `1200` + 106 次 `1340` | 50/50 全 `1340` |
+| 客户端 `loss_pct` | 最高 51% | **0** |
+| 客户端 `pending` | 74 MB | **0** |
+| 客户端 WARN/ERROR | 21 条误报 | **0** |
+
+> 遗留：curl 超时中断后，服务端要等满 30 秒背压兜底才放弃该流
+> （客户端此时没有及时发 `STOP_SENDING`）。不影响正常请求，
+> 已记录为待办。
+
+## 2026-11-12 13:54 (北京时间)
+
+### 高速率 CPU 打满与吞吐调研：定位到系统调用 + 自造 bufferbloat（100→190 Mbps，CPU 100%→22%）
+
+背景：speedtest.net 下行只到 100 Mbps 且新加坡服务器 CPU 打满；同机 hysteria1
+能跑 300+ Mbps，怀疑是加密栈问题。
+
+**1. 加密结论：不是瓶颈，换算法救不了**
+
+线上是 **2 层 AEAD**：
+
+| 层 | 算法 | 实现 |
+|---|---|---|
+| 外层（伪装/鉴权） | ChaCha20-Poly1305 | RustCrypto 纯软件 |
+| 内层（QUIC） | TLS 1.3 → AES-128-GCM | ring，ARM 走 `aes`+`pmull` 硬件指令 |
+
+`openssl speed` 在 Neoverse-N1 上实测：AES-128-GCM **2404/2531 MB/s**，
+ChaCha20-Poly1305 **796/818 MB/s**（AES-GCM 快 3.1 倍）。
+但 100 Mbps 只有 12.5 MB/s，ChaCha 也只占 **1.6% CPU**，两层合计不到 5%。
+→ hy1 只跑 1 层（QUIC 自带 TLS 1.3），per-packet 开销天然比我们少一半，
+但这不是我们掉到 100 Mbps 的原因。
+
+**2. 真正的瓶颈：每包一次系统调用**
+
+压测时采样 `/proc/<pid>/stat`：`utime=52 / stime=166` ticks —— **76% 在核态**，
+15260 pps 下每包约 83µs，几乎全在 `sendto`。
+
+改动（`src/faketcp/socket.rs`、`packet.rs`、`codec.rs`、`client.rs`、`server.rs`）：
+- 发送从 `IPPROTO_RAW + IP_HDRINCL` 换成 `AF_PACKET / SOCK_DGRAM` +
+  `PACKET_QDISC_BYPASS`，跳过 IP 路由、netfilter、MTU 检查、qdisc（不可用时自动回退）。
+  踩坑：`SOCK_DGRAM` 只让内核补以太网头，**不做 ARP**，必须自己从
+  `/proc/net/arp` 取下一跳 MAC，否则包发成全零地址被网关静默丢弃
+  （表现为客户端一直等 SYN-ACK）。
+- `sendmmsg` 批量发送（32 包/次）+ `PacketBatch` 复用缓冲池，稳态零分配。
+- `build_packet_into` / `seal_into` 去掉每包的 3~5 次 malloc 和 `pseudo` 临时 Vec。
+- `poll_transmit(now, 32, buf)` 而非传 1：一次调用封好整批等长数据报
+  （按 `segment_size` 切开逐包加外层记录），事件循环不再按包数空转。
+- nonce 改递增计数器，不再每包 `rand::thread_rng()`。
+
+**3. 背压设计错误（自造 bufferbloat）**
+
+服务端 `pending` 一度堆到 **214MB**，随后 cwnd 从 8MB 崩到 1.2MB，吞吐掉回 81 Mbps：
+- 水位取 `max_cwnd * 2` = 每流 16MB（12 流 192MB）→ 改成 `max_cwnd/4` 封顶 1MB。
+- 等待用 `sleep(5ms)` 轮询 + 每次只读 16KB → 拥塞时吞吐死锁在 3MB/s，
+  单流实测掉到 20 Mbps → 改成 `Notify` 事件驱动（`flush_pending` 归还字节即唤醒）。
+- 溢出阈值低于「一轮动作批量能推进的量」（64×16KB=1MB）会误杀正常流 → 阈值改 8 倍，
+  动作批量 256→64。
+- `net.max_cwnd` 语义修正：之前只当初始值（丢包<5% 会 1.2 倍放大到 8MB），
+  现在是真的硬上限。
+
+**实测（国内家宽 → 新加坡 ARM 1 核，服务端 busybox httpd 作纯净源）：**
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| 8 流下行 | 100 Mbps（CPU 打满） | **174~196 Mbps** |
+| 服务端 CPU | **100%** | **22%** |
+| 客户端 CPU | — | 28% |
+| `pending` 峰值 | 214 MB | ~18 MB |
+| 单流长跑 | 125 Mbps | 87 Mbps（cwnd 只到 97KB，BBR 爬升偏慢，待优化） |
+
+两端 CPU 都没饱和，瓶颈已经回到链路上（iperf3 UDP 同链路 274 Mbps / 4.8% 丢包）。
+遗留项：单流 BBR 爬升偏慢、`stream_receive_window` 与单流吞吐的关系需要单独调。
+
+## 2026-11-12 12:06 (北京时间)
+
+### 服务端切到新加坡 ARM 千兆机（203.0.113.10）+ 全量重新部署
+- 背景：客户端按新的 `deploy/client-cn.yaml` 指向 `203.0.113.10:8443` 后，
+  日志一直停在 `已发送 SYN，等待 SYN-ACK`，30 秒内没有 `三次握手完成`。
+- 排查：
+  - 新机 ICMP 74ms 可达，8443 内核真网站 `HTTP 200`，`ip route get 8.8.8.8`
+    显示源地址是内网 `10.0.0.10`（Oracle NAT），`faketcp.local_ip` 已正确写公网 IP。
+  - 新机 raw 表规则正常（`u32 "0x4&0xff00ffff=0xf1004000"`），
+    `server.log` 能看到 `收到 raw 包 client=... payload=125`，但同期
+    `conns=0` —— 包收到了却没建连。
+  - 对比源码 md5：`/opt/flowtls-src` 有 9 个文件与本地不一致
+    （`client.rs`、`config.rs`、`faketcp/packet.rs`、`quic/capped.rs`、
+    `server.rs` 等），二进制是 01:23 编的旧版本。**根因就是服务端代码没同步**。
+- 部署（全部在服务器上原生 aarch64 编译）：
+  - `tar | ssh` 推送 `src`、`Cargo.toml`、`Cargo.lock`、`web`（远端无 rsync）。
+  - `cargo build --release` 1m02s，12 个 `never used` 警告，无 error。
+  - 旧二进制备份为 `flowtls.bak.HHMM`，重启后 `LISTEN 0.0.0.0:8443`。
+  - 本地客户端同步用最新源码重编 musl 静态版。
+- 实测（国内家庭宽带 → 新加坡，SOCKS5 admin:abcd1234）：
+  - `三次握手完成` → `QUIC 连接已建立` 用时约 0.2s，无重传。
+  - `http://gstatic/204` 0.10s、`https://gstatic/204` 0.45s、`api.ipify` 200。
+  - 出口 IP 确认 `203.0.113.10`。
+  - 下载 20MB ×3：**7.6 / 7.9 MB/s**（约 61~63 Mbps），`cwnd` 爬满 8MB，
+    `loss_pct=0`；服务端侧 `lost=3886`（0.6%），`rtt_ms=94`。
+  - `rtt_ms` 由切机前的 333ms 降到 **92~95ms**。
+
 ## 2026-11-12 11:01 (北京时间)
 
 ### 修复客户端发送侧无背压（pending 峰值 125MB → 13MB）+ 日志可观测性

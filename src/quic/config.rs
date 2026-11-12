@@ -39,9 +39,24 @@ fn transport_config(
     t.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("idle timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(10)));
     // 跨境路径实测 MTU >= 1428，QUIC 载荷用 1340：
-    // 加 37 字节外层开销 + 40 字节 IP/TCP 后总包 1417，留足余量且包数比 1200 少 12%。
+    // 加 33 字节外层开销 + 40 字节 IP/TCP 后总包 1413，留足余量且包数比 1200 少 12%。
     // 包数少意味着同样丢包率下被丢弃的包更少，直播分片下载更稳。
     t.initial_mtu(1340);
+    // 必须关掉 PMTUD（路径 MTU 发现），并把 min_mtu 抬到 1340。
+    //
+    // 原因：quinn 的 BlackHoleDetector 只要观测到「连续 4 个可疑丢包突发」
+    // （BLACK_HOLE_THRESHOLD = 3，突发里所有包都大于 min_mtu 且之后没有更大的包被 ACK），
+    // 就判定路径 MTU 变小，把 current_mtu 直接打回 min_mtu（默认 1200）。
+    // 国际线路 TCP/裸 IP 丢包本来就是常态（实测 20~50%），这个启发式必然误判：
+    // 实测浏览器测速时 mtu 从 1340 塌到 1200 再也没爬回来，此后每包少装 140 字节
+    // 有效载荷（-10.4%），包数增加 11.7%，丢包概率随之上升，形成恶性循环。
+    //
+    // 我们的路径 MTU 是「自己说了算」的：外层封装固定 5 字节记录头 + 12 nonce + 16 tag，
+    // 加上 40 字节 IP/TCP 头，1340 载荷对应 1413 字节报文，稳定小于链路 1428。
+    // 中间没有任何需要探测的变量，PMTUD 只会带来误判。
+    t.mtu_discovery_config(None);
+    // 双保险：即使将来重新开启 PMTUD，也不允许降到 1340 以下
+    t.min_mtu(1340);
     // 窗口必须控制在 quinn 硬限制之内：接收组装器 MAX_CHUNKS=1024（代码写死），
     // 即单流最多容忍 1024 个乱序空洞。公式：窗口 × 丢包率 ÷ 包大小 < 1024。
     // 当前链路实测丢包 30~50%、包 1308 字节，
@@ -51,7 +66,18 @@ fn transport_config(
     // 同时 4MB 仍是本链路 BDP（70Mbps × 141ms ≈ 1.23MB）的 3 倍，够跑满。
     t.receive_window(quinn_proto::VarInt::from_u32(16 * 1024 * 1024));
     t.stream_receive_window(quinn_proto::VarInt::from_u32(4 * 1024 * 1024));
-    t.send_window(16 * 1024 * 1024);
+    // 发送侧内存上限（quinn 内部「已交给 QUIC 但还没被 ACK 释放」的字节，
+    // 按整条连接算，应用层完全看不见）。
+    // 之前固定 16MB，比 cwnd 上限（4MB）大 4 倍：目标是本地回环服务时
+    // 读取速度几百 MB/s，会先无声地灌满这 16MB，再灌满我们自己的 pending，
+    // 最后触发「pending 超过上限」保护把流 reset，下载断在 6~8MB。
+    // 收到 max_cwnd 的 2 倍：既留足 BBR 爬升空间，又让缓冲在写爆之前
+    // 就能通过 write() 返回 Blocked / 部分写入，把背压传回出站任务。
+    let send_window = max_cwnd
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_mul(2)
+        .clamp(2 * 1024 * 1024, 16 * 1024 * 1024);
+    t.send_window(send_window);
     // 让对端 5ms 内回 ACK：默认 25ms 会拉高 RTT，并使 PTO 误判丢包。
     // 通过 ACK Frequency 扩展协商，属于 QUIC 标准扩展。
     let mut ack = quinn_proto::AckFrequencyConfig::default();

@@ -75,10 +75,17 @@ fn run_async<F>(fut: F) -> Result<()>
 where
     F: std::future::Future<Output = Result<()>>,
 {
+    // worker 数量跟着 CPU 核数走。
+    // 之前写死 4：服务端机型常是 1 核（如 Oracle A1 最小规格），
+    // 4 个 worker 线程加收包线程、主循环一起抢同一个核，
+    // 上下文切换和 cache 失效反而拖慢热路径。
+    // 上限 4 是经验值：更多 worker 对「单连接多流」没有额外收益。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 4);
     tokio::runtime::Builder::new_multi_thread()
-        // 服务端 1 核也可能同时有几十条出站流（Twitch 网页会开 40+ 连接），
-        // 单 worker 会让 IO 任务互相饥饿，4 个 worker 让调度更平滑。
-        .worker_threads(4)
+        .worker_threads(workers)
         .enable_all()
         .build()
         .context("创建 tokio 运行时失败")?

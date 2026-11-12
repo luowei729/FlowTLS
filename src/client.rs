@@ -11,8 +11,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use quinn_proto::{
-    ConnectionHandle, Dir, Endpoint, EndpointConfig, Event, ReadError, StreamEvent, StreamId,
-    WriteError,
+    ConnectionHandle, Dir, Endpoint, EndpointConfig, Event, ReadError, ReadableError, StreamEvent,
+    StreamId, WriteError,
 };
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,8 +21,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{parse_host_port, ClientFile};
 use crate::faketcp::codec::{build_client_hello, parse_records, Obfs, REC_APPDATA};
-use crate::faketcp::packet::{build_packet, build_packet_opts, parse_frame, SYN_OPTIONS, TCP_ACK, TCP_PSH, TCP_SYN};
-use crate::faketcp::socket::RawSocket;
+use crate::faketcp::packet::{
+    build_packet, build_packet_into, build_packet_opts, parse_frame, SYN_OPTIONS, TCP_ACK,
+    TCP_PSH, TCP_SYN,
+};
+use crate::faketcp::socket::{PacketBatch, RawSocket};
 use crate::proxy::{self, ProxyAction};
 
 /// 本地代理任务持有的句柄，用来向事件循环发动作。
@@ -101,6 +104,9 @@ struct StreamState {
     /// 已因读取错误被 stop。置位后忽略该流的后续 Readable 事件，
     /// 否则 quinn 会持续投递 Readable，每次都重新 read/失败/stop 空转。
     stopped: bool,
+    /// 本地已 EOF，等 pending 写完才能发 FIN。
+    /// 直接 finish() 会让 FIN 越过尚未写出的数据，对端提前看到流结束。
+    fin_pending: bool,
     /// 最后一次读写时间。用于清理「双方都没发 FIN、但已经长时间无数据」的僵尸流。
     last_active: Instant,
 }
@@ -125,6 +131,7 @@ struct SendCtx {
 
 impl SendCtx {
     /// 把一个 QUIC 数据报封装成 TLS 记录 + TCP 包并发出。
+    /// 只用于零星包（stateless reset 等），热路径走 `build_datagram` + 批量发送。
     fn send_datagram(&mut self, payload: &[u8]) {
         let record = self.obfs.seal(payload);
         let pkt = build_packet(
@@ -146,6 +153,29 @@ impl SendCtx {
         // TCP 语义上序列号要按载荷长度推进，让中间盒看起来正常
         self.seq = self.seq.wrapping_add(record.len() as u32);
         // IP ID 在 magic 高字节内递增，避免固定值被识别
+        let base = self.ip_id & 0xFF00;
+        self.ip_id = base | ((self.ip_id.wrapping_add(1)) & 0x00FF);
+    }
+
+    /// 只做「明文 → 记录 → IP 报文」的纯内存构造，不碰 socket。
+    /// 三个缓冲都由调用方复用，稳态零分配；构造完由上层批量 `sendmmsg` 发出。
+    fn build_datagram(&mut self, record: &mut Vec<u8>, out: &mut Vec<u8>, payload: &[u8]) {
+        self.obfs.seal_into(record, payload);
+        build_packet_into(
+            out,
+            self.local_ip,
+            self.server_ip,
+            self.source_port,
+            self.server_port,
+            self.seq,
+            self.peer_seq,
+            TCP_PSH | TCP_ACK,
+            self.ip_id,
+            &[],
+            record,
+        );
+        // 序列号与 IP ID 仍需按包推进，保持 TCP 外观连续
+        self.seq = self.seq.wrapping_add(record.len() as u32);
         let base = self.ip_id & 0xFF00;
         self.ip_id = base | ((self.ip_id.wrapping_add(1)) & 0x00FF);
     }
@@ -288,6 +318,9 @@ async fn run_session(
     let isn: u32 = rand::thread_rng().gen();
     ctx.seq = isn.wrapping_add(1);
 
+    // 批量发送缓冲池：跨重连复用，报文缓冲只分配一次
+    let mut send_batch = PacketBatch::new();
+
     // ---- 标准三次握手：先只发 SYN ----
     // 严格 NAT/状态防火墙只放行「SYN → SYN-ACK → ACK」之后的数据包，
     // 旧版「SYN + 数据同批发」会被直接丢弃（实测江苏移动新网关）。
@@ -363,7 +396,13 @@ async fn run_session(
             // 窗口(字节) ÷ 1308 × 丢包率 必须小于 1024，否则直接断连。
             // 按当前丢包率反算安全上限，再乘 0.7 留余量，然后限制在 1.5MB~8MB。
             let safe_cap = ((1024.0 * 1308.0) / loss.max(0.01) * 0.7) as u64;
-            let upper = safe_cap.clamp(1536 * 1024, 8 * 1024 * 1024);
+            // 配置里的 net.max_cwnd 是「上限」语义：自适应只能在它之下浮动。
+            // 之前只把它当初始值，丢包率低于 5% 时会被 1.2 倍一路放大到 8MB，
+            // 用户按小带宽链路设的 4MB 完全失效（表现为窗口远超 BDP、丢包变多）。
+            let cfg_cap = cfg.net.max_cwnd.max(1536 * 1024);
+            let upper = safe_cap
+                .clamp(1536 * 1024, 8 * 1024 * 1024)
+                .min(cfg_cap);
             let next = next.clamp(1536 * 1024, upper);
             max_cwnd.store(next, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
@@ -471,7 +510,7 @@ async fn run_session(
         // 每次状态变化后都要把 QUIC 想发的包全部排空。
         // 握手未完成时不能发：严格 NAT 会丢掉 SYN-ACK 之前的数据包。
         if !awaiting_syn_ack {
-            drain_transmits(&mut conn, &mut ctx);
+            drain_transmits(&mut conn, &mut ctx, &mut send_batch);
         }
         // 处理事件（连接建立、流可读、流可写）
         let disconnected = drain_events(&mut conn, &mut streams, &mut connected_logged);
@@ -543,23 +582,55 @@ fn handle_incoming(
 }
 
 /// 把所有待发的 QUIC 包排空。
+///
+/// 优化要点：明文/记录/IP 报文全部用复用缓冲，且攒满 32 个包后
+/// 一次性 `sendmmsg` 发出——单包 `sendto` 在 1 核机器上约 40~50µs/包，
+/// 是高速率下 CPU 打满的主因。
 /// 注意：poll_transmit 会向 buf 追加写入，每次循环必须先 clear，
 /// 否则 buf 无限增长，seal 会越来越慢，看起来像死循环。
-fn drain_transmits(conn: &mut quinn_proto::Connection, ctx: &mut SendCtx) {
-    let mut buf = Vec::with_capacity(2048);
-    let mut sent = 0;
+fn drain_transmits(
+    conn: &mut quinn_proto::Connection,
+    ctx: &mut SendCtx,
+    batch: &mut PacketBatch,
+) {
+    let mut n = 0usize;
+    // 一次 poll_transmit 最多要多少个 QUIC 数据报。
+    // 之前固定传 1，等于「每个数据报走一遍完整状态机」：pacing 在高速率下
+    // 每包都会拦一次，于是每次唤醒只能发一个包，事件循环被 1 个包/次拖着空转。
+    // 传 32 后 quinn 会在一次调用里连续封好整批（segment_size 等长对齐），
+    // 我们按 segment_size 切开逐包加外层 TLS 记录，再一次性 sendmmsg 发出。
+    // 线上格式完全不变，只是少了几十倍的调度与状态机开销。
+    const DATAGRAMS_PER_POLL: usize = PacketBatch::MAX;
     loop {
-        buf.clear();
-        let Some(t) = conn.poll_transmit(Instant::now(), 1, &mut buf) else {
+        // Instant::now() 提到循环外：每包取一次时钟在 1.2 万 pps 下也是可观开销
+        let now = Instant::now();
+        batch.plain.clear();
+        let Some(t) = conn.poll_transmit(now, DATAGRAMS_PER_POLL, &mut batch.plain) else {
             break;
         };
-        tracing::debug!(size = t.size, dst_port = ctx.server_port, "发出 QUIC 数据报");
-        ctx.send_datagram(&buf[..t.size]);
-        sent += 1;
-        // 每轮最多 64 个包：一次发上千包会长时间占住事件循环，
-        // 导致入向 ACK 在 channel 里积压，RTT 虚高、PTO 误判。
-        if sent >= 64 {
+        // 单数据报时 segment_size 为 None；多数据报时每个数据报都等长且按 segment 对齐，
+        // 因此直接按 segment_size 切片即可（quinn 已保证末包补齐）。
+        let seg = t.segment_size.unwrap_or(t.size);
+        if t.size == 0 || seg == 0 {
             break;
+        }
+        let mut off = 0usize;
+        while off < t.size && n < PacketBatch::MAX {
+            let end = (off + seg).min(t.size);
+            batch.ensure(n + 1);
+            ctx.build_datagram(&mut batch.record, &mut batch.bufs[n], &batch.plain[off..end]);
+            n += 1;
+            off = end;
+        }
+        // 每轮最多 32 个包：一次发上千包会长时间占住事件循环，
+        // 导致入向 ACK 在 channel 里积压，RTT 虚高、PTO 误判。
+        if n >= PacketBatch::MAX {
+            break;
+        }
+    }
+    if n > 0 {
+        if let Err(e) = ctx.raw.send_batch(&batch.bufs[..n], ctx.server_ip) {
+            tracing::warn!(error = %e, "批量发送失败");
         }
     }
 }
@@ -639,7 +710,6 @@ fn read_stream(
     st.last_active = Instant::now();
     let mut out = Vec::new();
     let mut finished = false;
-    let mut read_err = false;
     {
         let mut recv = conn.recv_stream(id);
         match recv.read(true) {
@@ -660,18 +730,15 @@ fn read_stream(
                 }
                 let _ = chunks.finalize();
             }
-            Err(_) => read_err = true,
+            // “流已不在接收表 / 已读空 / 已停止”是正常状态：
+            // Readable 事件会重复投递，上一轮已把数据读空，这一轮自然拿不到东西。
+            // 旧代码把任何 Err 都判成「流卡死」直接 stop()，会让还在传输的流被提前
+            // 中断，日志里大量 "recv.read 失败，停止该流释放窗口" 都是误报。
+            Err(ReadableError::ClosedStream) => {}
+            Err(ReadableError::IllegalOrderedRead) => {
+                tracing::warn!(stream = ?id, "有序读写在无序读之后，忽略本轮");
+            }
         };
-    }
-    if read_err {
-        // 流已进入不可恢复状态（组装器被锁定）。
-        // 继续跳过只会让这条流的窗口永不释放，最终堆成几十 MB pending，
-        // 所以直接 stop：释放流控额度，让请求失败重试，不拖累整条连接。
-        st.stopped = true;
-        st.remote_finished = true;
-        let _ = conn.recv_stream(id).stop(0u32.into());
-        tracing::warn!(stream = ?id, "recv.read 失败，停止该流释放窗口");
-        return;
     }
     if !out.is_empty() {
         // 每条数据都打 INFO 会写出几十万行、几十 MB 日志（实测 8 小时 62MB），
@@ -709,6 +776,15 @@ fn flush_pending(
             }
         }
     }
+    // 本地 EOF 后必须等 pending 真正写空再 finish()，
+    // 否则 FIN 会越过尚未写出的数据，服务端提前认为请求结束。
+    let ready = st.fin_pending && st.pending.is_empty();
+    if ready {
+        st.fin_pending = false;
+    }
+    if ready {
+        let _ = conn.send_stream(id).finish();
+    }
 }
 
 /// 处理本地代理任务发来的动作。
@@ -738,6 +814,7 @@ fn handle_action(
                     local_finished: false,
                     remote_finished: false,
                     stopped: false,
+                    fin_pending: false,
                     last_active: Instant::now(),
                 },
             );
@@ -765,14 +842,17 @@ fn handle_action(
             flush_pending(conn, streams, id);
         }
         ProxyAction::Fin(id) => {
-            let Some(st) = streams.get_mut(&id) else { return };
-            if st.local_finished {
-                return;
+            {
+                let Some(st) = streams.get_mut(&id) else { return };
+                if st.local_finished {
+                    return;
+                }
+                st.local_finished = true;
+                // 只登记「待发 FIN」，真正 finish() 交给 flush_pending
+                // 在 pending 清空时执行；否则 FIN 会越过残留数据。
+                st.fin_pending = true;
             }
-            st.local_finished = true;
-            // 先清空 pending，再 FIN；写不完时依靠后续 Writable 事件继续
             flush_pending(conn, streams, id);
-            let _ = conn.send_stream(id).finish();
         }
     }
 }

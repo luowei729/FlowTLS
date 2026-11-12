@@ -202,27 +202,59 @@ pub fn build_packet_opts(
     options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
+    // 保留原 API：内部转调零分配版本，测试和老调用点都不用改
+    let mut out = Vec::with_capacity(40 + options.len() + payload.len());
+    build_packet_into(
+        &mut out, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, ip_id, options, payload,
+    );
+    out
+}
+
+/// 构造 IPv4 + TCP 报文，直接写入调用方提供的缓冲区（可反复复用）。
+///
+/// 与 `build_packet_opts` 的两点区别，都是为了高速率下的 CPU 开销：
+/// 1. 复用 `out` 已分配的内存，不再每包 `vec![0u8; total_len]`；
+/// 2. TCP 校验和直接在 `out` 上分段累加，不再拼一个 `pseudo` 临时 Vec。
+///    原实现每包要把「伪头 + TCP 头 + 载荷」整段 memcpy 一遍，
+///    等于载荷被遍历两次（一次拷贝、一次求和），这里只剩一次。
+#[allow(clippy::too_many_arguments)]
+pub fn build_packet_into(
+    out: &mut Vec<u8>,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    ip_id: u16,
+    options: &[u8],
+    payload: &[u8],
+) {
     let header_len = 20 + options.len();
     let tcp_len = header_len + payload.len();
     let total_len = 20 + tcp_len;
-    let mut buf = vec![0u8; total_len];
+
+    // 复用容量：resize 只改长度，已分配的堆内存保留；下面每个字节都会被覆盖，
+    // 因此不需要先 clear（少一次 memset）
+    out.resize(total_len, 0);
 
     // ---- IPv4 头 ----
-    buf[0] = 0x45; // 版本 4，头长 5*4=20
-    buf[1] = 0; // TOS 普通
-    buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    buf[4..6].copy_from_slice(&ip_id.to_be_bytes());
-    buf[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF 位，禁止分片
-    buf[8] = 64; // TTL
-    buf[9] = 6; // TCP
-    buf[10..12].copy_from_slice(&[0, 0]); // 校验和先占位
-    buf[12..16].copy_from_slice(&src_ip.octets());
-    buf[16..20].copy_from_slice(&dst_ip.octets());
-    let ip_sum = fold(sum16(&buf[..20]));
-    buf[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    out[0] = 0x45; // 版本 4，头长 5*4=20
+    out[1] = 0; // TOS 普通
+    out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    out[4..6].copy_from_slice(&ip_id.to_be_bytes());
+    out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF 位，禁止分片
+    out[8] = 64; // TTL
+    out[9] = 6; // TCP
+    out[10..12].copy_from_slice(&[0, 0]); // 校验和先占位
+    out[12..16].copy_from_slice(&src_ip.octets());
+    out[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_sum = fold(sum16(&out[..20]));
+    out[10..12].copy_from_slice(&ip_sum.to_be_bytes());
 
     // ---- TCP 头 ----
-    let t = &mut buf[20..20 + header_len];
+    let t = &mut out[20..20 + header_len];
     t[0..2].copy_from_slice(&src_port.to_be_bytes());
     t[2..4].copy_from_slice(&dst_port.to_be_bytes());
     t[4..8].copy_from_slice(&seq.to_be_bytes());
@@ -238,27 +270,64 @@ pub fn build_packet_opts(
     }
 
     // 载荷拷贝到 TCP 头之后
-    buf[20 + header_len..].copy_from_slice(payload);
+    out[20 + header_len..].copy_from_slice(payload);
 
-    // ---- TCP 校验和（含伪头）----
-    // 伪头：源 IP(4) + 目的 IP(4) + 0 + 协议(1) + TCP 长度(2)
-    let mut pseudo = Vec::with_capacity(12 + tcp_len);
-    pseudo.extend_from_slice(&src_ip.octets());
-    pseudo.extend_from_slice(&dst_ip.octets());
-    pseudo.push(0);
-    pseudo.push(6);
-    pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&buf[20..20 + header_len]);
-    pseudo.extend_from_slice(payload);
-    let tcp_sum = fold(sum16(&pseudo));
-    buf[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
-
-    buf
+    // ---- TCP 校验和（伪头 + TCP 头 + 载荷，全程零额外拷贝）----
+    // 伪头 12 字节是固定格式，放栈上即可，不必再分配 Vec：
+    // 源 IP(4) + 目的 IP(4) + 0 + 协议(1) + TCP 长度(2)
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&src_ip.octets());
+    pseudo[4..8].copy_from_slice(&dst_ip.octets());
+    pseudo[9] = 6;
+    pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    // TCP 头里的校验和字段此刻是 0，正好符合反码求和规则；
+    // TCP 头与载荷在 out 中是连续的，一次遍历覆盖两段
+    let mut sum = sum16(&pseudo);
+    sum += sum16(&out[20..total_len]);
+    let tcp_sum = fold(sum);
+    out[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 校验和自验证：正确的报文整体再求一次反码和，结果必须为 0。
+    /// 这是检验「去掉 pseudo 临时 Vec、改为在 out 上分段累加」是否正确的关键用例，
+    /// 覆盖奇数/偶数载荷长度，确保首尾拼接的字节对齐规则没写错。
+    #[test]
+    fn checksum_valid() {
+        let src = Ipv4Addr::new(10, 0, 0, 253);
+        let dst = Ipv4Addr::new(129, 150, 44, 117);
+        for len in [0usize, 1, 2, 3, 100, 1299, 1300, 1401] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
+            let mut pkt = Vec::new();
+            build_packet_into(
+                &mut pkt,
+                src,
+                dst,
+                44311,
+                8443,
+                1234,
+                5678,
+                TCP_PSH | TCP_ACK,
+                0xF107,
+                &[],
+                &payload,
+            );
+            // IP 头：整头求和后折叠应为 0
+            assert_eq!(fold(sum16(&pkt[..20])), 0, "IP 校验和错误 len={len}");
+            // TCP：伪头 + TCP 段求和后折叠应为 0
+            let tcp_len = pkt.len() - 20;
+            let mut pseudo = [0u8; 12];
+            pseudo[0..4].copy_from_slice(&src.octets());
+            pseudo[4..8].copy_from_slice(&dst.octets());
+            pseudo[9] = 6;
+            pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+            let s = sum16(&pseudo) + sum16(&pkt[20..]);
+            assert_eq!(fold(s), 0, "TCP 校验和错误 len={len}");
+        }
+    }
 
     #[test]
     fn build_and_parse_roundtrip() {

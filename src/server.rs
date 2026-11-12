@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use bytes::BytesMut;
 use quinn_proto::{
     Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ReadError,
-    ServerConfig, StreamEvent, StreamId, WriteError,
+    ReadableError, ServerConfig, StreamEvent, StreamId, WriteError,
 };
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,8 +20,11 @@ use tokio::sync::mpsc;
 
 use crate::config::{parse_listen, ServerFile};
 use crate::faketcp::codec::{build_server_hello, parse_records, Obfs, REC_APPDATA};
-use crate::faketcp::packet::{build_packet, build_packet_opts, parse_frame, SYN_OPTIONS, TCP_ACK, TCP_PSH, TCP_SYN};
-use crate::faketcp::socket::RawSocket;
+use crate::faketcp::packet::{
+    build_packet, build_packet_into, build_packet_opts, parse_frame, SYN_OPTIONS, TCP_ACK,
+    TCP_PSH, TCP_SYN,
+};
+use crate::faketcp::socket::{PacketBatch, RawSocket};
 use crate::proxy::decode_target;
 
 /// 出站任务发回事件循环的动作
@@ -42,6 +45,20 @@ struct ServerStream {
     /// 出站任务靠它感知下游堵塞，从而停止读目标 socket——这就是背压。
     /// quic-go 里由阻塞式 Write 完成，quinn-proto 的同步 write 需要自己做。
     pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// pending 被消化时通知出站任务。
+    /// 之前出站任务用「每 5ms 醒来读 16KB」轮询水位，拥塞时吞吐被锁在
+    /// 16KB ÷ 5ms ≈ 3MB/s，BBR 看到流量受限就永远爬不出低速区（实测单流 20Mbps）。
+    /// 改成事件通知：pending 一降下去立刻唤醒，等待只有微秒级。
+    drain_notify: Arc<tokio::sync::Notify>,
+    /// QUIC 发送缓冲是否已满（write 返回 Blocked / 只写了部分）。
+    /// 这是真正的背压信号：pending_bytes 只统计「我们自己暂存」的字节，
+    /// 而 quinn 内部还有一个 send_window（默认十几 MB、按连接算）的发送缓冲，
+    /// 那部分背压完全看不见。所以出站任务必须同时看这个标志，
+    /// 否则会以本地回环速度（几百 MB/s）把数据吸进来，直到 quinn 缓冲写满、
+    /// 我们自己的 pending 涨过安全阈值，整条流被当作僵尸流 reset——
+    /// 实测表现就是单流下到 6~8MB 后 curl 报
+    /// "transfer closed with ... bytes remaining to read"。
+    write_blocked: Arc<std::sync::atomic::AtomicBool>,
     /// 目标地址帧累积缓冲
     target_buf: Vec<u8>,
     /// 目标地址是否已经解析完毕
@@ -53,6 +70,11 @@ struct ServerStream {
     /// 已因读取错误被 stop。置位后忽略该流的后续 Readable 事件，
     /// 否则 quinn 会持续投递 Readable，每次都重新 read/失败/stop 空转。
     stopped: bool,
+    /// 上游（目标 socket）已 EOF，等 pending 写完才能发 FIN。
+    /// 直接 finish() 会在 pending 之前就把 FIN 发出去，
+    /// 客户端会提前看到流结束——实测就是 200MB 下载最后少掉约 1MB
+    /// （刚好是一个背压高水位），curl 报 exit 18。
+    fin_pending: bool,
     /// 最后一次读写时间，用于 5 分钟空闲超时清理僵尸流。
     last_active: Instant,
 }
@@ -63,11 +85,14 @@ impl Default for ServerStream {
             to_tcp: None,
             pending: Vec::new(),
             pending_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+            write_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             target_buf: Vec::new(),
             target_ready: false,
             local_finished: false,
             remote_finished: false,
             stopped: false,
+            fin_pending: false,
             last_active: Instant::now(),
         }
     }
@@ -187,10 +212,16 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
     let mut last_lost = 0u64;
     let server_quic: Arc<ServerConfig> =
         Arc::new(crate::quic::config::server_config(max_cwnd.clone()));
-    // 背压高水位：默认为窗口上限的 2 倍。
-    // 千兆（8MB）→ 16MB；30Mbps 链路（1MB）→ 2MB。
-    // 出站任务看到 pending 超过这个值就暂停读目标 socket，让目标 TCP 窗口收缩。
-    let pending_high_water = ((cfg.net.max_cwnd as usize).saturating_mul(2)).max(512 * 1024);
+    // 背压高水位：决定「每条流最多能在内存里堆多少待发数据」。
+    // 之前取窗口上限的 2 倍（千兆 8MB → 每流 16MB），实测这是最严重的问题：
+    // 12 条并发流能堆到 214MB，目标 TCP 被读得飞快，QUIC 却发不出去，
+    // 于是 cwnd 允许时就会把几百 MB 一次性灌进链路 → 瓶颈队列溢出 →
+    // 大量丢包 → BBR 窗口从 8MB 崩到 1.2MB，吞吐被锁在 100Mbps 上下，
+    // 而且 RTT 抖动剧烈。这就是典型的自造 bufferbloat。
+    // 正确做法是把它绑到「链路 BDP」而不是「窗口上限」：
+    // 按 100ms RTT 估算，每流 1MB 已经足够填满 80Mbps 的在途数据，
+    // 再多只是排队。多条流合计仍在可控范围（12 流约 12MB）。
+    let pending_high_water = ((cfg.net.max_cwnd as usize) / 4).clamp(512 * 1024, 1024 * 1024);
     let mut endpoint = Endpoint::new(
         Arc::new(EndpointConfig::default()),
         Some(server_quic.clone()),
@@ -207,10 +238,18 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
     // 有界动作队列：按 quic-go 的「阻塞写」模型做背压。
     // 目标读到数据后要等队列有空位才能继续读，队列满 → 目标 TCP 接收缓冲满
     // → 目标发送变慢。这样下行数据不会在 pending 里无限堆积。
-    // 2048 项 ≈ 32MB：70Mbps 下约 3.7 秒缓冲，
-    // 256 项（4MB）只有 0.46 秒，主循环稍一抖动就会误触发背压降速。
-    let (action_tx, mut action_rx) = mpsc::channel::<ServerAction>(2048);
+    // 1024 项 ≈ 16MB（200Mbps 下约 0.65 秒）：既能吸收主循环抖动，
+    // 又不会在 cwnd 收缩时攒出几百 MB 的 backlog（之前 2048 项 + 每流 16MB
+    // 背压上限实测堆到过 214MB，直接把链路打成 bufferbloat）。
+    let (action_tx, mut action_rx) = mpsc::channel::<ServerAction>(1024);
     let mut last_stats = Instant::now();
+
+    // 批量发送缓冲池：全部报文缓冲只分配一次，之后每轮复用。
+    // 这是把 11000 pps 的「每包 3~5 次 malloc + 每包一次 sendto」
+    // 压成「每 32 包一次 sendmmsg」的关键。
+    let mut send_batch = PacketBatch::new();
+    // `poll_transmit` 的备用缓冲（保留签名完整性，实际不再使用）
+    let mut scratch: Vec<u8> = Vec::new();
 
     loop {
         // 每 2 秒打印一次每条连接的路径统计，定位吞吐瓶颈
@@ -260,7 +299,13 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
             // 窗口(字节) ÷ 1308 × 丢包率 必须小于 1024，否则直接断连。
             // 按当前丢包率反算安全上限，再乘 0.7 留余量，然后限制在 1.5MB~8MB。
             let safe_cap = ((1024.0 * 1308.0) / loss.max(0.01) * 0.7) as u64;
-            let upper = safe_cap.clamp(1536 * 1024, 8 * 1024 * 1024);
+            // 配置里的 net.max_cwnd 是「上限」语义：自适应只能在它之下浮动。
+            // 之前只当初始值，丢包率低于 5% 时会被 1.2 倍一路放大到 8MB，
+            // 用户按小带宽链路设的值完全失效（窗口远超 BDP，丢包反而变多）。
+            let cfg_cap = cfg.net.max_cwnd.max(1536 * 1024);
+            let upper = safe_cap
+                .clamp(1536 * 1024, 8 * 1024 * 1024)
+                .min(cfg_cap);
             let next = next.clamp(1536 * 1024, upper);
             max_cwnd.store(next, std::sync::atomic::Ordering::Relaxed);
             // 收包队列积压：持续不归零说明主循环处理不过来（或批量上限太小）
@@ -327,10 +372,13 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
             // 3. 出站任务回传的数据
             maybe = action_rx.recv() => {
                 let Some(first) = maybe else { break };
-                // 同样批量消化：上传大流量时目标回写动作会集中爆发
-                let mut actions: Vec<ServerAction> = Vec::with_capacity(256);
+                // 同样批量消化：上传大流量时目标回写动作会集中爆发。
+                // 每轮上限 64 项（约 1MB）而不是 256 项（4MB）：
+                // 这个上限直接决定了单轮能往某条流的 pending 里推进多少，
+                // 必须明显小于背压溢出的判断阈值，否则会误杀正常流。
+                let mut actions: Vec<ServerAction> = Vec::with_capacity(64);
                 actions.push(first);
-                while actions.len() < 256 {
+                while actions.len() < 64 {
                     match action_rx.try_recv() {
                         Ok(a) => actions.push(a),
                         Err(_) => break,
@@ -344,7 +392,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
 
         // 每条连接都要把 QUIC 待发包排空，并处理事件
         for c in conns.values_mut() {
-            drain_transmits(c, &raw, port, magic, &obfs);
+            drain_transmits(c, &raw, port, &obfs, &mut send_batch, &mut scratch);
             drain_events(c, &action_tx, pending_high_water);
         }
         // 清理已双向结束的流：之前从不删除，长时间跑高并发（直播/测速）会一直累积，
@@ -522,7 +570,7 @@ fn handle_packet(
                 // endpoint 直接产生响应（如 Retry / stateless reset）
                 if let Some(found) = find_by_client(conns, client) {
                     if let Some(c) = conns.get_mut(&found) {
-                        c.send_datagram(raw, port, magic, obfs, &buf[..t.size]);
+                        c.send_datagram_one(raw, port, obfs, &buf[..t.size]);
                     }
                 }
             }
@@ -618,21 +666,28 @@ fn handle_perfunctory_syn(
 }
 
 impl ServerConn {
-    /// 把一个 QUIC 数据报封装成 TLS 记录 + TCP 包发给客户端。
-    fn send_datagram(
+    /// 把一个 QUIC 数据报封装成 TLS 记录 + TCP 包，写入 `out` 后由调用方批量发送。
+    ///
+    /// 与旧实现（每包内部 `raw.send`）的区别：这里不碰 socket，
+    /// 只负责「明文 → 记录 → IP 报文」的纯内存构造，
+    /// 让上层可以把 32 个包攒起来用一次 `sendmmsg` 发出去。
+    ///
+    /// 返回目的 IPv4，供批量发送复用；非 IPv4 客户端返回 None。
+    fn build_datagram(
         &mut self,
-        raw: &Arc<RawSocket>,
         port: u16,
-        magic: u16,
         obfs: &Obfs,
+        record: &mut Vec<u8>,
+        out: &mut Vec<u8>,
         payload: &[u8],
-    ) {
-        let record = obfs.seal(payload);
-        let dst_ip = match self.client.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return,
+    ) -> Option<std::net::Ipv4Addr> {
+        // 外层 AEAD：写进复用缓冲，不分配
+        obfs.seal_into(record, payload);
+        let std::net::IpAddr::V4(dst_ip) = self.client.ip() else {
+            return None;
         };
-        let pkt = build_packet(
+        build_packet_into(
+            out,
             self.local_ip,
             dst_ip,
             port,
@@ -641,39 +696,102 @@ impl ServerConn {
             self.peer_seq,
             TCP_PSH | TCP_ACK,
             self.ip_id,
-            &record,
+            &[],
+            record,
         );
-        if let Err(e) = raw.send(&pkt, dst_ip) {
-            tracing::warn!(error = %e, "发送失败");
-        }
+        // TCP 语义：序列号按载荷推进，让中间盒看到的流是连续的
         self.seq = self.seq.wrapping_add(record.len() as u32);
         // IP ID 在 magic 高字节内递增
         let base = self.ip_id & 0xFF00;
         self.ip_id = base | ((self.ip_id.wrapping_add(1)) & 0x00FF);
+        Some(dst_ip)
+    }
+
+    /// 单包发送：只用于 Retry / stateless reset 这类低频冷路径。
+    /// 热路径（正常数据包）不走这里，否则又会退化成「一包一次 sendto」。
+    fn send_datagram_one(
+        &mut self,
+        raw: &Arc<RawSocket>,
+        port: u16,
+        obfs: &Obfs,
+        payload: &[u8],
+    ) {
+        let mut record = Vec::with_capacity(2048);
+        let mut pkt = Vec::with_capacity(2048);
+        if let Some(dst_ip) = self.build_datagram(port, obfs, &mut record, &mut pkt, payload) {
+            if let Err(e) = raw.send(&pkt, dst_ip) {
+                tracing::warn!(error = %e, "发送失败");
+            }
+        }
     }
 }
 
 /// 排空一条连接的待发 QUIC 包。
+///
+/// 核心优化：不再「一包一次 sendto」，而是攒满 `PacketBatch::MAX` 个
+/// 或队列取空后，用一次 `sendmmsg` 发出。对应地，明文/记录/IP 报文
+/// 三个缓冲全部复用，稳态零分配。
 fn drain_transmits(
     c: &mut ServerConn,
     raw: &Arc<RawSocket>,
     port: u16,
-    magic: u16,
     obfs: &Obfs,
+    batch: &mut PacketBatch,
+    buf: &mut Vec<u8>,
 ) {
-    let mut buf = Vec::with_capacity(2048);
-    let mut sent = 0;
+    let std::net::IpAddr::V4(dst_ip) = c.client.ip() else {
+        return;
+    };
+    let mut n = 0usize;
+    // 一次 poll_transmit 最多要多少个 QUIC 数据报。
+    // 传 1 时每个数据报都要走一遍完整状态机 + pacing 检查，高速率下
+    // 每次唤醒只发一个包，事件循环被迫按包数空转（1.2 万 pps 就是 1.2 万次）。
+    // 传 32 后 quinn 在一次调用里封好整批（等长、按 segment_size 对齐），
+    // 我们按 segment_size 切开逐包加外层 TLS 记录，再一次性 sendmmsg 发出。
+    const DATAGRAMS_PER_POLL: usize = PacketBatch::MAX;
     loop {
+        // Instant::now() 提到循环外，避免每包一次时钟读取
+        let now = Instant::now();
         // poll_transmit 是追加写入，必须先清空，否则缓冲区无限膨胀
-        buf.clear();
-        let Some(t) = c.conn.poll_transmit(Instant::now(), 1, &mut buf) else {
+        batch.plain.clear();
+        let Some(t) = c.conn.poll_transmit(now, DATAGRAMS_PER_POLL, &mut batch.plain) else {
             break;
         };
-        c.send_datagram(raw, port, magic, obfs, &buf[..t.size]);
-        sent += 1;
-        // 每轮最多 64 个包，避免长时间占住事件循环导致 ACK 积压
-        if sent >= 64 {
+        // 多数据报时 segment_size 给出单个数据报长度；单数据报为 None。
+        // quinn 已保证批内每个数据报等长并按 segment 对齐（末包补齐）。
+        let seg = t.segment_size.unwrap_or(t.size);
+        if t.size == 0 || seg == 0 {
             break;
+        }
+        let mut off = 0usize;
+        while off < t.size && n < PacketBatch::MAX {
+            let end = (off + seg).min(t.size);
+            batch.ensure(n + 1);
+            // 明文 → 记录 → IP 报文，三步都写在复用缓冲上
+            if c.build_datagram(
+                port,
+                obfs,
+                &mut batch.record,
+                &mut batch.bufs[n],
+                &batch.plain[off..end],
+            )
+            .is_none()
+            {
+                break;
+            }
+            n += 1;
+            off = end;
+        }
+        // 每轮最多 32 个包：既对齐 sendmmsg 上限，又避免长时间占住事件循环
+        // 导致入向 ACK 在 channel 里积压、RTT 虚高、PTO 误判。
+        if n >= PacketBatch::MAX {
+            break;
+        }
+    }
+    let _ = buf;
+    if n > 0 {
+        if let Err(e) = raw.send_batch(&batch.bufs[..n], dst_ip) {
+            tracing::warn!(error = %e, "批量发送失败");
         }
     }
 }
@@ -705,6 +823,13 @@ fn drain_events(
                 read_stream(c, id, action_tx, pending_high_water);
             }
             Event::Stream(StreamEvent::Writable { id }) => {
+                // QUIC 发送缓冲腾出空间：这是端到端背压的「放行」信号。
+                // 清掉标志并唤醒出站任务，它可以继续读目标 socket 了。
+                if let Some(s) = c.streams.get_mut(&id) {
+                    s.write_blocked
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    s.drain_notify.notify_waiters();
+                }
                 flush_pending(c, id);
             }
             Event::Stream(StreamEvent::Finished { id }) => {
@@ -744,9 +869,8 @@ fn read_stream(
     st.last_active = Instant::now();
     let mut out = Vec::new();
     let mut finished = false;
-    // 出站缓冲打满 / 接收流已卡死时必须停流：标记后再动 conn，避免借用冲突
+    // 出站缓冲打满时必须停流：标记后再动 conn，避免借用冲突
     let mut need_stop = false;
-    let mut stop_recv = false;
     {
         let mut recv = c.conn.recv_stream(id);
         match recv.read(true) {
@@ -767,21 +891,21 @@ fn read_stream(
                 }
                 let _ = chunks.finalize();
             }
-            Err(_) => {
-                // 流已进入不可恢复状态（组装器被锁定）。
-                // 继续跳过只会让这条流的接收窗口永不释放，上行数据堆成几十 MB pending。
-                // 直接 stop 释放流控额度，让客户端该请求失败重试。
-                stop_recv = true;
+            // “流已不在接收表 / 已读空 / 已停止”是正常状态：
+            // Readable 事件会重复投递，上一轮已经把数据读完，这一轮再读就拿到
+            // ReadableError::ClosedStream。
+            // 旧代码把任何 Err 都当成「流卡死」，执行 stop() 并把 st.to_tcp 置 None，
+            // 而 to_tcp 一断，出站任务立刻退出、目标 TCP 连接被关闭，
+            // 正在下载的这条流直接被截断——实测 curl 报
+            // "transfer closed with ... bytes remaining to read"，
+            // 200MB 单流只能下到 6~7MB 就断。
+            // 这里什么都不做，等下一个 Readable 事件即可。
+            Err(ReadableError::ClosedStream) => {}
+            // 有序读写在无序读之后：编程错误，只记日志不杀流
+            Err(ReadableError::IllegalOrderedRead) => {
+                tracing::warn!(stream = ?id, "有序读写在无序读之后，忽略本轮");
             }
         };
-    }
-    if stop_recv {
-        st.stopped = true;
-        st.remote_finished = true;
-        st.to_tcp = None;
-        let _ = c.conn.recv_stream(id).stop(0u32.into());
-        tracing::warn!(stream = ?id, "接收流已卡死，停止并释放窗口");
-        return;
     }
 
     if !st.target_ready {
@@ -812,6 +936,8 @@ fn read_stream(
                         rx,
                         action_tx,
                         st.pending_bytes.clone(),
+                        st.drain_notify.clone(),
+                        st.write_blocked.clone(),
                         pending_high_water,
                     ));
                 }
@@ -862,6 +988,10 @@ fn reset_stream(c: &mut ServerConn, id: StreamId, why: &str) {
     if let Some(st) = c.streams.get_mut(&id) {
         st.pending.clear();
         st.pending_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+        // 配额被强制清零也要唤醒出站任务，否则它会一直卡在等待里直到 50ms 兜底
+        st.write_blocked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        st.drain_notify.notify_waiters();
         st.target_buf.clear();
         st.to_tcp = None;
         st.local_finished = true;
@@ -877,6 +1007,7 @@ fn reset_stream(c: &mut ServerConn, id: StreamId, why: &str) {
 /// 把暂存数据写回 QUIC 流。
 fn flush_pending(c: &mut ServerConn, id: StreamId) {
     let Some(st) = c.streams.get_mut(&id) else { return };
+    let mut freed = false;
     while !st.pending.is_empty() {
         match c.conn.send_stream(id).write(&st.pending) {
             Ok(n) if n > 0 => {
@@ -884,15 +1015,54 @@ fn flush_pending(c: &mut ServerConn, id: StreamId) {
                 // 已写出，归还背压配额，通知出站任务可以继续读目标
                 st.pending_bytes
                     .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+                freed = true;
             }
             Ok(_) => break,
             Err(WriteError::Blocked) => break,
-            Err(_) => {
+            Err(WriteError::Stopped(code)) => {
+                // 对端已经丢弃这条流（发了 STOP_SENDING / RESET）：
+                // 剩下的数据永远送不出去，必须丢掉，但要留日志。
+                tracing::warn!(
+                    stream = ?id,
+                    code = %code,
+                    dropped = st.pending.len(),
+                    "对端已停止该流，丢弃待发数据"
+                );
                 st.pending.clear();
                 st.pending_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+                freed = true;
+                break;
+            }
+            Err(WriteError::ClosedStream) => {
+                // 流已经被关闭（reset/finish）：剩下的数据不可能再送出
+                st.pending.clear();
+                st.pending_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+                freed = true;
                 break;
             }
         }
+    }
+    // 归还了配额就唤醒出站任务：它可能正卡在 pending 水位上，
+    // 事件驱动唤醒比 5ms 轮询快两个数量级，直接决定了拥塞时的吞吐。
+    if freed {
+        // pending 已经全部交给 quinn，说明发送缓冲的压力缓解了，
+        // 清掉阻塞标志（否则出站任务会一直等到下一个 Writable 事件）。
+        if st.pending.is_empty() {
+            st.write_blocked
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        st.drain_notify.notify_waiters();
+    }
+    // 上游已 EOF 且这一次终于把残留数据全部写进 QUIC，才能发 FIN。
+    // 否则 FIN 会越过还没写出的数据，客户端提前收到流结束
+    // （实测 200MB 下载最后少掉约 1MB，正好是一个背压高水位）。
+    // 先算好标志再结束借用，避免与 c.conn 同时可变借用。
+    let ready_to_finish = st.fin_pending && st.pending.is_empty();
+    if ready_to_finish {
+        st.fin_pending = false;
+    }
+    if ready_to_finish {
+        let _ = c.conn.send_stream(id).finish();
     }
 }
 
@@ -908,6 +1078,22 @@ fn handle_action(
             let overflow;
             {
                 let Some(st) = c.streams.get_mut(&id) else { return };
+                // 这批数据已经到达主循环，先从「在途」计数里剪掉。
+                // pending_bytes 现在的语义是「从目标 socket 读出来、但还没交给 QUIC 的
+                // 全部字节」，包含两段：还在 action 通道里排队的 + 已经落到 st.pending 的。
+                // 少算前一段是背压失效的根因：通道容量 1024 × 16KB ≈ 16MB，
+                // 出站任务可以比主循环领先 16MB，目标是本地回环服务（几百 MB/s）时
+                // 很快就把 st.pending 顶过安全阈值，整条流被 reset。
+                // 用 saturating 减法：reset_stream 会把计数器清零，
+                // 此时队列里可能还有在途数据，直接 fetch_sub 会下溢成 usize::MAX，
+                // 导致这条流的背压判断彻底失效。
+                let _ = st
+                    .pending_bytes
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(data.len())),
+                    );
                 if st.local_finished {
                     return;
                 }
@@ -915,13 +1101,22 @@ fn handle_action(
                 tracing::debug!(stream = ?id, bytes = data.len(), "目标数据写回 QUIC");
                 if st.pending.is_empty() {
                     match c.conn.send_stream(id).write(&data) {
-                        Ok(n) if n == data.len() => return,
+                        Ok(n) if n == data.len() => {
+                            // 全部交给 quinn，未触顶，背压标志保持原样
+                            st.write_blocked
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
                         Ok(n) => {
+                            // 只写进去一部分：quinn 的发送缓冲快满了，
+                            // 从此刻起必须让出站任务停下来，别再读目标 socket。
                             st.pending.extend_from_slice(&data[n..]);
                             st.pending_bytes.fetch_add(
                                 data.len() - n,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
+                            st.write_blocked
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(WriteError::Blocked) => {
                             st.pending.extend_from_slice(&data);
@@ -929,16 +1124,30 @@ fn handle_action(
                                 data.len(),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
+                            st.write_blocked
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Err(_) => return,
+                        Err(WriteError::Stopped(code)) => {
+                            // 流已被对端丢弃：这批数据送不出去了
+                            tracing::warn!(
+                                stream = ?id,
+                                code = %code,
+                                dropped = data.len(),
+                                "对端已停止该流，丢弃数据"
+                            );
+                            return;
+                        }
+                        Err(WriteError::ClosedStream) => return,
                     }
                 } else {
                     st.pending.extend_from_slice(&data);
                     st.pending_bytes
                         .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
                 }
-                // 超过高水位 2 倍说明对端已经彻底不读，继续堆只会在内存里越积越多
-                overflow = st.pending.len() > pending_high_water.saturating_mul(2);
+                // 超过高水位的 8 倍才认为对端已彻底不读，继续堆只会在内存里越积越多。
+                // 不能取 2 倍：一批动作最冬 64 × 16KB = 1MB 会一次性推进 pending，
+                // 阈值太低会把正在正常下载的流误判成僵尸流。
+                overflow = st.pending.len() > pending_high_water.saturating_mul(8);
             }
             if overflow {
                 reset_stream(c, id, "pending 超过上限");
@@ -948,13 +1157,19 @@ fn handle_action(
         }
         ServerAction::Fin(ch, id) => {
             let Some(c) = conns.get_mut(&ch) else { return };
-            let Some(st) = c.streams.get_mut(&id) else { return };
-            if st.local_finished {
-                return;
+            {
+                let Some(st) = c.streams.get_mut(&id) else { return };
+                if st.local_finished {
+                    return;
+                }
+                st.local_finished = true;
+                // 只登记「待发 FIN」：上游 EOF 不代表数据已经写完，
+                // 真正 finish() 由 flush_pending 在 pending 清空时执行。
+                // 直接在这里 finish() 会让 FIN 越过残留数据，
+                // 客户端提前看到流结束（末尾少约 1MB 的元凶）。
+                st.fin_pending = true;
             }
-            st.local_finished = true;
             flush_pending(c, id);
-            let _ = c.conn.send_stream(id).finish();
         }
     }
 }
@@ -969,6 +1184,8 @@ async fn outbound(
     mut rx: mpsc::Receiver<Vec<u8>>,
     action_tx: mpsc::Sender<ServerAction>,
     pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    drain_notify: Arc<tokio::sync::Notify>,
+    write_blocked: Arc<std::sync::atomic::AtomicBool>,
     high_water: usize,
 ) {
     let addr = format!("{host}:{port}");
@@ -996,20 +1213,35 @@ async fn outbound(
 
     let at1 = action_tx.clone();
     let addr_reader = addr.clone();
+    let notify = drain_notify.clone();
+    let blocked = write_blocked.clone();
     let reader = async move {
         let mut buf = [0u8; 16384];
-        // 连续背压等待的轮数（5ms 一轮），用于 30 秒超时
+        // 连续背压等待的轮数（最多 50ms 一轮），用于 30 秒超时
         let mut stalled = 0u32;
         loop {
-            // 端到端背压：pending 超过高水位就暂停读目标 socket。
-            // 目标 TCP 接收缓冲随之堆满，发送方降速，于是 QUIC 发不出去的速度
-            // 会反向传导给目标，而不是全部堆在服务端内存里。
-            // quic-go 靠阻塞式 Stream.Write 自动实现，quinn-proto 的同步 write
-            // 必须显式做，这是两者最关键的区别。
-            while pending_bytes.load(std::sync::atomic::Ordering::Relaxed) > high_water {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            // 端到端背压，两个条件任一成立就停下：
+            // 1) 我们自己暂存的 pending 超水位；
+            // 2) quinn 的发送缓冲满了（write 返回 Blocked 或只写进一部分）。
+            //    这一条之前没有，于是目标是本地回环时（几百 MB/s）会一口气
+            //    把几 MB 数据吸进 quinn 的内部缓冲 + 我们的 pending，
+            //    最后被「pending 超过上限」的保护当成僵尸流 reset，
+            //    正在下载的连接直接断在 6~8MB。
+            while pending_bytes.load(std::sync::atomic::Ordering::Relaxed) > high_water
+                || blocked.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // 先拿 notified() 再做一次检查，避免「检查后、await 前」
+                // 刚好被写空导致丢失通知而白等 50ms。
+                let wait = notify.notified();
+                if pending_bytes.load(std::sync::atomic::Ordering::Relaxed) <= high_water
+                    && !blocked.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+                // 50ms 只是兜底（对端彻底不 ACK 时不会有 Writable 事件）
+                let _ = tokio::time::timeout(Duration::from_millis(50), wait).await;
                 stalled += 1;
-                if stalled > 6000 {
+                if stalled > 600 {
                     tracing::warn!(addr = %addr_reader, "背压等待超过 30 秒，放弃该流");
                     let _ = at1.send(ServerAction::Fin(ch, id)).await;
                     return;
@@ -1024,6 +1256,9 @@ async fn outbound(
                 }
                 Ok(n) => {
                     tracing::debug!(addr = %addr_reader, bytes = n, "目标返回数据");
+                    // 送进队列之前先计入背压水位（含通道在途部分），
+                    // 主循环 handle_action 会把这笔账转录成 st.pending 的占用。
+                    pending_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                     // 阻塞发送：QUIC 写得慢时在这里挂住，不再读目标 socket，
                     // 于是目标 TCP 窗口收缩、发送降速——这就是背压。
                     if at1
@@ -1031,6 +1266,9 @@ async fn outbound(
                         .await
                         .is_err()
                     {
+                        // 主循环已不在（连接/流结束）：把刚计入的在途量退回，
+                        // 避免它残留在计数器里影响后续判断
+                        pending_bytes.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 }

@@ -4,11 +4,12 @@
 //! 记录头只是外观，真正的安全性来自 QUIC 自身的 TLS 1.3；
 //! 外层 AEAD 的作用是让未授权方连 QUIC 状态机都进不来（解密失败即丢弃）。
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// TLS 记录类型常量
 pub const REC_HANDSHAKE: u8 = 0x16;
@@ -25,6 +26,17 @@ pub struct TlsRecord<'a> {
 /// 外层伪装编解码器，持有密码派生出的 AEAD 密钥。
 pub struct Obfs {
     cipher: ChaCha20Poly1305,
+    /// 发送侧 nonce 的固定前缀（4 字节），进程启动时随机生成。
+    /// 与下面的 64 位计数器拼成 12 字节 nonce：
+    /// 同一密钥下进程内计数器严格单调，nonce 永不重复，
+    /// 前缀只用来降低「不同会话重启后计数器从 0 开始」撞车的概率。
+    nonce_prefix: [u8; 4],
+    /// 发送侧 nonce 计数器。
+    /// 原实现每包调 `rand::thread_rng()` 取 12 字节随机数：
+    /// thread_rng 要访问线程局部状态并跑 ChaCha12 CSPRNG，
+    /// 在 11000 pps 下是纯粹的用户态浪费。AEAD 的安全性只要求
+    /// 「同一密钥下 nonce 不重复」，递增计数器完全满足，且无锁无随机数生成。
+    send_ctr: AtomicU64,
 }
 
 impl Obfs {
@@ -35,29 +47,61 @@ impl Obfs {
         let mut key = [0u8; 32];
         hk.expand(b"flowtls faketcp aead key", &mut key)
             .expect("hkdf expand");
+        // nonce 前缀只需一次随机，之后全部走计数器
+        let mut nonce_prefix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut nonce_prefix);
         Self {
             cipher: ChaCha20Poly1305::new(&key.into()),
+            nonce_prefix,
+            send_ctr: AtomicU64::new(0),
         }
+    }
+
+    /// 取下一个发送 nonce：4 字节固定前缀 + 8 字节递增计数器（大端）。
+    #[inline]
+    fn next_nonce(&self) -> [u8; 12] {
+        let ctr = self.send_ctr.fetch_add(1, Ordering::Relaxed);
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
+        nonce[4..].copy_from_slice(&ctr.to_be_bytes());
+        nonce
     }
 
     /// 封装一个 QUIC 数据报为 TLS ApplicationData 记录。
     /// 返回：17 03 03 len(2) + nonce(12) + 密文。
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let ct = self
-            .cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .expect("aead encrypt");
-        let body_len = 12 + ct.len();
-        let mut out = Vec::with_capacity(5 + body_len);
-        out.push(REC_APPDATA);
-        out.push(0x03);
-        out.push(0x03);
-        out.extend_from_slice(&(body_len as u16).to_be_bytes());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
+        // 保留原 API：内部转调零分配版本
+        let mut out = Vec::with_capacity(5 + 12 + plaintext.len() + 16);
+        self.seal_into(&mut out, plaintext);
         out
+    }
+
+    /// 封装并写入调用方提供的缓冲区（可反复复用，不分配）。
+    ///
+    /// 结构：`17 03 03 len(2) | nonce(12) | 密文+tag(16)`
+    /// 加密用 `encrypt_in_place`，密文直接覆盖在 `out` 的载荷区，
+    /// 只有明文需要从入参拷进来一次（这是 QUIC 明文缓冲 → 记录缓冲的必然搬运）。
+    pub fn seal_into(&self, out: &mut Vec<u8>, plaintext: &[u8]) {
+        let nonce = self.next_nonce();
+        // body = nonce(12) + 密文(len) + tag(16)
+        let body_len = 12 + plaintext.len() + 16;
+        out.clear();
+        out.resize(5 + body_len, 0);
+        out[0] = REC_APPDATA;
+        out[1] = 0x03;
+        out[2] = 0x03;
+        out[3..5].copy_from_slice(&(body_len as u16).to_be_bytes());
+        out[5..17].copy_from_slice(&nonce);
+        // 明文填入载荷区，之后**原地**加密：密文覆盖明文，tag 追加在末尾。
+        // aead 0.5 的 `Buffer` 只为 Vec<u8> 实现，所以用 detached 版本
+        // 直接对 `&mut [u8]` 操作，避免多分配一个 Vec。
+        let plain_len = plaintext.len();
+        out[17..17 + plain_len].copy_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), b"", &mut out[17..17 + plain_len])
+            .expect("aead encrypt");
+        out[17 + plain_len..].copy_from_slice(&tag);
     }
 
     /// 解开一条 ApplicationData 记录。
@@ -211,6 +255,27 @@ mod tests {
         let rec = a.seal(b"data");
         let records = parse_records(&rec);
         assert!(b.open(records[0].payload).is_none());
+    }
+
+    /// `seal_into` 必须和 `seal` 产出完全同构的记录：
+    /// 记录头一致、长度一致、都能被同一密钥解开。
+    /// 这是零分配改造不破坏线上兼容性的关键回归用例。
+    #[test]
+    fn seal_into_matches_seal() {
+        let obfs = Obfs::new("test-password");
+        for plain in [&b""[..], b"a", b"hello world", &vec![7u8; 1400][..]] {
+            let owned = obfs.seal(plain);
+            let mut reused = Vec::new();
+            obfs.seal_into(&mut reused, plain);
+            assert_eq!(owned.len(), reused.len(), "记录总长必须一致");
+            assert_eq!(owned[..5], reused[..5], "记录头必须一致");
+            // 两次的 nonce 不同（计数器递增），但都必须能解回同样的明文
+            let a = parse_records(&owned);
+            let b = parse_records(&reused);
+            assert_eq!(obfs.open(a[0].payload).as_deref(), Some(plain));
+            assert_eq!(obfs.open(b[0].payload).as_deref(), Some(plain));
+            assert_ne!(a[0].payload[..12], b[0].payload[..12], "nonce 必须递增不重复");
+        }
     }
 
     #[test]

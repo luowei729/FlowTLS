@@ -365,7 +365,221 @@ pub async fn send(&self, id: StreamId, data: Vec<u8>) {
 格式化 + 写 stdout 的开销在高速传输时不可忽略，且把真正的 WARN 淹没。
 原则：数据面日志用 `trace`，只留统计（每 2 秒一条）和状态变为 `info`。
 
-## 28. 常用调试命令
+## 28. 换服务器/接管机器时，源码和二进制必须核对版本
+
+症状：客户端日志停在 `已发送 SYN，等待 SYN-ACK`，30 秒后仍然不出现
+`三次握手完成`；服务端 `server.log` 里能看到
+
+```
+INFO 收到 raw 包 client=x.x.x.x:PORT ip_id="0x0000" flags="0x10" payload=125
+INFO 服务端队列统计 rx_queue=0 conns=0
+```
+
+包确实收到了、IP/iptables/路由都对，但 `conns` 永远是 0，说明**两端代码不兼容**
+（伪包格式或握手逻辑对不上）。
+
+2026-11-12 新加坡机就踩到这个：机器上 `/opt/flowtls-src` 有 9 个文件与本地不一致，
+二进制是几小时前编的老版本。核对方法只有比对 md5：
+
+```bash
+# 本地
+find src -name '*.rs' | sort | xargs md5sum
+# 远端
+ssh root@HOST 'cd /opt/flowtls-src && find src -name "*.rs" | sort | xargs md5sum'
+```
+
+远端没有 rsync，用 tar 走 ssh：
+
+```bash
+tar czf - --exclude=target --exclude=.git src Cargo.toml Cargo.lock web \
+  | ssh root@HOST 'tar xzf - -C /opt/flowtls-src'
+ssh root@HOST 'export PATH=$HOME/.cargo/bin:$PATH; cd /opt/flowtls-src && cargo build --release'
+```
+
+注意远端 `cargo` 在 `~/.cargo/bin`，非交互 ssh 的 PATH 里没有，必须先 export。
+
+部署后验证顺序：`pgrep -af "flowtls server"` → `ss -lntp | grep 8443` →
+客户端日志出现 `QUIC 连接已建立` → curl 走 SOCKS5 拿 204。
+
+## 29. 高速率下 CPU 打满：先怀疑系统调用，不要怀疑加密
+
+2026-11-12 在 1 核 ARM（Neoverse-N1）千兆机上排查「speedtest 只跑 100Mbps
+且服务端 CPU 100%」，结论与加密完全无关。
+
+**加密开销实测（`openssl speed -evp <alg>`，同一台机器）：**
+
+| 算法 | 1024B | 8KB | 说明 |
+|---|---|---|---|
+| AES-128-GCM | 2404 MB/s | 2531 MB/s | ARMv8 有 `aes` + `pmull` 专用指令 |
+| ChaCha20-Poly1305 | 796 MB/s | 818 MB/s | 只有 NEON/AVX2 向量化，无专用指令 |
+
+AES-GCM 快 3.1 倍，但 100 Mbps = 12.5 MB/s，ChaCha 也只占 1.6% CPU。
+**两层 AEAD 合计不到 5%，换算法最多省 4%，救不了 CPU 100%。**
+
+所以：`/proc/<pid>/stat` 里 `stime` 远大于 `utime` 才是关键信号。
+实测 15260 pps 时 `utime=52 / stime=166` ticks —— 76% 的时间在内核态，
+瓶颈是「每包一次系统调用」，不是 CPU 算力。
+
+**三层逐级优化（按收益排序）：**
+
+1. 发送从 `IPPROTO_RAW + IP_HDRINCL` 换成 `AF_PACKET / SOCK_DGRAM`
+   - 跳过 IP 层路由、netfilter OUTPUT/POST_ROUTING、MTU 检查、qdisc 排队
+   - 加 `PACKET_QDISC_BYPASS`（常量 20，libc 未导出）直交驱动
+   - **坑**：`SOCK_DGRAM` 只让内核补以太网头，**不做 ARP**。
+     不给目的 MAC 会发成全零地址，包在网关被静默丢弃，
+     表现是客户端一直停在「等待 SYN-ACK」。必须自己从 `/proc/net/arp`
+     取下一跳（默认网关）MAC，邻居表空时先用 UDP 包触发一次 ARP。
+   - 效果：同 65 Mbps 下服务端 CPU 73% → **10.6%**
+2. `sendmmsg` 批量发送（一次最多 32 包）+ 复用缓冲池，稳态零分配
+3. `poll_transmit(now, 32, buf)` 而不是 `poll_transmit(now, 1, buf)`
+   - 传 1 等于每个数据报走一遍完整状态机 + pacing 检查；高速率下
+     pacing 每包拦一次，每次唤醒只发一个包，事件循环按包数空转
+   - `enable_segmentation_offload` 默认 true，传 N 时 quinn 会把 N 个
+     **等长且按 segment_size 对齐**（末包已补齐）的数据报连续写进 buf，
+     返回 `segment_size = Some(mtu)`，`size = N × mtu`
+   - 我们按 segment_size 切开，逐包加外层 TLS 记录 + IP/TCP 头，
+     再一次性 `sendmmsg` 发出。**线上格式完全不变。**
+
+**测速源也很关键**：`python3 -m http.server` 在 1 核机上服务 15 MB/s 就吃掉
+小半个核，会把「隧道慢」和「源站慢」混在一起。用 `busybox httpd` 或 nginx
+（sendfile）做源。另外 `speed.cloudflare.com` 有 IP 级限流，
+连续测几次就 429（Retry-After 近一小时），不要拿它做对照实验。
+
+## 30. 自造 bufferbloat：背压水位不能绑窗口上限，等待不能轮询
+
+调完系统调用后（见第 29 条）8 流跑到 169 Mbps，但服务端 `pending` 一度飙到
+**214MB**，紧接着 cwnd 从 8MB 崩到 1.2MB，吞吐掉回 81 Mbps。这是两处叠加的错误：
+
+**错误一：背压水位取了窗口上限的 2 倍。**
+
+```rust
+// 错：千兆 8MB → 每流 16MB，12 条并发流就是 192MB
+let pending_high_water = cfg.net.max_cwnd * 2;
+```
+
+目标 TCP 被读得飞快，QUIC 发不出去，全堆在内存。等 cwnd 一旦放松，
+几百 MB 一次性灌进链路 → 瓶颈队列溢出 → 大量丢包 → BBR 大幅缩窗。
+正确做法是绑 **BDP** 而不是窗口上限：
+
+```rust
+// 对：每流封顶 1MB，100ms RTT 下已足够填满 80Mbps 在途数据
+let pending_high_water = (cfg.net.max_cwnd / 4).clamp(512 * 1024, 1024 * 1024);
+```
+
+**错误二：等待用固定 sleep 轮询，把吞吐死锁在「一次读量 ÷ 轮询间隔」。**
+
+```rust
+// 错：拥塞时吞吐上限 = 16KB ÷ 5ms ≈ 3MB/s
+while pending > high_water {
+    sleep(5ms).await;
+}
+read(&mut buf).await;   // 每次只读 16KB
+```
+
+实测单流从 125 Mbps 掉到 **20 Mbps**，而且 BBR 看到流量受限会一直待在低速区，
+永远爬不出来。改成 `Notify` 事件驱动：`flush_pending` 每归还一批字节就
+`notify_waiters()`，等待变成微秒级；50ms 的 timeout 只作兜底。
+
+**错误三（配套）：溢出判断阈值不能低于「一轮批量能推进的量」。**
+动作批量是 64 项 × 16KB = 1MB，如果 `pending > high_water * 2`（2MB）就 reset，
+正常下载的流会被成批误杀（日志里连续 `重置该流 reason="pending 超过上限"`）。
+阈值取 8 倍，同时把批量从 256 降到 64。
+
+修完的结果（同一台 1 核机、同一时段）：
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 8 流吞吐 | 100 Mbps | **174~196 Mbps** |
+| 服务端 CPU | 100% | **22%** |
+| pending 峰值 | 214 MB | ~18 MB |
+| cwnd | 崩到 1.2MB | 稳定在 4MB 上限 |
+
+另外记一笔：`net.max_cwnd` 文档写的是「上限」，但代码只把它当初始值，
+丢包率 < 5% 时会按 1.2 倍一路放大到 8MB，用户按小带宽链路设的值完全失效。
+已改成真正的硬上限（`upper = upper.min(cfg.net.max_cwnd)`）。
+
+## 31. 跨境链路必须关掉 quinn 的 PMTUD，否则 MTU 会永久塌到 1200
+
+`quinn-proto` 的 `BlackHoleDetector` 用 `BLACK_HOLE_THRESHOLD = 3`：
+连续 4 个「可疑丢包突发」（突发内所有包都大于 `min_mtu`，且之后没有更大的包
+被 ACK）就判定路径 MTU 变小，把 `current_mtu` 打回 `min_mtu`（默认 1200）。
+国际线路丢包 20~50% 是常态，这个启发式**必然误判**。
+
+后果是连锁的：MTU 1200 比 1340 每包少装 140 字节（-10.4%），
+包数增加 11.7%，丢包概率上升 → 更容易再次触发 → 永远爬不回 1340。
+实测日志里 73 次 `mtu=1200` + 106 次 `mtu=1340`，丢包率 21~51%。
+
+```rust
+// 我们的路径 MTU 是自己算的：5 记录头 + 12 nonce + 16 tag + 40 IP/TCP = 1413
+// 没有需要探测的变量，PMTUD 只会带来误判
+t.initial_mtu(1340);
+t.mtu_discovery_config(None);  // 关掉 PMTUD
+t.min_mtu(1340);               // 双保险：将来重开也不允许降
+```
+
+修复后 50 次采样全部 `mtu=1340`，`loss_pct=0`。
+
+## 32. `ReadableError::ClosedStream` 是正常状态，不是致命错误
+
+```rust
+// 错：任何 Err 都当「流卡死」，执行 stop() 并置空 to_tcp
+match recv.read(true) {
+    Ok(c) => { ... }
+    Err(_) => { st.to_tcp = None; conn.recv_stream(id).stop(0)?; }
+}
+```
+
+`read()` 返回 `Err(ClosedStream)` 的三种情况**全是正常的**：
+流已不在接收表、数据已被上一次 `Readable` 读空、或已调用过 `stop()`。
+`Readable` 事件会重复投递，所以这条路径一定会走到。
+
+危险在于配套动作：`to_tcp = None` 会让出站任务立刻退出、**目标 TCP 连接被关闭**，
+正在下载的流直接被截断。实测 `curl: (18) transfer closed with 203699359 bytes remaining`，
+200MB 只能下到 6~8MB。
+
+正确写法：
+
+```rust
+Err(ReadableError::ClosedStream) => {}          // 什么都不做，等下一个 Readable
+Err(ReadableError::IllegalOrderedRead) => warn!(),  // 编程错误，不杀流
+```
+
+真正代表「对端放弃」的是 `Chunks::next()` 返回的 `ReadError::Reset(code)`。
+
+## 33. quinn 的 send_window 是应用层看不见的缓冲，背压必须显式接出来
+
+`pending_bytes` 只统计我们自己 `Vec` 里暂存的数据，
+而 quinn 内部还有 `send_window`（默认十几 MB，按**连接**算）的发送缓冲。
+目标是本地回环服务时（几百 MB/s），出站任务会先无声地灌满这层，
+再灌满我们的 `pending`，最后触发「pending 超过上限」把流 reset。
+
+三个必做：
+1. `send_window` 设成 `max_cwnd × 2`（clamp 2~16MB），别留 16MB 默认值；
+2. `write()` 返回 `Blocked` **或只写进一部分**时置位 `write_blocked`，
+   出站任务的背压等待要同时检查它和 `pending` 水位；
+   `Writable` 事件到达时清除并 `notify_waiters()`；
+3. `pending_bytes` 要算「从目标 socket 读出、但还没交给 QUIC 的全部字节」，
+   **包括还在 channel 里排队的**。漏掉这段等于凭空多出
+   `channel_capacity × chunk_size`（1024×16KB≈16MB）的隐形缓冲。
+
+记账要用 `fetch_update` + `saturating_sub`：`reset_stream` 会把计数器清零，
+此时队列里可能还有在途数据，直接 `fetch_sub` 会下溢成 `usize::MAX`。
+
+## 34. `finish()` 必须在 pending 清空后调用
+
+```rust
+// 错：先 flush 再无条件 finish
+flush_pending(c, id);
+conn.send_stream(id).finish()?;   // pending 没写完时 FIN 会跑到数据前面
+```
+
+FIN 一旦越过还没写出的数据，对端就提前看到流结束。
+实测末尾稳定少掉约 1MB —— 正好是一个背压高水位，
+`curl: (18) transfer closed with 1014706 bytes remaining to read`。
+
+正确做法：`Fin` 只登记 `fin_pending = true`，
+由 `flush_pending` 在 `pending.is_empty()` 时执行真正的 `finish()`。
+
+## 35. 常用调试命令
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03
