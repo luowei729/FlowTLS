@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## 2026-11-12 11:01 (北京时间)
+
+### 修复客户端发送侧无背压（pending 峰值 125MB → 13MB）+ 日志可观测性
+- 排查 8 小时长跑日志（北京时间 02:55~10:55，累计下行 2.6GB / 上行 1.3GB）：
+  - 零断线、零重连、零 ERROR；RSS 客户端 11MB / 服务端 9MB，无内存泄漏。
+  - 但客户端 `pending` 峰值 **125MB**、服务端 80MB，都出现在测速并发时。
+- 根因：客户端 `ProxyAction` 用无界 mpsc，`pending` 是无上限 Vec，
+  `pipe_stream` 读本地 socket 多快就往里塞多快，QUIC 写不下去时全部堆在内存。
+  服务端早有 `pending_high_water` + 暂停读目标 socket 的背压，客户端一直缺这一层。
+- 改动（`src/client.rs`、`src/proxy/http.rs`）：
+  - `ProxyAction` 通道改 `mpsc::channel(1024)`（1024 × 16KB ≈ 16MB 上限）。
+  - `ProxyClient::send` / `fin` 改 `async`，内部 `tx.send().await`；`open` 同样 await。
+  - `pipe_stream` 的读取任务在 `send().await` 挂住 → 停止读本地 socket →
+    对端 TCP 窗口收缩 → 浏览器/测速端自然降速，形成端到端背压。
+  - `http.rs` 两处 `client.send(...)` 补 `.await`。
+- 日志（`src/main.rs`、`src/client.rs`）：
+  - `tracing` 关闭 ANSI 颜色码。之前字段被 `\033[3m..\033[0m` 包裹，
+    `grep 'rtt_ms='` 一条都匹配不到，排查时只能肉眼翻几十 MB 日志。
+  - `收到 QUIC 数据` 由 `info` 降为 `trace`：8 小时 44 万条、62MB，
+    格式化 + 写 stdout 的开销在高速传输时不可忽略。
+- 实测（香港 100M，部署后）：
+  - 20MB 上传：`pending` 峰值 **13.6MB**（修复前 125MB），13MB 卡在 16MB 上限内，无 WARN。
+  - 10MB 下载 ×2：3.05 / 3.80 MB/s；服务端 `pending` 峰值 2.2MB 后回落。
+  - 客户端日志 **61 行 / 6.7KB**（修复前 62MB），`grep 'rtt_ms='` 正常命中。
+  - 代理可用性：Google 204 / 0.44s。
+
 ## 2026-11-12 03:10 (北京时间)
 
 ### 文档全面校正（AGENTS / PROJECT_PLAN / DESIGN / DEPLOY_CREDENTIALS）

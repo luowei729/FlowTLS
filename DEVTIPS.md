@@ -319,7 +319,53 @@ quinn-proto 的 `Chunks` 会锁定所在流的组装器。一旦某次 `finalize
 默认析构晚于 `recv`，会报 `recv does not live long enough`；
 在 `}` 后加一个分号 `};` 让临时值提前 drop 即可。
 
-## 26. 常用调试命令
+## 26. 客户端发送侧必须自己做背压，不能只靠 QUIC 流控
+
+quinn-proto 的 `send_stream().write()` 是同步的，返回 `Blocked` 表示窗口满，
+它不会阻塞调用方。如果本地读取任务收到 `Blocked` 后只是把数据堆进 `Vec` 就继续读，
+就等于把流控完全失效：本地读多快、内存就胀多快。
+
+实测（8 小时长跑，跨境 100M）：
+- 客户端 `pending` 峰值 **125MB**，服务端峰值 80MB，都出现在测速多线并发时
+- RSS 随之暴涨到 117MB，但进程不崩、也没有 ERROR，很容易被忽略
+
+正确做法与服务端一致：**在本地 socket 读取处制造阻塞**。
+
+```rust
+// ProxyAction 用有界 channel；满时 send().await 挂住
+let (action_tx, mut action_rx) = mpsc::channel::<ProxyAction>(1024);
+
+pub async fn send(&self, id: StreamId, data: Vec<u8>) {
+    if let Some(tx) = self.sender() {
+        let _ = tx.send(ProxyAction::Data(id, data)).await;
+    }
+}
+```
+
+通道满 → `pipe_stream` 的读取任务停住 → 不再 `read` 本地 socket →
+内核接收缓冲堆满 → TCP 窗口收缩 → 浏览器/测速端降速。
+这就是 hysteria2 靠阻塞式 `Write` 自动获得的效果。
+
+容量选择：`1024 × 16KB ≈ 16MB`，对齐 `max_cwnd` 的 4 倍；
+太小（如 256）会把测速多线误杀，太大等于没做背压。
+
+服务端对应位置是 `outbound` 里的 `pending_high_water` 循环，两者缺一不可。
+
+## 27. 日志必须关 ANSI，高频路径不能用 info
+
+`tracing_subscriber::fmt()` 默认开启 ANSI 颜色码。输出到文件后字段名会被包成
+`\033[3mrtt_ms\033[0m=`，带来两个问题：
+
+1. `grep 'rtt_ms='` 一条都匹不到，排查时只能肉眼翻几十 MB 日志；
+2. 多余转义字节让日志体积膨胀。
+
+修复：`.with_ansi(false)`。只在终端直连时才需要颜色。
+
+另一个坑：**每条数据都打 info**。实测客户端 `收到 QUIC 数据` 8 小时写 44 万条 / 62MB，
+格式化 + 写 stdout 的开销在高速传输时不可忽略，且把真正的 WARN 淹没。
+原则：数据面日志用 `trace`，只留统计（每 2 秒一条）和状态变为 `info`。
+
+## 28. 常用调试命令
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03
@@ -330,4 +376,9 @@ iptables -t raw -vnL PREROUTING --line-numbers
 
 # 看 QUIC 统计（服务端每 2 秒打印 rtt/cwnd/lost）
 grep "路径统计" /opt/flowtls/server.log | tail
+
+# 长跑体检：流表峰值、pending 峰值、累计丢包（字段可 grep，无需去 ANSI）
+grep 'rtt_ms=' /tmp/ft-cn.log | grep -oE 'pending=[0-9]+' | cut -d= -f2 | sort -n | tail -1
+grep 'rtt_ms=' /tmp/ft-cn.log | grep -oE 'streams=[0-9]+' | cut -d= -f2 | sort -n | tail -1
+grep -cE 'WARN|ERROR' /tmp/ft-cn.log
 ```

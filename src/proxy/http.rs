@@ -181,7 +181,8 @@ where
         // CONNECT 之后可能已经有粘包数据，先补发
         let extra = buf[head_end..].to_vec();
         if !extra.is_empty() {
-            client.send(id, extra);
+            // send 已改为 async + 有界队列，这里 await 让背压生效
+            client.send(id, extra).await;
         }
         pipe_stream(s, id, rx, client).await;
         return Ok(());
@@ -224,7 +225,7 @@ where
     let Some((id, rx)) = client.open(target).await else {
         return Ok(());
     };
-    client.send(id, payload);
+    client.send(id, payload).await;
     // 请求体由上面的 payload 发出，这里不再从本地读，只把响应写回
     let mut r = s;
     let mut resp = rx;

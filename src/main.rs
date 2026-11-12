@@ -63,6 +63,10 @@ fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        // 关闭 ANSI 颜色码：日志重定向到文件后，颜色码会把字段名包成
+        // `\033[3mrtt_ms\033[0m=`，导致 grep 'rtt_ms=' 一条都匹配不到，
+        // 排查时只能肉眼翻几十 MB 日志。服务端和客户端都输出到文件，统一关掉。
+        .with_ansi(false)
         .try_init();
 }
 

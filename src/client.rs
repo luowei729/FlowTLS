@@ -30,7 +30,12 @@ use crate::proxy::{self, ProxyAction};
 pub struct ProxyClient {
     /// 内部动作通道。用 Mutex<Option<..>> 而不是直接持有 Sender，
     /// 是因为断线重连时主循环会重建通道，而本地代理入口只启动一次。
-    tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ProxyAction>>>>,
+    ///
+    /// 必须是有界通道：QUIC 写不下去时（跨境链路丢包高、窗口收缩），
+    /// 无界通道会让本地 socket 读到的数据无限堆在内存里（实测 8 小时峰值 125MB）。
+    /// 有界之后 send().await 会挂住，本地 socket 停止读取，TCP 窗口收缩，
+    /// 浏览器/测速端自然降速——这就是端到端背压，和 hysteria2 的阻塞式 Write 一致。
+    tx: Arc<std::sync::Mutex<Option<mpsc::Sender<ProxyAction>>>>,
 }
 
 impl ProxyClient {
@@ -42,14 +47,14 @@ impl ProxyClient {
     }
 
     /// 绑定本次连接的动作通道。旧通道被丢弃，旧连接上的请求随之失效。
-    fn set_tx(&self, tx: mpsc::UnboundedSender<ProxyAction>) {
+    fn set_tx(&self, tx: mpsc::Sender<ProxyAction>) {
         if let Ok(mut guard) = self.tx.lock() {
             *guard = Some(tx);
         }
     }
 
     /// 取出当前通道的克隆；未绑定（重连间隙）时返回 None。
-    fn sender(&self) -> Option<mpsc::UnboundedSender<ProxyAction>> {
+    fn sender(&self) -> Option<mpsc::Sender<ProxyAction>> {
         self.tx.lock().ok().and_then(|g| g.clone())
     }
 
@@ -61,21 +66,24 @@ impl ProxyClient {
         // 先克隆出 Sender，避免 std Mutex 的 guard 跨 await
         let tx = self.sender()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(ProxyAction::Open { target, reply: reply_tx }).ok()?;
+        // 有界通道满时在这里等待：新连接也会被背压，不会绕过水位
+        tx.send(ProxyAction::Open { target, reply: reply_tx }).await.ok()?;
         reply_rx.await.ok().flatten()
     }
 
-    /// 本地 → 远端
-    pub fn send(&self, id: StreamId, data: Vec<u8>) {
+    /// 本地 → 远端。
+    /// 用 async + 有界通道实现背压：通道满时调用方（pipe_stream 的读取任务）
+    /// 会挂在这里，于是不再读本地 socket，浏览器发送端被 TCP 窗口反向限速。
+    pub async fn send(&self, id: StreamId, data: Vec<u8>) {
         if let Some(tx) = self.sender() {
-            let _ = tx.send(ProxyAction::Data(id, data));
+            let _ = tx.send(ProxyAction::Data(id, data)).await;
         }
     }
 
-    /// 本地方向结束
-    pub fn fin(&self, id: StreamId) {
+    /// 本地方向结束。同样走有界通道，保证 FIN 不会插到未写完的数据前面。
+    pub async fn fin(&self, id: StreamId) {
         if let Some(tx) = self.sender() {
-            let _ = tx.send(ProxyAction::Fin(id));
+            let _ = tx.send(ProxyAction::Fin(id)).await;
         }
     }
 }
@@ -309,7 +317,9 @@ async fn run_session(
     }
 
     // 本次连接的本地动作通道，绑定给常驻的代理入口
-    let (action_tx, mut action_rx) = mpsc::unbounded_channel::<ProxyAction>();
+    // 有界动作队列：1024 × 16KB ≈ 16MB 上限，与 max_cwnd(4MB) 的 4 倍对齐。
+    // 满了之后本地读取任务阻塞在 send().await，形成端到端背压。
+    let (action_tx, mut action_rx) = mpsc::channel::<ProxyAction>(1024);
     proxy_client.set_tx(action_tx);
 
     // ---- 流表 ----
@@ -664,7 +674,9 @@ fn read_stream(
         return;
     }
     if !out.is_empty() {
-        tracing::info!(stream = ?id, bytes = out.len(), "收到 QUIC 数据");
+        // 每条数据都打 INFO 会写出几十万行、几十 MB 日志（实测 8 小时 62MB），
+        // 格式化 + 写 stdout 的开销在高速传输时不可忽略，降到 trace 只在排查时打开。
+        tracing::trace!(stream = ?id, bytes = out.len(), "收到 QUIC 数据");
         let _ = st.to_local.send(out);
     }
     if finished {
@@ -869,12 +881,14 @@ where
         loop {
             match r.read(&mut buf).await {
                 Ok(0) => {
-                    c1.fin(id);
+                    c1.fin(id).await;
                     break;
                 }
-                Ok(n) => c1.send(id, buf[..n].to_vec()),
+                // send().await 在动作队列满时挂住，从而停止读本地 socket，
+                // 让对端 TCP 窗口收缩。这是客户端侧唯一的背压点，不能去掉。
+                Ok(n) => c1.send(id, buf[..n].to_vec()).await,
                 Err(_) => {
-                    c1.fin(id);
+                    c1.fin(id).await;
                     break;
                 }
             }
