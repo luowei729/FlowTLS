@@ -20,8 +20,15 @@ import (
 // quic.Transport{Conn: session} 就能工作，quic-go 一行都不用改。
 // 这与 sing-quic 用 SalamanderConn 包装 net.PacketConn 是同一个套路。
 type Session struct {
-	raw   *rawSocket
-	codec *Codec
+	raw *rawSocket
+	// ownsRaw 表示本会话是否拥有 raw socket 的生命周期。
+	//
+	// 客户端独占（ownsRaw=true，Close 时关 fd）；
+	// 服务端共享同一个 socket 管所有客户端（ownsRaw=false，绝不能关）。
+	// 服务端若不共享，每客户端一个 AF_PACKET + 8MB 接收缓冲，
+	// 100 个客户端就是 800MB 内核内存。
+	ownsRaw bool
+	codec   *Codec
 
 	// peer 是对端地址（客户端模式是服务端，服务端模式是客户端）
 	peer netip.AddrPort
@@ -29,10 +36,14 @@ type Session struct {
 	localPort  uint16
 	remotePort uint16
 
-	// TCP 状态。只由持有者（事件循环）访问，因此不需要原子操作：
-	// raw socket 的读写分别在「接收协程」和「上层写」两个地方，
-	// 但写方向只会有上层调用（quic-go 保证 WriteTo 串行），
-	// 读方向的 TCP 状态更新全部在接收协程里做。
+	// mu 保护下面所有 TCP 状态与写缓冲。
+	//
+	// **必须加锁**：写入方向由 quic-go 的写协程调用（WriteTo），
+	// 读方向由接收协程调用（handleIncoming → sendPureACK），
+	// 两者都会改 seq / ipid 并共用 wPkt 缓冲。
+	// 之前只靠注释说「只由持有者访问」是不够的——P4 引入共享 socket 后
+	// 两个方向真正并发，不加锁会产生「seq 跳变」这类抓包可见的异常。
+	mu      sync.Mutex
 	seq     uint32
 	peerSeq uint32
 	ipid    uint16
@@ -57,7 +68,7 @@ type Session struct {
 	// 让另一方永久阻塞在读通道上。
 	rxOnce sync.Once
 
-	// 收发缓冲复用。写侧由 quic-go 串行调用，读侧由接收协程独占。
+	// 收发缓冲复用。受 mu 保护。
 	wRecord []byte
 	wPkt    []byte
 
@@ -66,6 +77,13 @@ type Session struct {
 	pktsRecv atomic.Uint64
 	// rxDropped 统计因队列满而丢弃的包数（应为 0；非 0 说明背压链路断了）
 	rxDropped atomic.Uint64
+	// lastSeenAt 是最后一次收到**任何属于本会话的包**的时刻（UnixNano）。
+	//
+	// 必须是「任何包」而不是「解密出数据的包」：QUIC 保活 PING 只换回
+	// 一个纯 ACK（无载荷），若只在有数据的包上更新时间戳，
+	// 健康连接空闲 10 秒后就会被误判为「已死」。
+	// 探活也依赖这一点：探测包换回的同样是纯 ACK。
+	lastSeenAt atomic.Int64
 }
 
 // net.PacketConn 接口断言。编译期即可发现签名不一致。
@@ -154,18 +172,22 @@ func (s *Session) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if s.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	s.mu.Lock()
 	// 记录复用：稳态下零分配
 	s.wRecord = s.codec.Seal(s.wRecord[:0], p)
-	s.wPkt = s.appendSegment(s.wPkt[:0], s.wRecord, TCPPSH|TCPACK)
-	if err := s.raw.Send(s.wPkt, s.peer.Addr()); err != nil {
+	s.wPkt = s.appendSegmentLocked(s.wPkt[:0], s.wRecord, TCPPSH|TCPACK)
+	err := s.raw.Send(s.wPkt, s.peer.Addr())
+	s.mu.Unlock()
+	if err != nil {
 		return 0, err
 	}
 	s.pktsSent.Add(1)
 	return len(p), nil
 }
 
-// appendSegment 把 TLS 记录封装成一个 TCP 段（含 IP 头）。
-func (s *Session) appendSegment(dst, payload []byte, flags uint8) []byte {
+// appendSegmentLocked 把 TLS 记录封装成一个 TCP 段（含 IP 头）。
+// 调用方必须持有 s.mu。
+func (s *Session) appendSegmentLocked(dst, payload []byte, flags uint8) []byte {
 	seg := TcpSeg{
 		Src:     s.raw.LocalIP,
 		Dst:     s.peer.Addr(),
@@ -195,11 +217,14 @@ func (s *Session) sendPureACK() {
 	if s.closed.Load() {
 		return
 	}
+	s.mu.Lock()
 	s.ackPend = 0
 	s.lastAck = time.Now()
-	pkt := s.appendSegment(s.wPkt[:0], nil, TCPACK)
-	// 纯 ACK 不占序号：appendSegment 已按 seqLen 判断，这里不用回退
-	if err := s.raw.Send(pkt, s.peer.Addr()); err != nil {
+	pkt := s.appendSegmentLocked(s.wPkt[:0], nil, TCPACK)
+	// 纯 ACK 不占序号：appendSegmentLocked 已按 seqLen 判断
+	err := s.raw.Send(pkt, s.peer.Addr())
+	s.mu.Unlock()
+	if err != nil {
 		return
 	}
 	s.pktsSent.Add(1)
@@ -210,8 +235,11 @@ func (s *Session) sendFIN() {
 	if s.closed.Load() {
 		return
 	}
-	pkt := s.appendSegment(s.wPkt[:0], nil, TCPFIN|TCPACK)
-	_ = s.raw.Send(pkt, s.peer.Addr())
+	s.mu.Lock()
+	pkt := s.appendSegmentLocked(s.wPkt[:0], nil, TCPFIN|TCPACK)
+	err := s.raw.Send(pkt, s.peer.Addr())
+	s.mu.Unlock()
+	_ = err
 }
 
 // Close 关闭会话。幂等。
@@ -230,10 +258,15 @@ func (s *Session) Close() error {
 		// 关 rx 让上层仍阻塞在 ReadFrom 的调用同样被唤醒：
 		// closeCh 只影响 select，而有数据分支可能先选中 rx。
 		s.rxOnce.Do(func() { close(s.rx) })
-		// 必须关 raw socket：recvLoop 阻塞在 raw.Recv 上，
-		// 只标 closed 不会唤醒它（它不看标志，等的是 syscall 返回）。
-		// 不关会泄漏一个 goroutine 和两个 fd。
-		_ = s.raw.Close()
+		// 只在自己拥有 socket 时才关闭。
+		//
+		// 客户端必须关：recvLoop 阻塞在 raw.Recv 上，只标 closed 不会唤醒它
+		// （它不看标志，等的是 syscall 返回），不关会泄漏 goroutine + 2 个 fd。
+		// 服务端绝不能关：所有会话共享同一个 socket，关掉会把整台服务器
+		// 的所有客户端一起断掉。
+		if s.ownsRaw {
+			_ = s.raw.Close()
+		}
 	})
 	return nil
 }
@@ -301,6 +334,26 @@ func (s *Session) SetWriteDeadline(t time.Time) error { return nil }
 // 内存代价：16384 × 1500B ≈ 24MB 上限，且只在真有流量时才占满
 // （切片从 sync.Pool 取，空闲时会被 GC 回收）。
 const rxQueueDepth = 16384
+
+// LastSeenAt 返回最后一次收到属于本会话的包的时刻。
+//
+// 零值（会话从未收到包）返回 time.Time{}，调用方应视为「刚建立」。
+func (s *Session) LastSeenAt() time.Time {
+	v := s.lastSeenAt.Load()
+	if v == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, v)
+}
+
+// IdleFor 返回距最后一次收到对端包已过去多久。
+func (s *Session) IdleFor() time.Duration {
+	t := s.LastSeenAt()
+	if t.IsZero() {
+		return 0
+	}
+	return time.Since(t)
+}
 
 // deliver 由接收协程调用：把解密后的数据报投进 rx。
 //
@@ -420,7 +473,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		// SYN-ACK 之后客户端要回 ACK，并记录对端 ISN
 		s.peerSeq = synAck.seq + 1
 		s.clock.Observe(synAck.tsval, synAck.hasTS)
-		ack := s.appendSegment(s.wPkt[:0], nil, TCPACK)
+		ack := s.appendSegmentLocked(s.wPkt[:0], nil, TCPACK)
 		if err := raw.Send(ack, s.peer.Addr()); err != nil {
 			_ = raw.Close()
 			return nil, err
@@ -550,7 +603,17 @@ func (s *Session) matchPeer(p ParsedPacket) bool {
 }
 
 // handleIncoming 处理一个属于本会话的包：更新 TCP 状态 + 解密交付。
+//
+// 客户端由自己的 recvLoop 调用；服务端由 Listener 的共享 recvLoop 调用。
+// 两种模式下调用方都是单协程，但 WriteTo 可能在另一个协程里跑，
+// 所以 TCP 状态更新必须持 s.mu。
 func (s *Session) handleIncoming(p ParsedPacket) {
+	// 记录收包时刻：只要收到对端的任何包（含纯 ACK），链路就是活的。
+	// 更新时间放在最前面——连解密失败也要算「收到了包」，
+	// 因为探活/保活关心的是链路可达性，不是业务数据。
+	s.lastSeenAt.Store(time.Now().UnixNano())
+
+	s.mu.Lock()
 	// ack 只增不减：乱序时回退的 ack 会被中间设备当成非法包
 	next := p.Seq + seqLen(p.Flags, len(p.Payload))
 	if next-s.peerSeq < 0x8000_0000 {
@@ -560,7 +623,13 @@ func (s *Session) handleIncoming(p ParsedPacket) {
 	if len(p.Payload) > 0 {
 		s.ackPend++
 	}
+	needACK := s.ackPend >= 2 || time.Since(s.lastAck) >= 40*time.Millisecond
+	s.mu.Unlock()
+
 	if len(p.Payload) == 0 {
+		if needACK {
+			s.sendPureACK()
+		}
 		return
 	}
 	s.pktsRecv.Add(1)
@@ -579,7 +648,7 @@ func (s *Session) handleIncoming(p ParsedPacket) {
 		s.deliver(plain)
 	}
 	// 延迟确认：累计 2 段立即确认，或超 40ms 兜底
-	if s.ackPend >= 2 || time.Since(s.lastAck) >= 40*time.Millisecond {
+	if needACK {
 		s.sendPureACK()
 	}
 }

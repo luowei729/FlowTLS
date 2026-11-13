@@ -66,6 +66,13 @@ func RandomIPID(mark uint16) uint16 {
 	return mark | (uint16(mrand.Uint32()) & IPIDLowMask)
 }
 
+// randomUint32 生成一个随机 32 位值。
+//
+// 用途：伪造 TCP 的初始序号（ISN）与初始时间戳（TSval）。
+// 真实 TCP 两者都是随机化的——固定值会让连接可被预测，
+// 也是中间盒判定「非真实栈」的明显特征。
+func randomUint32() uint32 { return mrand.Uint32() }
+
 // ParsedPacket 是解析后的 IPv4 + TCP 报文视图。
 // Payload 直接借用接收缓冲区，零拷贝。
 type ParsedPacket struct {

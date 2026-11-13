@@ -40,8 +40,19 @@ func DefaultQUICConfig() *quicgo.Config {
 		// 伪造 TCP 路径没有真实的 ICMP 反馈，PMTU 探测既探不准又像扫描
 		DisablePathMTUDiscovery: true,
 		InitialPacketSize:       1340,
-		MaxIdleTimeout:          30 * time.Second,
-		KeepAlivePeriod:         10 * time.Second,
+		// MaxIdleTimeout 决定「隧道已死多久才被发现」。
+		//
+		// 它只适用于「完全收不到包」的场景，而健康连接每 KeepAlivePeriod
+		// 就会收到一次 ACK，所以不会误触发。
+		// 取 15s 而不是 Rust 侧的 30s：服务端重启后，客户端会在旧的
+		// 死连接上瞬间开流（写入只是本地缓冲），请求实际卡在「等服务端
+		// 响应」上，直到这个超时。实测 30s 对用户来说不可接受，15s 是
+		// 「丢包链路不会误杀」与「故障恢复不过慢」的折中。
+		MaxIdleTimeout: 15 * time.Second,
+		// 保活周期 5s：既是心跳也是死亡探测器。
+		// 必须明显小于 MaxIdleTimeout（至少 2:1），否则一次丢包就可能
+		// 被误判为掉线。
+		KeepAlivePeriod: 5 * time.Second,
 		// HandshakeIdleTimeout 必须显式设置。
 		//
 		// 默认 5s 看似够用，但**它是「多久没收到任何包」而不是总时长**：
@@ -418,6 +429,55 @@ func (c *Client) Done() <-chan struct{} { return c.conn.Context().Done() }
 // Err 返回连接关闭的原因（Done 触发后可读）。
 func (c *Client) Err() error { return context.Cause(c.conn.Context()) }
 
+// IdleFor 返回距最后一次成功收到服务端包的时间。
+//
+// 这是判断「连接是否已死」的关键指标：QUIC 的保活 PING 每
+// KeepAlivePeriod（10s）会收到一次 ACK，因此**健康连接的这个值
+// 不会显著超过保活周期**。远大于它就意味着链路可能已断。
+func (c *Client) IdleFor() time.Duration { return c.session.IdleFor() }
+
+// Probe 主动探测连接是否还活着。
+//
+// 为什么需要探活：QUIC 连接「已死但未检测到」是常态。服务端重启后，
+// 客户端仍能在旧连接上瞬间开流并写入（这些操作只是本地缓冲，不等 ACK），
+// 于是请求会卡在「等服务端响应」上，直到 MaxIdleTimeout（30 秒）。
+// 实测：不探活时服务端重启后的首个请求固定耗时 30.0s。
+//
+// 探测手段：发一个对端会丢弃的 DATAGRAM。目的不是送达，而是让对端
+// 回 ACK —— 只要收到任何包，Session.lastSeenAt 就会推进。
+// 代价只有 1 个 RTT，远小于重建整个 QUIC 连接。
+//
+// 返回 true 表示链路确认存活。
+func (c *Client) Probe(ctx context.Context, timeout time.Duration) bool {
+	if c.session == nil {
+		return false
+	}
+	before := c.session.LastSeenAt()
+	// 载荷刻意是不合法的 UDP 帧（不足 6 字节），服务端解析失败后
+	// 会按 UDP 语义静默丢弃——不会产生任何副作用，但 ACK 必须回。
+	_ = c.conn.SendDatagram([]byte{0x00})
+	// 轮询而不是等事件：Session 没有暴露「收到包」的通知通道，
+	// 而探活是低频动作（仅在空闲超过阈值时触发），50ms 轮询成本可忽略。
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-c.conn.Context().Done():
+			return false
+		case <-ticker.C:
+			if c.session.LastSeenAt().After(before) {
+				return true
+			}
+		}
+	}
+}
+
 // Stats 是通道的核心统计，供日志/健康检查使用。
 //
 // 刻意不含拥塞窗口：sagernet/quic-go 这个版本的 ConnectionStats
@@ -504,10 +564,24 @@ func (c *Client) DialConn(ctx context.Context, target string, port uint16) (net.
 	if err != nil {
 		return nil, fmt.Errorf("打开 QUIC 流失败: %w", err)
 	}
+	// **写地址帧必须设 deadline**。
+	//
+	// quic-go 的 Stream.Write 只在两个条件下返回：写成功，或**连接关闭**。
+	// 它不看 ctx —— 连接「已死但未检测到」时（服务端重启、链路中断），
+	// 这里会一直挂到 MaxIdleTimeout（30 秒），表现为「一个请求卡 30 秒」。
+	// 实测：不设 deadline 时，服务端重启后的首个请求耗时 30.0s。
+	//
+	// 设了 deadline 后，写超时会返回错误，上层据此重建通道并重试。
+	if dl, ok := ctx.Deadline(); ok {
+		_ = stream.SetWriteDeadline(dl)
+	}
 	if _, err := stream.Write(frame); err != nil {
 		_ = stream.Close()
 		return nil, fmt.Errorf("写地址帧失败: %w", err)
 	}
+	// 清掉写 deadline：后续数据由调用方的读写循环自己管理超时，
+	// 残留的 deadline 会让正常的大流量写被误杀。
+	_ = stream.SetWriteDeadline(time.Time{})
 	return &StreamConn{
 		stream: stream,
 		local:  c.session.LocalAddr(),

@@ -1,5 +1,64 @@
 # CHANGELOG
 
+## 2026-11-13 13:30 (北京时间)
+
+### Go P4 完成：服务端（共享 raw socket 的 Listener + sing-box inbound）+ 四向互通矩阵全绿
+
+**新增**
+
+| 文件 | 内容 |
+|---|---|
+| `flowtls/listener.go` | 共享 raw socket + 单收包协程 + 四元组分发；SYN 握手状态机；会话空闲回收 |
+| `flowtls/quic/server.go` | 基于 Session 的 QUIC 服务端（`Accept` 返回已握手的 `*quic.Conn`） |
+| `flowtls/cmd/ftserver/` | 服务端联调工具（TCP 转发 + UDP DATAGRAM 转发） |
+| `sing-box/protocol/flowtls/inbound.go` | 真实 inbound：流首帧解析目标地址 → `RouteConnectionEx`；DATAGRAM → `RoutePacketConnectionEx` |
+
+**修复**
+
+| 问题 | 原因 | 处理 |
+|---|---|---|
+| 客户端重启后握手超时（首包被吞） | 源端口固定 → 四元组复用；旧会话未回收时新 SYN 被当成乱序包丢弃 | `handlePacket` 把**纯 SYN 判断提到「已有会话」之前**，命中则先 `dropSession` 再重新握手；重传 SYN 仍走 pending 分支复用原 ISN |
+| `serveSession` 抢包 | 服务端误启 `Session` 自己的收包协程，直接读同一个共享 raw socket | 服务端只由 `Listener.recvLoop` 收包，`Session` 不启动接收协程 |
+| 服务端 `Accept` 永远拿不到连接 | 原实现在连接关闭后才把 conn 交给 `acceptCh` | 先交付、再等关闭 |
+
+**互通矩阵（全部实测通过）**
+
+| 客户端 \ 服务端 | Rust | Go（sing-box 1.14.4-rev.1） |
+|---|---|---|
+| Rust | ✓ | ✓ TCP 200 / 0.22s，UDP 61B / 1ms |
+| Go（sing-box） | ✓ TCP 200 / 0.22s，UDP 61B / 1ms | ✓ 连跑 5 次 0.21s，UDP 61B / 1ms |
+
+**关键设计**
+
+- **每客户端一个 `quic.Transport`，但只共享一个 raw socket**：
+  共用 PacketConn 会让 deadline 语义打架（一个客户端的超时打断其他客户端）、
+  readLoop 单点排队（快客户端饿死慢客户端）、单会话错误波及全体。
+- inbound 的 raw socket 严格放在 `Start(StartStateStart)`，
+  `sing-box check` 仍然不需要 root（已实测）。
+- 内层 QUIC 证书用运行时自签：安全由外层 AEAD 保证，无需用户配置。
+
+**新增门禁脚本**
+
+| 文件 | 内容 |
+|---|---|
+| `docs/e2e_matrix.sh` | 一键跑完 4 格互通矩阵（Rust/Go × Rust/Go，TCP+UDP，共 10 条断言）；与编解码门禁 `docs/interop_check.sh` 分工互补 |
+
+```
+$ bash docs/e2e_matrix.sh
+=== 汇总：10 通过 / 0 失败 ===
+PASS
+```
+
+**联调命令**
+
+```bash
+cd flowtls && go build -o /tmp/ftserver ./cmd/ftserver
+/tmp/ftserver -listen 0.0.0.0:8443 -password test-password-123 -local-ip <公网IP>
+```
+
+注意：本机互通必须用**真实网卡 IP**，不能用 `127.0.0.1`
+（Go 客户端按默认路由选网卡，发到 lo 的包会被送到 ens3）。
+
 ## 2026-11-13 12:37 (北京时间)
 
 ### Go P3 完成：UDP（QUIC DATAGRAM）与 Rust 服务端互通

@@ -1694,3 +1694,73 @@ bash docs/bench.sh 20
 # 临时关闭 DATAGRAM 扩展（用于二分排查延迟/握手问题）
 FLOWTLS_NO_DATAGRAM=1 ./flowtls server -c server.yaml
 ```
+
+## 69. 服务端共享 raw socket：收包只能有一个协程
+
+`flowtls.Listener` 用一个 AF_PACKET socket 收所有客户端的包，按四元组分发。
+这带来一条硬规则：
+
+> **服务端模式下，`Session` 绝不能启动自己的 `recvLoop`。**
+
+`Session.recvLoop` 会直接读同一个 raw socket。两个协程抢同一个 fd 时，
+包会被随机分给其中一方——属于 A 会话的包被 B 的协程读走后，
+`matchPeer` 判定不匹配就丢掉，A 的 QUIC 就永远收不到 ACK。
+现象是「TCP 能通但大文件卡死」或「握手随机超时」，极难定位。
+
+客户端侧没有这个问题（一个会话独占一个 raw socket），
+所以这段代码在客户端是正确的、在服务端是致命的。
+
+```go
+// 服务端：只有 Listener 收包
+// ❌ sess.StartReceiver()
+transport := &quicgo.Transport{Conn: sess}
+listener, err := transport.Listen(tlsConf, quicConf)
+```
+
+## 70. 源端口固定会撞四元组：纯 SYN 必须优先于已有会话
+
+客户端为了实现 iptables 精确匹配，会固定 `source_port`（默认 44300）。
+结果是：**客户端每重启一次，用的都是完全相同的四元组**。
+
+如果服务端的分发逻辑是「先查已有会话，再判断 SYN」，那么：
+
+1. 旧会话还没到空闲回收时间（默认 120s），仍在表里；
+2. 新客户端发来的 SYN 被投给旧会话；
+3. 旧会话的序号窗口对不上，当成乱序包丢弃；
+4. 客户端一直重传 SYN，直到握手超时——**服务端日志里一条记录都没有**。
+
+抓包能看到：SYN 发了，没回应，1 秒后重传，这才有 SYN-ACK。
+
+正确顺序（`listener.go` 的 `handlePacket`）：
+
+```go
+// 1) 纯 SYN 最先判：命中则清掉旧会话，重新握手
+if p.Flags&TCPSYN != 0 && p.Flags&TCPACK == 0 && len(p.Payload) == 0 {
+    if l.sessionFor(client) != nil { l.dropSession(client) }
+    l.handleSYN(client, p)
+    return
+}
+// 2) 已有会话 → 投递
+// 3) 都不是 → 首包
+```
+
+重传的 SYN 由 `handleSYN` 内部的 `pending` 分支处理，仍然回**一模一样**的
+SYN-ACK（ISN 不变），不会打乱客户端状态，也不会误杀已建立的会话。
+
+## 71. 本机联调必须用真实网卡 IP，不能用 127.0.0.1
+
+Go 客户端按**默认路由**选网卡（`defaultRouteInterface()`）。
+目标写 `127.0.0.1` 时，路由查询仍然返回 `ens3`，包被送到物理网卡，
+loopback 上根本没有——表现是 `handshake timeout` 而服务端毫无反应。
+
+```bash
+# ❌ 本机互通
+/tmp/ftdial -server 127.0.0.1:8443 ...
+# ✓ 用这台机器的真实地址
+/tmp/ftdial -server 10.0.0.1:8443 ...
+```
+
+另外 `net.mode: none` 时内核没有 8443 的监听 socket，
+会对每个伪造包回 RST（抓包能看到 `Flags [R]`）。
+这些 RST 不影响已建立的会话，但会让第一条 SYN 的路径更曲折——
+正式部署请让 iptables 规则生效（`net.mode: auto`）。

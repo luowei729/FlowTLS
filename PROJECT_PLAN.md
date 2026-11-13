@@ -378,3 +378,34 @@ IP ID 高字节固定 → 长连接的 IP ID 只落在 256 个连续值里，
 并做分布分析；不是「一条规则就能判定」的等级（对比：缺 TCP 时间戳、
 ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
 「使用编译默认 magic 值」给出警告，避免所有部署共用同一特征。
+
+---
+
+## 2026-11-13 13:30（北京时间）更新：P4 完成
+
+### 已完成
+
+| 项 | 状态 |
+|---|---|
+| `flowtls/listener.go`（共享 raw socket + 四元组分发 + SYN 状态机） | ✅ |
+| `flowtls/quic/server.go`（服务端 QUIC） | ✅ |
+| `sing-box` inbound 适配层（流 → `RouteConnectionEx`，DATAGRAM → `RoutePacketConnectionEx`） | ✅ |
+| 四向互通矩阵（Rust/Go × Rust/Go，TCP+UDP） | ✅ 全绿 |
+| `sing-box check` 非 root 通过（raw socket 只在 Start 阶段申请） | ✅ |
+
+### 剩下的事（P5）
+
+1. **iptables 规则在 sing-box 侧落地**
+   `option.FlowTLSInboundOptions.IPTablesMode` 已定义（none/print/auto），
+   但还没接上 Rust 版 `src/rules.rs` 的等价逻辑。当前部署仍需手工维护规则。
+2. **同端口真证书网站**
+   sing-box 的 flowtls inbound 只做协议，没有伪装站点。
+   需要复用 `web/index.html` + 一个内嵌 rustls/https 的等价实现，
+   或者在 README 里明确要求另起一个 nginx/caddy 监听同端口。
+3. **CI 互通矩阵**（进度：本地脚本已完成）
+   `docs/e2e_matrix.sh` 已覆盖 4 格全链路（TCP+UDP，10 条断言）；
+   剩余工作只是把它接进 GitHub Actions（需要 runner 具备 CAP_NET_RAW）。
+4. **配置迁移文档**
+   Rust 的 YAML 与 sing-box 的 JSON 字段对照表（`docs/MIGRATION.md`）。
+5. **冻结 Rust**
+   等 P5 的 1~3 稳定后，Rust 代码只作为参考实现保留，不再加特性。

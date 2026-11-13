@@ -1,41 +1,58 @@
 #!/usr/bin/env bash
-# 跨语言互通门禁。
+# wire format 冻结向量门禁（无需 root，无需 Rust 工具链）。
 #
-# 为什么需要脚本而不是只靠单测：
-#   Rust 与 Go 各自单测通过，不代表两端能互通——派生参数、AAD 组成、
-#   记录布局任何一处不一致都会「自测全绿、联调全挂」。
-#   这里用「Rust 加密 → Go 解密」和「Go 加密 → Rust 解密」双向验证，
-#   把互通性变成一个可执行的硬门禁。
+# 背景：本协议最早由 Rust 实现，现在 Rust 已冻结归档到 `legacy-rust` 分支
+# （见 docs/EVOLUTION.md）。冻结前用力它的单测导出了两份**黄金向量**并入库：
+#
+#   flowtls/testdata/wire_v2_rust.bin         两条记录的完整字节流
+#   flowtls/testdata/wire_v2_rust_authid.txt  密码派生的 authID（hex）
+#
+# 这两个文件就是 wire format v2 的权威字节。任何「改了 HKDF 参数、
+# AAD 组成、nonce 布局或记录头格式」的行为都会让门禁立刻变红。
+#
+# 为什么这比「跑一遍两端联调」更值得做门禁：
+#   联调只能证明「两端现在能互相通信」，两端同时改错会一起通过；
+#   冻结向量钉的是**绝对字节**，不存在两端同时漂移的盲区。
 #
 # 用法：bash docs/interop_check.sh
-# 要求：cargo 与 go 都可用；需要 root（不，本脚本不碰 raw socket，纯编解码）
+# 要求：go 可用；不需要 root；不需要 Rust。
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 GO="${GO:-go}"
-CARGO="${CARGO:-cargo}"
-VECTOR=/tmp/flowtls-go-vector.bin
-RUST_VECTOR=/tmp/flowtls-rust-vector.bin
+export PATH=/usr/local/go/bin:$PATH
+export GOPATH="${GOPATH:-/root/go}"
+export GOTOOLCHAIN=local
 
-echo "==> 1/4 清除旧向量"
-rm -f "$VECTOR" "$RUST_VECTOR" /tmp/flowtls-rust-authid.txt
+echo "==> 1/3 检查冻结向量是否入库"
+for f in flowtls/testdata/wire_v2_rust.bin flowtls/testdata/wire_v2_rust_authid.txt; do
+	if [[ ! -f "$f" ]]; then
+		echo "FAIL: 缺少冻结向量 $f"
+		echo "      它应该随仓库分发；丢失意味着兼容性基线消失。"
+		exit 1
+	fi
+	echo "    ✓ $f ($(stat -c%s "$f") 字节)"
+done
 
-echo "==> 2/4 Rust 导出向量（Rust -> Go 用）"
-"$CARGO" test --quiet export_vector 2>&1 | grep -E "test result|error" || true
-test -f "$RUST_VECTOR" || { echo "FAIL: Rust 未导出向量"; exit 1; }
-
-echo "==> 3/4 Go 消费 Rust 向量 + 导出 Go 向量"
+echo "==> 2/3 用冻结向量验证 Go 实现（Rust → Go 方向）"
 (
-  cd flowtls
-  "$GO" test -run 'TestInterop' -v ./... 2>&1 | grep -E "^(=== RUN|--- (PASS|FAIL|SKIP))" || true
-  "$GO" test -run 'TestInterop' ./... >/dev/null
+	cd flowtls
+	"$GO" test -run 'TestInteropRustToGo' -v ./... 2>&1 |
+		grep -E '^(=== RUN|--- (PASS|FAIL|SKIP))'
+	# SKIP 视为失败：门禁环境里向量必须存在，跳过说明检查没生效
+	if ! "$GO" test -run 'TestInteropRustToGo' ./... 2>&1 | grep -q '^ok'; then
+		echo "FAIL: TestInteropRustToGo 未通过（或向量被跳过）"
+		exit 1
+	fi
 )
-test -f "$VECTOR" || { echo "FAIL: Go 未导出向量"; exit 1; }
 
-echo "==> 4/4 Rust 消费 Go 向量（Go -> Rust 用）"
-"$CARGO" test --quiet consume_go_vector 2>&1 | grep -E "test result|error" || true
+echo "==> 3/3 全量单测（含竞态检测）"
+(
+	cd flowtls
+	"$GO" test -race ./... 2>&1 | grep -v 'no test files'
+)
 
 echo
-echo "互通门禁：PASS"
+echo "冻结向量门禁：PASS"

@@ -3,49 +3,65 @@ package flowtls
 import (
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
-// 跨语言互通测试。
+// 冻结向量门禁：与已归档的 Rust 参考实现对齐。
 //
-// 与 Rust 侧的 `interop_vector::export_vector` / `interop_consume::consume_go_vector`
-// 配对，构成双向门禁。向量文件由 Rust 侧单测生成：
+// 历史背景：本协议最早由 Rust 实现（现已冻结，见 docs/EVOLUTION.md）。
+// 冻结前用它的单测导出了两份**黄金向量**并入库：
 //
-//	cargo test export_vector
+//	flowtls/testdata/wire_v2_rust.bin          —— 两条记录的字节流
+//	flowtls/testdata/wire_v2_rust_authid.txt   —— 密码派生的 authID（hex）
 //
-// 手动把 Go 向量交给 Rust 验证：
+// 这两个文件是 wire format v2 的**权威字节**。任何改动 HKDF 参数、
+// AAD 组成、nonce 布局、记录头格式的行为都会让本测试立刻变红，
+// 即使 Rust 代码已经不在主分支里。
 //
-//	cd flowtls && go run ./internal/genvector   （或见 docs 里的命令）
-//
-// 文件不存在时跳过，保证在没跑过 Rust 的环境里 `go test ./...` 依然通过；
-// 但只要跑过，格式不一致就会立刻红。
-
+// 如果向量文件不存在（比如在极简检出里），用 /tmp 的旧路径兼服。
 const (
+	frozenVectorPath = "testdata/wire_v2_rust.bin"
+	frozenAuthIDPath = "testdata/wire_v2_rust_authid.txt"
+
 	rustVectorPath = "/tmp/flowtls-rust-vector.bin"
 	rustAuthIDPath = "/tmp/flowtls-rust-authid.txt"
 	goVectorPath   = "/tmp/flowtls-go-vector.bin"
 	interopPasswd  = "interop-password"
 )
 
+// readVector 优先读入库的冻结向量，其次读 /tmp 的临时文件。
+func readVector(primary, fallback string) ([]byte, bool) {
+	for _, path := range []string{primary, fallback} {
+		if path == "" {
+			continue
+		}
+		if blob, err := os.ReadFile(filepath.Clean(path)); err == nil {
+			return blob, true
+		}
+	}
+	return nil, false
+}
+
 // TestInteropRustToGo 用 Rust 加密的字节验证 Go 能解密。
 //
 // 覆盖的关键点：HKDF 参数（salt/info）、authID 派生、AAD 组成、
 // nonce 布局、记录格式 —— 任何一项不一致都会解密失败。
 func TestInteropRustToGo(t *testing.T) {
-	blob, err := os.ReadFile(rustVectorPath)
-	if err != nil {
-		t.Skipf("跳过：没有 %s（先跑 cargo test export_vector）", rustVectorPath)
+	blob, ok := readVector(frozenVectorPath, rustVectorPath)
+	if !ok {
+		t.Skipf("跳过：找不到冻结向量 %s（也不存在 %s）", frozenVectorPath, rustVectorPath)
 	}
 	codec, err := NewServerCodec(interopPasswd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// authID 必须与 Rust 导出的完全一致
-	if want, err := os.ReadFile(rustAuthIDPath); err == nil {
+	// authID 必须与冻结参考实现完全一致
+	if want, ok := readVector(frozenAuthIDPath, rustAuthIDPath); ok {
 		wantID := string(want)
 		id := codec.AuthID()
 		if got := toHex(id[:]); got != wantID {
-			t.Fatalf("authID 不一致：go=%s rust=%s（HKDF 参数被改动了？）", got, wantID)
+			t.Fatalf("authID 不一致：go=%s 冻结值=%s（HKDF 参数被改动了？）", got, wantID)
 		}
 	}
 

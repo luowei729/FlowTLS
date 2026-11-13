@@ -45,8 +45,16 @@ type FlowTLSOutboundOptions struct {
 	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
 	// SNI 只影响伪 ClientHello 的外观，不参与握手校验。
 	SNI string `json:"sni,omitempty"`
-	// Handshake 为 false 时跳过三次握手（要求客户端有公网 IP）。
-	Handshake bool `json:"handshake,omitempty"`
+	// DisableHandshake 关闭三次握手表演。
+	//
+	// **字段名故意是反向的**：Go 的 bool 零值是 false，若写成
+	// `Handshake bool`，默认行为就变成「关闭握手」——而正确默认是
+	// **开启**（严格 NAT/状态防火墙只放行握手完成的流量，不握手会直接被丢）。
+	// 用反向字段才能让零值等于「安全默认」。
+	//
+	// 仅在客户端有公网 IP、且链路没有状态防火墙时才可关闭
+	// （省一个 RTT）。
+	DisableHandshake bool `json:"disable_handshake,omitempty"`
 	// Network 声明支持的承载网络，默认 TCP+UDP。
 	Network NetworkList `json:"network,omitempty"`
 }

@@ -272,8 +272,14 @@ type userTable struct {
 }
 
 type userEntry struct {
-	Name  string
-	Codec *Codec
+	Name string
+	// Password 保留明文，因为**每条连接必须新建一个 Codec**。
+	//
+	// 不能共享：Codec 持有 nonce 计数器，两条连接共用一个计数器
+	// 会让同一密钥下的 nonce 交叉重复；一旦重复，ChaCha20-Poly1305
+	// 的机密性与完整性同时失效（可恢复明文、可伪造）。
+	Password string
+	Codec    *Codec
 }
 
 func newUserTable(users []User) (*userTable, error) {
@@ -286,7 +292,7 @@ func newUserTable(users []User) (*userTable, error) {
 		id := codec.AuthID()
 		// 密码相同 → authID 相同 → 后者覆盖前者，一整个用户会被静默顶掉。
 		// check 会在配置层拦截，这里再兜一层（覆盖是明确的行为，不是 bug）。
-		t.entries[id] = &userEntry{Name: u.Name, Codec: codec}
+		t.entries[id] = &userEntry{Name: u.Name, Password: u.Password, Codec: codec}
 	}
 	return t, nil
 }
