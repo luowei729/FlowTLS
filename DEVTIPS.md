@@ -2774,3 +2774,100 @@ for {
    `c.Done()` + `Probe` 判断连接死活 —— 信息重复且更不可靠。
 3. 精简的量化指标不是行数，而是**从「请求进来」到「发出第一字节」经过的函数数**。
    v1 是 6 层，v2 是 3 层（DialContext → channel → DialConn）。
+
+## 96. 服务端必须批量收包 + 用 AF_PACKET 发送：两项各让吞吐差 2~4 倍
+
+这是本轮最后两个真根因，都是**Go 版与 Rust 版在 syscall 层不一致**造成的，
+而不是算法或参数问题。
+
+### 6.1 收包：逐包 recvfrom 让 ACK 迟滞 150ms
+
+同一时刻对照（Go 客户端，同一条链路，ICMP 72.7ms）：
+
+| 服务端实现 | QUIC min_rtt | srtt |
+|---|---|---|
+| Rust 8445（`recvmmsg`） | 76.6ms | 79.9ms |
+| Go 8443（逐包 `recvfrom`） | **225.4ms** | 233.7ms |
+| Go 8443（改 `recvmmsg` 后） | **72.4ms** | 77.7ms |
+
+服务端 CPU 只有 6%，所以不是算力。差异来自 **syscall 与协程调度粒度**：
+
+- 下行 15MB/s ≈ 11000pps，客户端要回约 11000pps 纯 ACK；
+- 逐包 `recvfrom` = 每包一次 syscall + 一次协程调度；
+- 单核 ARM 上调度延迟被放大，ACK 晚 150ms 发出，对端把它算成 RTT。
+
+`Listener.recvLoop` 现在与 `Session.recvLoop` 一样用 `RecvBatch`（一次 32 包）。
+早期 recvmmsg「吞吐崩到 7KB/s」的坑是 `mmsghdr` 布局写错，
+现在 `TestRecvmmsgActuallyReceives` 直接断言「内核真的把包填进来」，风险已消除。
+
+### 6.2 发送：IPPROTO_RAW 是 1 核 ARM 的第一瓶颈
+
+Rust `socket.rs` 的注释写得很清楚：
+
+> 原先用 IPPROTO_RAW + IP_HDRINCL，实测在 1 核 ARM 上约 35µs/包
+> （15260 pps 时内核态吃掉 54% CPU），是高速率下的第一瓶颈。
+
+Go 版一直走 IPPROTO_RAW（因为早期 AF_PACKET 在 NAT 云主机上被网关丢包）。
+现在源地址已自动纠正为内网地址（DEVTIPS 87），AF_PACKET 可以正常工作：
+
+| 服务端发送路径 | 单流 100MB | cwnd |
+|---|---|---|
+| `ipproto_raw` | 5 MB/s | 1.2~1.7MB |
+| `af_packet` | **15~23 MB/s** | **4.7MB** |
+
+**默认值取舍**：
+
+```go
+usePacket := !bindRecv        // 服务端默认 AF_PACKET，客户端默认 IPPROTO_RAW
+if v := os.Getenv("FLOWTLS_AF_PACKET"); v != "" { usePacket = v == "1" }
+```
+
+客户端保持 RAW 的原因：家用/办公 NAT 对「没有 conntrack 状态却凭空出现的
+TCP 包」更挑剔（DEVTIPS 86），而客户端上行主要是纯 ACK，包量小，不是瓶颈。
+
+### 6.3 最终对照（同一链路、同一时段，多轮）
+
+| 指标 | Rust 服务端 | Go 服务端（修复后） |
+|---|---|---|
+| QUIC min_rtt | 76.6ms | **76.1ms** |
+| 单流 100MB | 10.6 MB/s | **15.2~23.0 MB/s** |
+| 4 并发 10MB 合计 | 5.8 MB/s | **12.3 MB/s** |
+| 伪 TCP 握手（抓包） | — | 80.8ms |
+| UDP DNS 6 项 | — | 全 PASS |
+
+### 教训
+
+1. **「CPU 不高所以不是性能问题」是错的**。逐包 syscall 的代价不是 CPU 占用，
+   而是**延迟**：每个 syscall 之间进程可能被调度走，1 核上这个间隔是毫秒级。
+2. 用户态伪造 TCP 栈的性能几乎完全由 syscall 形态决定：
+   `recvmmsg`/`sendmmsg` 批量 + `AF_PACKET` 旁路内核 IP 层，两者缺一不可。
+3. 对照实验必须**同一时刻、同一链路、同一条客户端**。
+   本轮多次被「几分钟前的数字」误导（例如以为 4 并发退化，
+   实际是链路波动；同一时刻对照后 Go 反而是 Rust 的两倍）。
+
+---
+
+## 97. Go v1 归档之后：v2 的精简原则
+
+用户判定「越写越复杂、排查越来越难」后，v2 的重构按三条原则执行：
+
+1. **一个概念只出现在一个文件**。通道获取只有 `Outbound.channel()` 一个入口，
+   不再有 `getClient` + `dialing` + `attemptCtx` + `invalidate` 四层。
+2. **删除误判的层，而不是再加一层判断**。`suspectConn` 想用「读错误」判断
+   连接死活，但正常关闭一条流时 Read 必然报错，无法区分；改为
+   `c.Done()` + `Probe()`，信息更可靠且只有一处。
+3. **量化指标是「请求到首字节经过的函数数」**，不是行数。
+   v1 是 6 层，v2 是 3 层（`DialContext` → `channel` → `DialConn`）。
+
+`outbound.go` 537 → 406 行（其中约 55% 是解释「为什么」的中文注释）。
+`inbound.go` 保持与 hysteria2 同构的最小结构（UDP 会话生命周期必须如此：
+`ctx` + `cancel` + `readDeadline` + `canceler.NewPacketConn`），不做进一步拆分。
+
+对照表（v2 目标与实测进展）：
+
+| 文件 | v1 | v2 | 说明 |
+|---|---|---|---|
+| `sing-box/protocol/flowtls/outbound.go` | 537 | **406** | 删掉 4 层包装 |
+| `sing-box/protocol/flowtls/inbound.go` | 730 | 730 | 已是 hy2 同构最小结构，不动 |
+| `flowtls/quic/client.go` | 897 | 897 | 待办：与 Rust `client.rs` 的 `run_session` 对齐 |
+| `flowtls/session.go` | 1229 | 1229 | 待办：收窄发送 API |

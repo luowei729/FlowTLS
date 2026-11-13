@@ -263,40 +263,56 @@ func (l *Listener) Stats() Stats {
 
 // recvLoop 是唯一的收包协程：解析 → 分流。
 //
-// **逐包 recvfrom，不用 recvmmsg**。曾试过 recvmmsg 批量收（一次 32 个），
-// 结果吞吐从 87Mbps 崩到 7KB/s，且客户端 sent 计数完全停滞。
-// 根因：`recvmmsg` 的 mmsghdr 布局在 AF_PACKET 上没有得到真实验证
-// （本机回环测试被环境跳过），内核可能静默不填充 MsgLen，
-// 表现为「收包协程空转、包全丢」——而 masquerade 走内核 TCP 栈
-// 依然正常，极难定位。
+// **批量收包（recvmmsg）**，与 Rust `server.rs` 的 `PacketBatch` 对齐。
 //
-// 教训：**任何 unsafe + syscall 的优化，没有能跑通的验证就不能上线**。
-// 收包侧的真实验证需要一个独立的发包源（另一台机器或 tcpdump 回灌），
-// 成本远高于收益，因此这里保持最简单的逐包实现。
+// 为什么必须批量：服务端 11000pps 下行时，客户端会回约 11000pps 的纯 ACK。
+// 逐包 recvfrom 意味着每包一次 syscall + 一次协程调度；单核 ARM 上
+// 调度延迟会被放大成**秒级的 ACK 迟滞**，对端测到的 RTT 直接从 76ms
+// 涨到 225ms（实测：同一时刻 Go 服务端 225ms、Rust 服务端 76ms，
+// CPU 仅 6%，所以不是算力问题，是 syscall/调度粒度问题）。
+//
+// 历史：早期 recvmmsg 曾把吞吐从 87Mbps 打到 7KB/s，原因是 mmsghdr
+// 布局写错（内核静默不填 MsgLen）。现在 `socket_linux_test.go` 的
+// `TestRecvmmsgActuallyReceives` 直接断言「内核真的把包填进来了」，
+// 客户端 `Session.recvLoop` 也已经在用同一条路径，风险已消除。
 func (l *Listener) recvLoop() {
 	defer l.wg.Done()
-	buf := make([]byte, 65536)
+	// 每个包用独立缓冲：ParseFrame 返回的切片直接指向它，
+	// 同一批里多个包必须各自成立。
+	bufs := make([][]byte, maxRecvBatch)
+	for i := range bufs {
+		// 2048 足够：伪包最大 1417 字节。
+		bufs[i] = make([]byte, 2048)
+	}
+	lens := make([]int, maxRecvBatch)
 	for {
 		if l.ctx.Err() != nil {
 			return
 		}
-		n, err := l.raw.Recv(buf)
+		n, err := l.raw.RecvBatch(bufs, lens)
 		if err != nil {
 			if l.ctx.Err() != nil {
 				return
 			}
+			// fd 被关闭或被打断：退避一下避免空转刷 CPU。
+			time.Sleep(time.Millisecond)
 			continue
 		}
-		p, ok := ParseFrame(buf[:n])
-		if !ok {
-			continue
+		for i := 0; i < n; i++ {
+			if l.ctx.Err() != nil {
+				return
+			}
+			p, ok := ParseFrame(bufs[i][:lens[i]])
+			if !ok {
+				continue
+			}
+			// 只处理发往本端口的包。绑定的是 AF_PACKET（收到整机所有 IP 包），
+			// 不过滤会把 Docker/SSH/伪装站的流量都走进来。
+			if p.DstPort != l.port {
+				continue
+			}
+			l.handlePacket(p)
 		}
-		// 只处理发往本端口的包。绑定的是 AF_PACKET（收到所有 IP 包），
-		// 不过滤会把整机流量都走进来。
-		if p.DstPort != l.port {
-			continue
-		}
-		l.handlePacket(p)
 	}
 }
 

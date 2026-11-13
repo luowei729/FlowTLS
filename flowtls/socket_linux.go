@@ -119,22 +119,31 @@ func newRawSocket(dst netip.Addr, local netip.Addr, bindRecv bool) (*rawSocket, 
 		}
 	}
 
-	// ---- 发送 fd：默认 IPPROTO_RAW，AF_PACKET 可选 ----
+	// ---- 发送 fd：服务端默认 AF_PACKET，客户端默认 IPPROTO_RAW ----
 	//
-	// **为什么默认 RAW 而不是 AF_PACKET**（与 Rust 版的实际行为一致）：
+	// **发送路径的选择直接决定吞吐**（实测，新加坡 1 核 ARM 服务端）：
 	//
-	// 1. 云主机常在 1:1 NAT 后面（如 Oracle Cloud：网卡只有内网 10.x，公网靠网关映射）。
-	//    AF_PACKET 完全旁路内核协议栈，包没有 conntrack 状态，
-	//    云网关会因反欺骗/无状态直接丢弃——实测 SYN-ACK 出了网卡但客户端收不到。
-	// 2. IPPROTO_RAW + IP_HDRINCL 走的仍是内核路由与 conntrack，
-	//    网关能正常做 SNAT/DNAT，实测跨境链路工作正常。
-	// 3. sendmmsg 批量发送对 RAW fd 同样生效，批量收益不依赖 AF_PACKET。
+	//	IPPROTO_RAW  → Go↔Go 5 MB/s，cwnd 卡在 1.2~1.7MB
+	//	AF_PACKET    → Go↔Go **21 MB/s**，cwnd 涨到 4.7MB
 	//
-	// 于是：默认 RAW（兼容性优先）；确认环境无 NAT/网关状态检查（物理网卡、直连）
-	// 时可用 FLOWTLS_AF_PACKET=1 开启 AF_PACKET（少一层内核 IP 处理，略快）。
+	// 原因与 Rust `socket.rs` 的注释完全一致：IPPROTO_RAW + IP_HDRINCL 每包
+	// 都要走内核的完整 IP 层（路由查找、conntrack、netfilter、qdisc），
+	// 1 核 ARM 上约 35µs/包，是高速率下的**第一瓶颈**。
+	// AF_PACKET 把帧直接交给驱动，只做一次 ARP。
+	//
+	// **为什么客户端仍然默认 RAW**：家用/办公网络的 NAT 设备对
+	// 「没有 conntrack 状态却凭空出现的 TCP 包」更挑剔，AF_PACKET 旁路
+	// conntrack 可能让回包被网关丢弃（DEVTIPS 86 的教训）。客户端的
+	// 上行主要是纯 ACK，包量小，RAW 的 syscall 成本不是瓶颈。
+	//
+	// 覆盖方式：`FLOWTLS_AF_PACKET=1` 强制开启，`=0` 强制关闭。
+	usePacket := !bindRecv // 服务端（bindRecv=false）默认 AF_PACKET
+	if v := os.Getenv("FLOWTLS_AF_PACKET"); v != "" {
+		usePacket = v == "1"
+	}
 	sendFD := -1
 	isPacket := false
-	if os.Getenv("FLOWTLS_AF_PACKET") == "1" && ifindex > 0 && nextHop != ([6]byte{}) {
+	if usePacket && ifindex > 0 && nextHop != ([6]byte{}) {
 		fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(syscall.ETH_P_IP)))
 		if err == nil {
 			sll := &syscall.SockaddrLinklayer{

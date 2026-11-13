@@ -1,5 +1,58 @@
 # CHANGELOG
 
+## 2026-11-14 03:35 (北京时间)
+
+### 再定位两个 syscall 层根因：服务端批量收包 + AF_PACKET 发送
+
+上一轮修完分流与发送队列后，`min_rtt` 在测试实例上降到 80ms，
+但切到生产入口（1080）又回到 216~225ms。按 DEVTIPS 91 的纪律做
+**同一时刻对照**，结论明确：问题在 Go 服务端，不在链路。
+
+| 服务端 | min_rtt | srtt | 单流 100MB | 4 并发合计 |
+|---|---|---|---|---|
+| Rust 8445 | 76.6ms | 79.9ms | 10.6 MB/s | 5.8 MB/s |
+| Go 8443（修复前） | 225.4ms | 233.7ms | 5 MB/s | — |
+| **Go 8443（修复后）** | **72.4~76.1ms** | **77.7~79.7ms** | **15.2~23.0 MB/s** | **12.3 MB/s** |
+
+**1) 服务端逐包 `recvfrom` → `recvmmsg`**
+
+下行 11000pps 时客户端要回同样速率的纯 ACK；逐包 recvfrom = 每包一次
+syscall + 一次协程调度，单核 ARM 上调度延迟被放大，ACK 晚 150ms 发出，
+对端把它算成 RTT。服务端 CPU 仅 6%，所以不是算力问题。
+
+`Listener.recvLoop` 改为 `RecvBatch`（一次 32 包），与 `Session.recvLoop`
+和 Rust `PacketBatch` 一致。早期 recvmmsg「吞吐崩到 7KB/s」的坑是
+`mmsghdr` 布局写错，现已有 `TestRecvmmsgActuallyReceives` 直接断言
+「内核真的把包填进来」。
+
+**2) 服务端发送 IPPROTO_RAW → AF_PACKET 默认**
+
+Rust `socket.rs` 早有注释：IPPROTO_RAW + IP_HDRINCL 在 1 核 ARM 上约
+35µs/包，是高速率下的第一瓶颈。Go 版一直走 RAW（早期 AF_PACKET 在 NAT
+云主机被网关丢包），但源地址自动纠正（DEVTIPS 87）之后 AF_PACKET 可用：
+
+| 发送路径 | 单流 100MB | cwnd |
+|---|---|---|
+| `ipproto_raw` | 5 MB/s | 1.2~1.7MB |
+| `af_packet` | **15~23 MB/s** | **4.7MB** |
+
+默认值：服务端 AF_PACKET、客户端 IPPROTO_RAW（家用 NAT 对旁路 conntrack
+的包更挑剔，DEVTIPS 86）。可用 `FLOWTLS_AF_PACKET=1/0` 强制覆盖。
+`PACKET_QDISC_BYPASS` 保持默认关闭（DEVTIPS 84）。
+
+**3) 生产入口最终验收（1080，Go↔Go）**
+
+| 用例 | 结果 |
+|---|---|
+| 出口 IP | 203.0.113.10 ✅ |
+| 单流 100MB ×3 | 17.2 / 22.0 / 23.0 MB/s（137~184Mbps） |
+| UDP DNS 6 项 | 全部 PASS |
+| 普通 curl 访问 8443 | 只收到内核 1 个 SYN-ACK ✅ |
+| `sing-box check`（不用 root） | 通过 ✅ |
+
+文档：`DEVTIPS.md` 新增 96（批量收包 + AF_PACKET 的量化对照与教训）、
+97（v2 精简原则与文件对照表）。
+
 ## 2026-11-14 03:10 (北京时间)
 
 ### 高 RTT / 连接不稳定的三个真根因定位与修复；Go v1 归档、v2 精简移植启动

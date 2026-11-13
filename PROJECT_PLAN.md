@@ -45,11 +45,22 @@ Go v1 功能全通，但**代码结构与 Rust 严重偏离**，导致排障成�
 
 | 指标 | 修复前 | 修复后 |
 |---|---|---|
-| QUIC min_rtt（客户端） | 213ms | **81.2ms** |
-| QUIC min_rtt（服务端） | 213ms | **80.3ms** |
 | 伪 TCP 握手（抓包） | 214ms | **80.8ms** |
-| 10MB 下载 ×6 | 3.4~17.7 MB/s（抖动大） | **14.7~16.1 MB/s** |
+| QUIC min_rtt（客户端） | 213ms | **76.1ms** |
+| QUIC min_rtt（服务端） | 213ms | **72.4~76.1ms** |
+| 单流 100MB | 5 MB/s | **15.2~23.0 MB/s** |
+| 4 并发 10MB 合计 | — | **12.3 MB/s**（Rust 同场景 5.8） |
 | 普通 curl 访问 8443 | 收到 2 个 SYN-ACK | 只收到内核 1 个 ✅ |
+
+五条根因（缺一不可，逐条验证过）：
+
+| # | 缺陷 | 文件 |
+|---|---|---|
+| 1 | 服务端丢了伪 SYN 判断 | `listener.go` |
+| 2 | IP ID 分流有 1/16 误命中且会被改写 → 改用 wscale=12 | `packet.go`/`rules.go` |
+| 3 | 发送队列 4096 深且满即丢 → 本地排队被计入 RTT | `session.go` |
+| 4 | 服务端逐包 `recvfrom` → ACK 迟滞 150ms | `listener.go` |
+| 5 | 服务端 `IPPROTO_RAW` 发送 → 1 核 ARM 第一瓶颈 | `socket_linux.go` |
 
 ### v2 目标结构（与 Rust 一一对应）
 
@@ -112,11 +123,19 @@ sing-box/protocol/flowtls/     只有两个文件（无第三个抽象层）
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | A | 归档 Go v1（tag + 分支 + 计划原文） | ✅ |
-| B | 三个真根因修复（分流 / 队列 / ACK 通道） | ✅ |
-| C | 精简 `outbound.go`（删 suspectConn 三件套） | 进行中 |
-| D | 精简 `inbound.go`（UDP 会话单分发） | 待办 |
-| E | 精简 `session.go`（收窄发送 API） | 待办 |
-| F | 文档收敛：AGENTS / DESIGN / DEVTIPS 与代码一致 | 待办 |
+| B | 五个真根因修复（分流 / wscale / 队列 / recvmmsg / AF_PACKET） | ✅ |
+| C | 精简 `outbound.go`（删 suspectConn 四件套，537→406） | ✅ |
+| D | 精简 `inbound.go` | 已评估：与 hy2 同构的最小结构，不再拆分 |
+| E | 精简 `session.go` / `quic/client.go`（收窄 API） | 待办（不影响性能） |
+| F | 文档收敛：AGENTS / DESIGN / DEVTIPS 与代码一致 | ✅ |
+
+**D 项的评估结论**：`inbound.go` 的 UDP 部分（`inboundPacketConn` +
+`canceler.NewPacketConn` + `readDeadline`）是 hysteria2 `service_packet.go`
+的同构实现，属于「UDP 会话生命周期」这一个概念所必需的最小结构；
+再拆只会增加层数。真正的复杂度来自注释（解释为什么），而注释是资产。
+
+E 项是纯代码整理（`Session` 的 `TxStats`/`CtrlStats` 可以合并为一个
+`TransportStats`），不影响正确性，留到有实际需求时再做。
 
 ---
 
