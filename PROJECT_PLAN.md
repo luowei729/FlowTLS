@@ -1,6 +1,40 @@
 # PROJECT_PLAN
 
-## 当前状态（2026-11-13 11:20 北京时间）
+## 当前状态（2026-11-13 11:29 北京时间）
+
+### Go P1 完成：`flowtls/` 传输层移植 + 双向互通门禁
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| P0 | subtree + 补丁 + stub 注册 + Makefile | ✅ |
+| **P1** | **`flowtls/` 主包：packet/codec/socket/session + 单测** | ✅ |
+| P2 | `quic/` 子包 + `protocol/flowtls/outbound.go` | 待办 |
+| P3 | UDP（udpnat2 + session 映射） | 待办 |
+| P4 | `Listener.Accept` + inbound 适配 | 待办 |
+| P5 | 打包脚本、CI 互通矩阵、配置迁移文档 | 待办 |
+
+**P1 产出**：`packet.go`（报文/校验和/时钟/窗口）、`codec.go`（v2 记录 +
+AEAD + 多用户表）、`socket_linux.go`/`socket_stub.go`、`session.go`
+（`net.PacketConn` + 三次握手）。
+
+**关键验证（这是 P1 真正的价值）**：Rust 与 Go 各自 17/25 个单测全绿，
+但真正的结论来自**交换真实字节**：
+
+- authID 派生：三个密码两端**逐字节一致**
+- Rust 加密 → Go 解密：通过
+- Go 加密 → Rust 解密：通过
+- 固化为 `bash docs/interop_check.sh`
+
+**依赖教训**：x/sys/unix 的当前版本符号缺失且把 go 指令顶到 1.26（sing-box
+是 1.25.5），已改用标准库 `syscall`；`SendBatch` 暂时退化循环 sendto，
+批量优化留到性能阶段。
+
+**P2 起点**：`flowtls/quic/service.go` 用 `quic.Transport{Conn: session}`
+直接接单条 Session，先做客户端 outbound（能打通 Rust 服务端即可验证线路）。
+
+---
+
+## 上一阶段状态（2026-11-13 11:20 北京时间）
 
 ### wire format v2：多用户鉴权（已完成并联调通过）
 

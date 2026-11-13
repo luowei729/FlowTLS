@@ -844,3 +844,73 @@ mod tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod interop_vector {
+    use super::*;
+
+    /// 导出固定的互通向量供 Go 侧消费（Rust -> Go 方向）。
+    ///
+    /// 这不是常规单测，而是跨语言互通的可执行契约：
+    /// Rust 加密的字节必须能被 Go 解开，反之亦然。
+    /// 文件写失败时静默跳过，避免在没有 /tmp 的环境里失败。
+    #[test]
+    fn export_vector() {
+        // 必须用客户端构造器：只有客户端会在首包上带 ver+authID。
+        // 服务端方向从不携带首包头（它总是先收后发）。
+        let obfs = Obfs::new_client("interop-password");
+        let first = obfs.seal(b"first-datagram");
+        // 模拟「已确认服务端可达」，后续包不再带首包头
+        obfs.mark_established();
+        let second = obfs.seal(b"second-datagram");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(first.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&first);
+        blob.extend_from_slice(&(second.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&second);
+        let _ = std::fs::write("/tmp/flowtls-rust-vector.bin", &blob);
+
+        // 同时导出 authID，便于 Go 侧核对派生参数
+        let id: String = obfs.auth_id().iter().map(|b| format!("{:02x}", b)).collect();
+        let _ = std::fs::write("/tmp/flowtls-rust-authid.txt", id);
+    }
+}
+
+#[cfg(test)]
+mod interop_consume {
+    use super::*;
+
+    /// 消费 Go 侧生成的向量（Go -> Rust 方向）。
+    ///
+    /// 与 export_vector 配对：两者合起来构成双向互通的回归门禁。
+    /// 文件不存在时静默跳过，避免在没跑过 Go 侧的环境里失败。
+    #[test]
+    fn consume_go_vector() {
+        let Ok(blob) = std::fs::read("/tmp/flowtls-go-vector.bin") else {
+            eprintln!("跳过：没有 /tmp/flowtls-go-vector.bin");
+            return;
+        };
+        let server = Obfs::new_server("interop-password");
+        let mut off = 0usize;
+        let mut idx = 0;
+        while off + 4 <= blob.len() {
+            let n = u32::from_be_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]) as usize;
+            off += 4;
+            let rec = &blob[off..off + n];
+            off += n;
+            let recs = parse_records(rec);
+            assert_eq!(recs.len(), 1);
+            let payload = recs[0].payload;
+            if idx == 0 {
+                let plain = server.open_first(payload).expect("Go 首包必须能解开");
+                assert_eq!(plain, b"go-first");
+            } else {
+                let plain = server.open(payload).expect("Go 后续包必须能解开");
+                assert_eq!(plain, b"go-second");
+            }
+            idx += 1;
+        }
+        assert_eq!(idx, 2, "应消费到 2 条记录");
+    }
+}

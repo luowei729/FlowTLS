@@ -24,8 +24,10 @@
 ```
 flowtls/                       独立 Go module，不 import sing-box
   doc.go  config.go  errors.go
-  （P1 起）packet.go codec.go socket_linux.go session.go listener.go
-  （P2 起）quic/  唯一依赖 quic-go 的子包
+  packet.go  codec.go  session.go              ← 已实现（P1）
+  socket_linux.go  socket_stub.go              ← 已实现（P1）
+  listener.go                                   ← P4
+  quic/                                         ← P2，唯一依赖 quic-go 的子包
 
 sing-box/protocol/flowtls/     适配层，~300 行（与 protocol/anytls 同形状）
   inbound.go  outbound.go
@@ -143,11 +145,29 @@ make verify
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | subtree + 补丁 + stub 注册 + Makefile，`version`/`check` 可用 | ✅ 2026-11-13 |
-| P1 | `flowtls/` 主包：packet/socket/codec/session/listener + 单测 | 待办 |
+| P1 | `flowtls/` 主包：packet/codec/socket/session + 单测 | ✅ 2026-11-13 |
 | P2 | `quic/` 子包 + outbound 适配，TCP 打通 Rust 服务端 | 待办 |
 | P3 | UDP（udpnat2 + session 映射），dig 通 | 待办 |
-| P4 | inbound 适配 + 与 Rust 客户端互通 | 待办 |
+| P4 | inbound 适配（含 `Listener.Accept`）+ 与 Rust 客户端互通 | 待办 |
 | P5 | 打包脚本、CI 互通矩阵、配置迁移文档 | 待办 |
+
+P1 已完成的部分（均已有单测）：
+
+| 文件 | 内容 |
+|---|---|
+| `packet.go` | IP/TCP 头、校验和、seq/ack、SYN 选项、TcpClock、IP ID、窗口 |
+| `codec.go` | v2 记录格式 + ChaCha20-Poly1305 + authID 派生 + 多用户表 |
+| `socket_linux.go` / `socket_stub.go` | AF_PACKET 收发 / 非 Linux 明确报错 |
+| `session.go` | `net.PacketConn` + 三次握手 + 接收循环（客户端方向） |
+
+**已建立的双向互通门禁**（`bash docs/interop_check.sh`）：
+
+- authID 派生两端逐字节一致；
+- Rust 加密 → Go 解密；
+- Go 加密 → Rust 解密。
+
+这比两端各自单测全绿重要得多——参数、AAD 或布局任一处不一致，
+现象都是「自测全绿、联调全挂」，且日志里只有 AEAD 解密失败。
 
 P2 是分水岭：Go 客户端跑通 Rust 服务端的 `curl` + `dig`，才能证明线路兼容。
 

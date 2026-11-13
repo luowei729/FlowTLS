@@ -1,5 +1,67 @@
 # CHANGELOG
 
+## 2026-11-13 11:29 (北京时间)
+
+### Go P1：`flowtls/` 传输层移植完成，与 Rust 双向互通已验证
+
+目标：把 Rust 的传输层做成独立 Go module（不 import sing-box），
+这是「与 hysteria2/anytls 平级」的地基。
+
+**新增文件**
+
+| 文件 | 内容 |
+|---|---|
+| `packet.go` | IP/TCP 头构造与解析、校验和、seq/ack、SYN 选项、TcpClock、IP ID、窗口 |
+| `codec.go` | v2 记录格式 + ChaCha20-Poly1305 + authID 派生 + 多用户表 |
+| `socket_linux.go` / `socket_stub.go` | AF_PACKET 收发 / 非 Linux 返回明确错误 |
+| `session.go` | `net.PacketConn` 实现 + 三次握手 + 接收循环 |
+| `codec_test.go` / `interop_test.go` | 17 个单测，含两个真实跨语言互通用例 |
+
+**跨语言互通已验证（双向）**
+
+这是本轮最重要的产出——Rust 与 Go 各自自测全绿**不代表**能互通。
+
+| 方向 | 做法 | 结果 |
+|---|---|---|
+| 密钥派生 | 三个密码导出 authID 对比 | **逐字节一致**（`414707f6…` 等） |
+| Rust → Go | Rust 加密首包+后续包，Go 解密 | 通过 |
+| Go → Rust | Go 加密，Rust `open_first`/`open` 解密 | 通过 |
+
+固化为 `docs/interop_check.sh`，一条命令跑完双向门禁。
+
+**依赖选型踩的坑**
+
+1. **x/sys/unix 不能用**：当前版本里 `Sendmmsg`、`IfNametoindex` 符号已变
+   （`undefined`），且它的 `go` 指令会把整个模块顶到 **1.26.0**，
+   而 sing-box 锁的是 1.25.5——直接导致 sing-box 无法编译本模块。
+   改用标准库 `syscall`（AF_PACKET / SOCK_RAW / sendto / recvfrom 都齐全），
+   只额外依赖 `golang.org/x/crypto`（ChaCha20-Poly1305），钉到 `v0.54.0`。
+2. **批量发送暂时退化**：标准库没有 `sendmmsg` 封装，`SendBatch` 先循环
+   `sendto`。正确性优先，批量优化留到性能阶段。接口不变，替换实现不影响上层。
+3. **HKDF 用标准库**：Go 1.24+ 的 `crypto/hkdf` 足够，不必引 x/crypto/hkdf。
+
+**`net.PacketConn` 设计要点**
+
+- 握手**同步完成**后才返回 Session：quic-go 的 `Dial` 会立刻写 Initial，
+  若在 `WriteTo` 里做握手就要在并发读循环里维护状态机，竞态极难排查。
+  这与 Rust 版「握手完成前不 drain_transmits」是同一语义。
+- `ReadFrom` 返回的 addr 恒为对端：伪造 TCP 是点对点的，不存在一个
+  socket 收多对端的情况。
+- 接收通道满就丢（UDP 语义）：改成阻塞会让接收协程被上层拖死，
+  整条连接的所有流一起卡住。
+- SYN 重传必须复用同一个 ISN（真实 TCP 行为），换新值服务端不会回 ACK。
+
+**验收**
+
+```
+cargo test                  → 25 passed
+cd flowtls && go test ./... → 17 passed（含 2 个互通用例，非 skip）
+GOOS=windows/darwin go build → OK（stub 生效）
+bash docs/interop_check.sh  → 互通门禁 PASS
+```
+
+**未做**：服务端 `Listener.Accept`（P4）、`quic/` 子包与 sing-box 适配层（P2/P4）。
+
 ## 2026-11-13 11:20 (北京时间)
 
 ### wire format v2：多用户鉴权 + 协议版本位
