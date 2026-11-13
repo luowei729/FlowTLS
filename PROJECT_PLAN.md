@@ -1,6 +1,30 @@
 # PROJECT_PLAN
 
-## 当前状态（2026-11-13 10:41 北京时间）
+## 当前状态（2026-11-13 11:20 北京时间）
+
+### wire format v2：多用户鉴权（已完成并联调通过）
+
+用户决策：开发阶段无兼容包袱，直接切 v2；需要多用户。
+版本位的加入理由：既然反正要改格式，1 字节成本换来「将来可协商」。
+
+**格式**：首包 `ver(1)+authID(16)+nonce(12)+密文`，后续包只有 `nonce+密文`；
+AAD 首包 `ver|authID`、后续 `ver`。authID 与 AEAD 密钥用不同 HKDF info 派生。
+
+**配置**：`users: [{name, password}]`（name 仅日志，与 sing-box 惯例一致），
+`users` 为空时退回顶层 `password` 单用户模式。
+
+**联调结果**（本机，全部通过）：alice/bob 双用户并发 TCP 各 20MB 完整下载、
+双用户 UDP 全套（DNS/会话复用/不可达目标）、错误密码被拒、服务端日志正确
+区分 user、解密失败 0 次、单用户老配置兼容、`cargo test` 23 passed。
+
+**关键教训**：首包头不能用「只发一次」的 swap 写法——QUIC Initial 重传时
+会发不带首包头的包，服务端无法鉴权，且只在真实丢包时复现（DEVTIPS 59）。
+
+**待办**：`docs/DESIGN.md` 已更新；`AGENTS.md` 与 `README.md` 里仍有
+过时的 `wscale=12` 描述（实际已是 wscale 9 + IP ID 高字节标记），
+属于既有技术债，与本轮改动无关，后续单独修。
+
+---
 
 ### 新增方向：sing-box 协议库 + rev 发行版（P0 已完成）
 

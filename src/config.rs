@@ -13,8 +13,21 @@ use serde::Deserialize;
 pub struct ServerFile {
     /// 监听地址，例如 ":8443" 或 "0.0.0.0:8443"
     pub listen: String,
-    /// 代理密码，同时也是外层 AEAD 的密钥来源
+    /// 单用户密码，同时也是外层 AEAD 的密钥来源。
+    ///
+    /// `users` 非空时该字段可留空（多用户模式）；
+    /// `users` 为空时必须填写，此时等价于「一个匿名用户」。
+    /// 用 `#[serde(default)]` 是为了让多用户配置可以不写它。
+    #[serde(default)]
     pub password: String,
+    /// 多用户列表。
+    ///
+    /// 结构与 sing-box 的 hysteria2 / anytls / shadowsocks 完全一致：
+    /// `name` 只用于日志和统计，可留空；真正的凭证是 `password`。
+    /// 线上不会传 name，也不会传 password 本身——客户端发的是
+    /// password 派生出的 16 字节不透明 auth id（见 faketcp::codec）。
+    #[serde(default)]
+    pub users: Vec<UserFile>,
     pub tls: TlsFile,
     #[serde(default)]
     pub site: SiteFile,
@@ -24,6 +37,41 @@ pub struct ServerFile {
     pub net: NetFile,
     #[serde(default)]
     pub udp: UdpFile,
+}
+
+/// 一个用户条目
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserFile {
+    /// 日志/统计用的名字，可留空（留空时日志显示 `user[序号]`）
+    #[serde(default)]
+    pub name: String,
+    /// 该用户的密码，同时是其外层 AEAD 密钥来源
+    pub password: String,
+}
+
+impl ServerFile {
+    /// 展开成 (显示名, 密码) 列表。
+    ///
+    /// `users` 非空优先；否则退回单用户模式（顶层的 `password`，名字为空）。
+    /// 顺序保持配置里的顺序，空名字在这里统一补成 `user[序号]`，
+    /// 这样日志里绝不会出现「空字符串用户」这种看不出是谁的记录。
+    pub fn effective_users(&self) -> Vec<(String, String)> {
+        if self.users.is_empty() {
+            return vec![(String::new(), self.password.clone())];
+        }
+        self.users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let name = if u.name.is_empty() {
+                    format!("user[{i}]")
+                } else {
+                    u.name.clone()
+                };
+                (name, u.password.clone())
+            })
+            .collect()
+    }
 }
 
 /// 证书配置

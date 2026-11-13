@@ -150,7 +150,7 @@ fn check_server(cfg: &ServerFile, r: &mut Report) {
         Err(e) => r.error(format!("listen 无法解析 ({}): {e:#}", cfg.listen)),
     }
 
-    check_password(&cfg.password, "服务端", r);
+    check_server_users(cfg, r);
 
     // 证书与私钥：必须存在、可读，且能被 rustls 解析。
     // 只检查文件存在是不够的——路径对但文件是空的/格式错时，
@@ -330,14 +330,27 @@ fn check_client(cfg: &ClientFile, r: &mut Report) {
 
 /// 两端一致性：这两项不一致时现象都很隐蔽，是 check 的核心价值
 fn check_pair(s: &ServerFile, c: &ClientFile, r: &mut Report) {
-    // 密码必须一致（外层 AEAD 密钥由它派生）
-    if s.password == c.password {
-        r.ok("两端 password 一致");
+    // 密码必须命中服务端的某个用户（外层 AEAD 密钥由它派生）。
+    //
+    // 多用户下不能再用「两个 password 字段相等」来判断：
+    // 服务端可能只写了 users，顶层 password 为空。
+    let users = s.effective_users();
+    if users.iter().any(|(_, p)| p == &c.password) {
+        if users.len() > 1 {
+            r.ok(format!(
+                "客户端 password 命中服务端 {} 个用户之一",
+                users.len()
+            ));
+        } else {
+            r.ok("两端 password 一致");
+        }
     } else {
-        r.error(
-            "两端 password 不一致：外层 AEAD 会全部解密失败，\
+        r.error(format!(
+            "客户端 password 不在服务端用户表里（服务端 {} 个用户）：\
+             外层 AEAD 会全部解密失败，\
              服务端只表现为「收到 raw 包但 conns=0」",
-        );
+            users.len()
+        ));
     }
 
     // 分流标记高字节必须一致（iptables 与伪包判别都依赖它）
@@ -384,6 +397,72 @@ fn check_pair(s: &ServerFile, c: &ClientFile, r: &mut Report) {
              UDP 包会单向消失，且没有任何错误日志",
             s.udp.enabled, c.udp.enabled
         ));
+    }
+}
+
+/// 服务端用户表校验。
+///
+/// 多用户是 2026-11-13 引入的（wire format v2），这里的每一条都对应
+/// 一个「配错了不报错、只是连不上」的坑。
+fn check_server_users(cfg: &ServerFile, r: &mut Report) {
+    if cfg.users.is_empty() {
+        // 单用户模式：顶层 password 就是唯一凭证
+        check_password(&cfg.password, "服务端", r);
+        if !cfg.password.is_empty() {
+            r.ok("单用户模式（未配置 users）");
+        }
+        return;
+    }
+
+    r.ok(format!("多用户模式: {} 个用户", cfg.users.len()));
+
+    // 顶层 password 在多用户模式下是多余的，容易让人误以为它仍生效
+    if !cfg.password.is_empty() {
+        r.warn("已配置 users，顶层 password 会被忽略；建议删掉避免误会");
+    }
+
+    // 用 auth id（密码派生值）查重，而不是比较 name：
+    // 真正决定「能不能分别鉴权」的是密码，name 只是日志标签。
+    let mut seen: std::collections::HashMap<[u8; crate::faketcp::codec::AUTH_ID_LEN], String> =
+        std::collections::HashMap::new();
+    let mut seen_names: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut ok_count = 0usize;
+    for (i, u) in cfg.users.iter().enumerate() {
+        let label = if u.name.is_empty() {
+            format!("user[{i}]")
+        } else {
+            u.name.clone()
+        };
+        if u.password.is_empty() {
+            r.error(format!("{label} 的 password 为空"));
+            continue;
+        }
+        ok_count += 1;
+        if u.password.len() < 8 {
+            r.warn(format!(
+                "{label} 的 password 只有 {} 个字符，建议 16 位以上",
+                u.password.len()
+            ));
+        }
+        let id = crate::faketcp::codec::Obfs::new_server(&u.password).auth_id();
+        if let Some(other) = seen.insert(id, label.clone()) {
+            r.error(format!(
+                "{label} 与 {other} 的 password 相同：auth id 冲突，\
+                 后一个用户会被静默覆盖（配置改了但登录失败就是这个）"
+            ));
+        }
+        // name 重复不影响鉴权，但日志里会分不清是谁，属于该修的配置问题
+        *seen_names.entry(u.name.as_str()).or_insert(0) += 1;
+    }
+    for (name, count) in seen_names {
+        if count > 1 {
+            let label = if name.is_empty() { "(空名字)" } else { name };
+            r.warn(format!("{label} 出现了 {count} 次，日志里无法区分"));
+        }
+    }
+    // 所有用户都填了密码时给一条正反馈，方便确认检查确实跑到了
+    if ok_count == cfg.users.len() {
+        r.ok(format!("{ok_count} 个用户均配置了 password"));
     }
 }
 

@@ -2,8 +2,25 @@
 # 复制到 deploy/ 并填入真实值；deploy/ 已在 .gitignore 中，不会入库。
 listen: ":8443"
 
-# 代理密码：客户端必须一致。请换成强密码。
+# 代理密码：单用户模式。客户端必须一致。请换成强密码。
+#
+# 多用户时改用下面的 users，本字段会被忽略（两个都填时 users 优先，
+# flowtls check 会警告）。
 password: "CHANGE_ME_STRONG_PASSWORD"
+
+# 多用户配置（可选）。结构与 sing-box 的 hysteria2 / anytls / shadowsocks 一致：
+#   - name 只用于日志和统计，可留空（留空显示 user[序号]）；
+#   - password 才是真正的凭证，同时是外层 AEAD 的密钥来源。
+#
+# 线上不会传 name，也不会传 password 本身：客户端发的是 password 派生出的
+# 16 字节不透明 auth id，服务端用它查表选密钥（O(1)，不遍历试解）。
+# 两个用户用同一个 password 会导致 auth id 冲突、后者静默覆盖前者，
+# flowtls check 会直接报错。
+# users:
+#   - name: "alice"
+#     password: "CHANGE_ME_ALICE_STRONG_PASSWORD"
+#   - name: "bob"
+#     password: "CHANGE_ME_BOB_STRONG_PASSWORD"
 
 # 同端口伪装网站使用的真实证书
 tls:

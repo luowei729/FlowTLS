@@ -1345,7 +1345,91 @@ go get github.com/sagernet/sing@v0.9.7-0.20261023115459-5dc452e537bf
 
 第二个区分标志是 `Tags:` 里带 `with_flowtls`——官方构建永远不会有这个 tag。
 
-## 59. 常用调试命令
+## 59. 首包头不能「只发一次」，必须「确认可达前每包都带」
+
+多用户需要每条连接的首包带一个明文身份标识（authID）。第一版实现用
+`AtomicBool::swap(true)` 做「只发一次」的开关，看起来天衣无缝：
+
+```rust
+// 错误写法
+let first = !self.sent_first.swap(true, Ordering::Relaxed);
+```
+
+**这个写法和 QUIC 的重传语义直接冲突**：Initial 丢包重传时会用新 nonce
+重新 `seal`，此时 `sent_first` 已经是 true，重传包就**不带首包头**了。
+服务端在新连接状态下收到的第一个包没有 authID → 无法查表 → 静默丢弃。
+现象是：
+
+```
+客户端：已发送 SYN → 三次握手完成 → 一直重传 Initial
+服务端：收到 raw 包，但 conns=0，日志里只有"外层 AEAD 解密失败"
+```
+
+而且因为丢包才触发，本地回环永远复现不出来，只在跨境链路上偶发。
+
+正确写法是「等对端证明能解我们的包」：
+
+```rust
+// 发送：确认可达前，每包都带首包头
+let first = self.send_first_header && !self.established.load(Ordering::Relaxed);
+
+// 客户端收到第一个能解开的服务端包时调用
+pub fn mark_established(&self) { self.established.store(true, Relaxed); }
+
+// 服务端：send_first_header = false，established 直接为 true
+```
+
+代价是握手期多带 17 字节 × 2~3 个包 ≈ 50 字节，可以忽略。
+
+## 60. 多用户为什么必须带明文索引，不能遍历试解
+
+单用户时代「解密成功即鉴权」很优雅：一把密钥试一次，失败就丢。
+多用户下这个方法直接崩：
+
+| 方案 | 每包成本 |
+|---|---|
+| 遍历 N 把密钥试解 | N 次 ChaCha20-Poly1305（含 poly1305 校验，比 AES 慢） |
+| 明文索引查表 | 1 次哈希查找 + 1 次 AEAD |
+
+100 用户时前者是 100 倍 CPU，11000 pps 直接打死单核。而且「试解次数」
+本身会随用户数变化，是一个可计时的侧信道。
+
+所以 hysteria2 / anytls / shadowsocks 全都这么做：**线上带一个从凭证派生的
+明文标识**（anytls 直接传 `sha256(password)` 32 字节，vless 传 UUID）。
+flowtls 的做法是 16 字节 authID。
+
+关键是这个标识**必须用独立的 HKDF info 派生**：
+
+```rust
+hk.expand(b"flowtls faketcp aead key v2", &mut key);      // 加密密钥
+hk.expand(b"flowtls faketcp auth id v2", &mut auth_id);   // 明文标识
+```
+
+如果图省事直接用 `sha256(password)` 当标识，就等于把「密钥的哈希」明文发到
+线上了：弱密码场景下拿到 hash 就能跑彩虹表。两个 info 不同 ⇒ 密码学上互相
+不可推导，泄露 authID 既推不出密码也解不开数据。
+
+## 61. 明文索引要参与 AAD，否则可以被改成别人的槽位
+
+authID 是明文，攻击者可以篡改（虽然不知道正确值）。如果不把它纳入 AAD，
+理论上可以把别人的 authID 抄过来，让服务端拿别人的密钥去解，产生一个
+「用错误密钥成功解密」的假象（实际上概率极低，但这是免费防护）。
+
+flowtls v2 的 AAD：
+
+```
+首包  = ver(1) | authID(16)
+后续  = ver(1)
+```
+
+顺便把版本号也纳入 AAD：将来出 v3 时，v2 的包在 v3 下必然认证失败，
+不会出现跨版本误判。
+
+两者都不写进报文，因此**零额外开销**——这是 AAD 相比「加字段」的最大优势。
+
+## 62. 常用调试命令
+
+```bash
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03

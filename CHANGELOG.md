@@ -1,5 +1,102 @@
 # CHANGELOG
 
+## 2026-11-13 11:20 (北京时间)
+
+### wire format v2：多用户鉴权 + 协议版本位
+
+用户确认「开发阶段、没发过版、不存在兼容问题」，并要求多用户；版本位由我
+参与设计（用户原话「1 字节版本位什么作用我不懂」）。
+
+**为什么必须改格式**：现在是「解密成功 = 鉴权通过」，全局一把密钥。
+多用户有 N 把钥匙，服务端必须先知道用哪把：
+
+- 遍历所有密钥试解 → 100 用户 = 每包 100 次 ChaCha20-Poly1305，不可接受；
+- 所以必须**在包里带一个明文标识**做索引。
+
+**为什么同时加版本位**：既然反正要改格式，版本位几乎零成本（放进 AAD 不占
+报文空间），却能把「改协议」从「断网重来」变成「可协商」——将来改
+wscale/ack 策略时可以支持新老客户端同时在线，不用再开第二个端口。
+
+**线上格式**：
+
+```
+首包：17 03 03 | len | ver(1) | authID(16) | nonce(12) | 密文+tag
+后续：17 03 03 | len | nonce(12) | 密文+tag
+
+AAD：首包 = ver|authID，后续 = ver
+```
+
+**密钥派生改成两条独立路径**（salt 升到 `flowtls-faketcp-v2`）：
+
+```
+authID  = HKDF(password, info="flowtls faketcp auth id v2")[0..16]
+aeadKey = HKDF(password, info="flowtls faketcp aead key v2")[0..32]
+```
+
+不同 info ⇒ 抓包拿到 authID 既推不出密码，也无法解密任何数据。
+
+**命名参照 sing-box 惯例**：查证了 hysteria2 / anytls / shadowsocks 三个协议，
+它们的 `users` 统一是 `name + password`，且 **name 只用于日志，线上传凭证
+本身或其派生值**（anytls 传 `sha256(password)`，vless 传 UUID）。所以
+flowtls 也是 name 仅日志、线上传 authID，配置结构完全对齐。
+
+**踩到的关键坑（差点酿成线上故障）**：最初把首包设计成「`swap` 一次，
+只发一次」。但 QUIC Initial 丢包重传会产生新记录——如果只在第一份上带首包
+头，后续重传的包服务端无法识别用户，**全部静默丢弃**，表现为「客户端一直
+重传、服务端完全没反应」。已改成：客户端在收到服务端第一个能解开的包之前，
+**每个包都带**首包头；确认可达后置 `established` 不再携带。服务端方向从不携带。
+
+**服务端结构变化**：
+
+| 项 | v1 | v2 |
+|---|---|---|
+| 密钥 | 进程级全局 `Obfs` | `ServerConn.obfs: Option<Arc<Obfs>>` |
+| 用户表 | 无 | `HashMap<[u8;16], (name, Arc<Obfs>)>` |
+| 包→密钥 | 直接全局 | `by_client: HashMap<SocketAddr, (ch, obfs, name)>` O(1) |
+| 解密失败日志 | `warn` | `debug`（公网探测包会刷满 warn） |
+
+`by_client` 必须在 accept 时插入、连接回收时（两处 `retain`）同步删除，
+否则会指向已删除的句柄，每包白跑一次 AEAD。
+
+**配置**（`users` 非空时优先，顶层 `password` 保留单用户模式）：
+
+```yaml
+password: "single-user-password"   # 单用户模式
+# 或
+users:
+  - name: "alice"
+    password: "..."
+  - name: "bob"
+    password: "..."
+```
+
+**check 新增三项校验**（每条都对应一个「配错不报错、只是连不上」的坑）：
+
+- 客户端 password 必须命中服务端用户表之一（原来是两个字段相等）；
+- 两个用户密码相同 → auth id 冲突、后者静默覆盖前者 → 报错；
+- 同时配了顶层 `password` 和 `users` → 警告前者被忽略。
+
+**验收（本机联调，全部通过）**：
+
+| 用例 | 结果 |
+|---|---|
+| alice TCP | `http=200` |
+| bob TCP（并发） | `http=200` |
+| alice 20MB 下载 | 20000000 字节完整，~2.0MB/s |
+| bob 20MB 下载 | 20000000 字节完整，~2.0MB/s |
+| alice UDP（DNS + session 复用 + 不可达目标） | 全部通过 |
+| bob UDP | 全部通过 |
+| 错误密码客户端 | 连不上（`http=000`），服务端无首包通过记录 |
+| 服务端日志用户区分 | `user=alice` / `user=bob` 正确 |
+| 解密失败次数 | 0 |
+| 单用户老配置 | 仍可用 |
+| `cargo test` | 23 passed |
+
+**测试用例新增**：`first_packet_carries_auth_id`、`subsequent_packet_has_no_header`、
+`retransmit_still_carries_header`、`tampered_auth_id_rejected`。
+
+**未做**：Go 侧（`flowtls/` 模块）P1 实现时直接按 v2 写，不需要额外迁移工作。
+
 ## 2026-11-13 10:41 (北京时间)
 
 ### P0：引入 sing-box v1.14.4，产出 `1.14.4-rev.1` 发行二进制

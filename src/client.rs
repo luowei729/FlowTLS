@@ -600,7 +600,7 @@ async fn run_session(
         server_port,
         source_port: cfg.faketcp.source_port,
         local_ip,
-        obfs: Obfs::new(&cfg.password),
+        obfs: Obfs::new_client(&cfg.password),
         seq: 0,
         peer_seq: 0,
         // 起始 IP ID 随机，避免所有连接都从同一值开始
@@ -940,6 +940,9 @@ fn handle_incoming(
             // 解密失败：不是我们的服务端，或链路被篡改，静默丢弃
             continue;
         };
+        // 能解开服务端的包，说明服务端已经用我们的 auth id 找对密钥并鉴权通过。
+        // 由此开始发送不再携带首包头（省 17 字节/包）。
+        ctx.obfs.mark_established();
         let now = Instant::now();
         let mut buf = Vec::with_capacity(2048);
         if let Some(event) = endpoint.handle(

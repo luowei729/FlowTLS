@@ -2,7 +2,15 @@
 
 ## 1. 线上包格式
 
-每个 UDP 意义上的数据报被包装成一个 IPv4 + TCP 报文：
+每个 UDP 意义上的数据报被包装成一个 IPv4 + TCP 报文。
+
+**首包**（每条连接的第一条 ApplicationData，仅客户端→服务端）：
+
+```
+IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | ver(1) | authID(16) | nonce(12) | ChaCha20-Poly1305(QUIC 数据报 + 16B tag)
+```
+
+**后续包**：
 
 ```
 IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | nonce(12) | ChaCha20-Poly1305(QUIC 数据报 + 16B tag)
@@ -11,7 +19,55 @@ IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | nonce(12) | ChaCha20-Poly1305(QUI
 - TLS 记录头 `17 03 03` 只是外观，载荷是 AEAD 密文。
 - TCP flags 使用 PSH+ACK，窗口固定 65535，seq/ack 按字节数推进。
 - IP ID 在 `0xF100~0xF1FF` 内递增（**仅作外观**，真实链路上会被运营商 NAT 改写为 0，不能用于分流）。
-- 每包额外开销 37 字节；QUIC 初始 MTU 1340，加上外层后总包约 1417，仍不分片。
+- 后续包每包额外开销 37 字节，首包 54 字节；QUIC 初始 MTU 1340，加上外层后总包约 1417/1434，仍不分片。
+- **首包头只在鉴权完成前携带**：客户端在收到服务端第一个能解开的包之前，每个包都带
+  `ver + authID`（QUIC Initial 丢包重传时仍能被服务端识别）；确认可达后不再携带。
+  服务端方向从不携带。
+
+### 1.1 AAD（附加认证数据）
+
+版本号与 authID 都参与 AEAD 认证，但**不占额外字节**：
+
+| 包类型 | AAD |
+|---|---|
+| 首包 | `ver \| authID`（17 字节） |
+| 后续包 | `ver`（1 字节） |
+
+作用：
+
+- 版本号入 AAD → 将来出 v3 时，v2 的包在 v3 下必然解密失败，不会跨版本误判；
+- authID 入 AAD → 篡改首包里的用户标识去撞别人密钥槽位会直接认证失败；
+- 两者都不写进报文，所以没有额外开销。
+
+## 1.2 多用户与鉴权
+
+鉴权模型与 sing-box 的 hysteria2 / anytls / shadowsocks 一致：**配置里是
+`name + password`，`name` 只用于日志，线上传的是 password 派生出的不透明标识**。
+
+```
+authID  = HKDF-SHA256(salt="flowtls-faketcp-v2", ikm=password,
+                      info="flowtls faketcp auth id v2")[0..16]
+aeadKey = HKDF-SHA256(salt="flowtls-faketcp-v2", ikm=password,
+                      info="flowtls faketcp aead key v2")[0..32]
+```
+
+两个派生值用**不同的 info**，密码学上互不可推导：抓包拿到 authID 既推不出
+密码，也无法解密任何数据。
+
+服务端流程：
+
+1. 读首包明文 `ver + authID`，`ver != 2` 直接丢；
+2. 用 authID 查表得到该用户密钥（O(1)；**不遍历试解**，否则 100 用户就是 100 倍 CPU）；
+3. `open_first` 做 AEAD 认证，失败静默丢弃——解析明文本身不构成信任。
+
+每条连接独立持有用户密钥（`ServerConn.obfs`），因为不同连接的客户端可能不同。
+服务端维护 `client 地址 → (连接句柄, 密钥, 名字)` 索引，后续包用它选密钥，
+避免每包 O(n) 遍历连接表。
+
+### 1.3 为什么不兼容旧格式
+
+v1（无版本位、单密码、解密成功即鉴权）**从未发布过**，因此直接废弃。
+Rust 与 Go 两端同步升级，不做双版本共存。
 
 ## 2. 伪包识别（重要）
 
@@ -52,10 +108,12 @@ NAT 会把 IP ID 改写为 `0x0000`，导致：
 
 ## 4. 鉴权
 
-- 外层密钥：`HKDF-SHA256(salt="flowtls-faketcp-v1", ikm=password, info="flowtls faketcp aead key")` → 32 字节。
-- 每包随机 12 字节 nonce，ChaCha20-Poly1305 加密。
-- 服务端解密失败直接丢弃，不回任何响应。
-- 解密成功即视为鉴权通过；无需额外首帧 token。
+详见 1.2。要点：
+
+- 密钥与身份标识都由 HKDF-SHA256 从密码派生，salt 为 `flowtls-faketcp-v2`；
+- 身份标识（authID，16 字节）明文出现在首包，仅用于服务端查表；
+- 真正的鉴权是首包的 AEAD 认证：认证失败静默丢弃，不回任何响应；
+- 后续包不再携带身份，靠连接自身持有的密钥解密。
 
 ## 5. 端口分流
 

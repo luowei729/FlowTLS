@@ -19,7 +19,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::{parse_listen, ServerFile};
-use crate::faketcp::codec::{build_server_hello, parse_records, Obfs, REC_APPDATA};
+use crate::faketcp::codec::{
+    build_server_hello, parse_first_header, parse_records, Obfs, AUTH_ID_LEN,
+    PROTOCOL_VERSION, REC_APPDATA,
+};
 use crate::faketcp::packet::{
     advertised_window, build_packet, build_packet_into, next_ipid, parse_frame, random_ipid,
     seq_len, syn_options, TcpClock, TcpSeg, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
@@ -151,12 +154,26 @@ struct SynState {
     at: Instant,
 }
 
+/// 多用户表：auth id → (显示名, 该用户的密钥)。
+///
+/// 键是从密码派生出的不透明标识，不是用户名也不是密码本身：
+/// 抓包只能看到一个 16 字节随机值，推不出密码。
+type UserMap = HashMap<[u8; AUTH_ID_LEN], (String, Arc<Obfs>)>;
+
 /// 服务端单条 QUIC 连接
 struct ServerConn {
     conn: Connection,
     ch: ConnectionHandle,
     /// 客户端的真实地址（NAT 后的）
     client: SocketAddr,
+    /// 该连接所属用户的密钥。
+    ///
+    /// 多用户下每条连接的用户可能不同，所以**必须按连接持有**，
+    /// 不能像单用户时代那样用进程级全局 Obfs。
+    /// 放在 Option 里是因为从「收到 SYN」到「首包解密成功」之间还不知谁是用户。
+    obfs: Option<Arc<Obfs>>,
+    /// 该连接的用户显示名（仅日志/统计用）
+    user: String,
     /// 本机接收该连接时使用的目标 IP，回包时作为源 IP
     local_ip: std::net::Ipv4Addr,
     /// 发往客户端时的序列号
@@ -304,7 +321,36 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
         false,
         None,
     );
-    let obfs = Obfs::new(&cfg.password);
+    // ---- 多用户鉴权表 ----
+    // 每个用户一份独立的 AEAD 密钥，用密码派生出的 16 字节 auth id 做索引。
+    //
+    // 为什么不用「遍历所有密钥试解」：ChaCha20-Poly1305 每次尝试都要跑一遍
+    // poly1305 校验，100 用户就是 100 倍 CPU；而且试验次数多了本身也是
+    // 一个可被计时的侧信道。用明文 auth id 查表是 O(1)。
+    //
+    // 为什么明文 auth id 是安全的：它由 HKDF 独立派生（info 与密钥不同），
+    // 与密钥在密码学上无关；抓包只能看到 16 字节随机值，既推不出密码，
+    // 也无法借此解密——真正的鉴权仍然靠 open_first 的 AEAD 校验。
+    let user_map: UserMap = {
+        let mut m: UserMap = HashMap::new();
+        for (name, password) in cfg.effective_users() {
+            let obfs = Arc::new(Obfs::new_server(&password));
+            let id = obfs.auth_id();
+            // 密码相同 → auth id 相同 → 后者覆盖前者，一整个用户会被静默顶掉。
+            // check 会拦这种情况，这里再兜一层日志，避免线上莫名少一个用户。
+            if m.insert(id, (name.clone(), obfs)).is_some() {
+                tracing::warn!(user = %name, "用户密码与前面的重复，已覆盖；请检查配置");
+            }
+        }
+        m
+    };
+    tracing::info!(users = user_map.len(), "外层鉴权表已就绪");
+    // 客户端地址 → (连接句柄, 密钥, 显示名)。
+    //
+    // 每个入向包都要靠它选密钥。不能用 find_by_client 那种 O(n) 遍历：
+    // 高包速率下（1 万 pps、几十条连接）会把 CPU 烧在无意义的地址比较上。
+    // 与 conns 同步维护：accept 时插入，连接回收时删除。
+    let mut by_client: HashMap<SocketAddr, (ConnectionHandle, Arc<Obfs>, String)> = HashMap::new();
     let magic = cfg.faketcp.ip_id_magic;
     let mut conns: HashMap<ConnectionHandle, ServerConn> = HashMap::new();
     // 记录每个客户端 SYN 的状态（ISN / TSval），等 QUIC 首包到达时复用。
@@ -435,7 +481,8 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
                         dst_ip,
                         port,
                         magic,
-                        &obfs,
+                        &user_map,
+                        &mut by_client,
                         seq,
                         client,
                         ip_id,
@@ -497,7 +544,7 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
             // 通告窗口按「待发字节数」动态计算，恒为 65535 是明显的伪造特征
             let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
             let window = advertised_window(unread);
-            drain_transmits(c, &raw, port, &obfs, &mut send_batch, &mut scratch, window);
+            drain_transmits(c, &raw, port, &mut send_batch, &mut scratch, window);
             drain_events(c, &action_tx, pending_high_water, &cfg.udp);
         }
         // 清理已双向结束的流：之前从不删除，长时间跑高并发（直播/测速）会一直累积，
@@ -555,10 +602,22 @@ pub async fn run(cfg: ServerFile) -> Result<()> {
         for c in conns.values_mut() {
             if c.conn.is_drained() {
                 let unread: usize = c.streams.values().map(|s| s.pending.len()).sum();
+                // 带上用户，多用户下排查「谁断了」不用去对时间戳
+                tracing::info!(client = %c.client, user = %c.user, "QUIC 连接结束");
                 c.send_fin(&raw, port, advertised_window(unread));
             }
         }
+        // 地址索引必须跟着一起摘，否则它会指向已删除的句柄：
+        // 下一个包会先用一条不存在的连接的密钥试解，白白跑一次 AEAD。
+        let drained_addrs: Vec<SocketAddr> = conns
+            .values()
+            .filter(|c| c.conn.is_drained())
+            .map(|c| c.client)
+            .collect();
         conns.retain(|_, c| !c.conn.is_drained());
+        for addr in drained_addrs {
+            by_client.remove(&addr);
+        }
     }
 
     tracing::info!("服务端退出");
@@ -576,7 +635,8 @@ fn handle_packet(
     local_ip: std::net::Ipv4Addr,
     port: u16,
     magic: u16,
-    obfs: &Obfs,
+    user_map: &UserMap,
+    by_client: &mut HashMap<SocketAddr, (ConnectionHandle, Arc<Obfs>, String)>,
     seq: u32,
     client: SocketAddr,
     ip_id: u16,
@@ -657,16 +717,28 @@ fn handle_packet(
         payload = payload.len(),
         "收到 raw 包"
     );
+    // 本包解出的用户身份，等 accept 时塞进 ServerConn。
+    // 只有首包解密成功才会被赋值；后续包的身份已经在连接里了。
+    let mut pending_user: Option<(Arc<Obfs>, String)> = None;
+
     // 遍历 TLS 记录：0x16 是表演握手，0x17 才是真实数据
     for rec in parse_records(payload) {
         if rec.typ != REC_APPDATA {
             continue;
         }
-        let Some(plain) = obfs.open(rec.payload) else {
-            // 解密失败：不是我们的客户端，静默丢弃
-            tracing::warn!(%client, len = rec.payload.len(), "外层 AEAD 解密失败");
+        let Some((plain, obfs_used, user_name, is_first)) =
+            decrypt_record(conns, by_client, client, user_map, rec.payload)
+        else {
+            // 解密失败：不是我们的客户端（或密码不对），静默丢弃。
+            // 用 debug 而不是 warn：公网端口每天会收到大量探测包，
+            // warn 会把日志刷满，反而掩盖真正的异常。
+            tracing::debug!(%client, len = rec.payload.len(), "外层 AEAD 解密失败");
             continue;
         };
+        if is_first {
+            tracing::info!(%client, user = %user_name, "首包鉴权通过");
+            pending_user = Some((obfs_used, user_name));
+        }
         let now = Instant::now();
         let mut buf = Vec::with_capacity(2048);
         let event = endpoint.handle(
@@ -686,6 +758,9 @@ fn handle_packet(
                 conns.retain(|_, c| c.client != client);
                 if conns.len() != before {
                     tracing::info!(%client, "清理同一客户端的旧连接");
+                    // 地址索引同步作废：否则它会指向已删除的句柄，
+                    // 后续包就先按旧密钥试解，白白跑一次 AEAD
+                    by_client.remove(&client);
                 }
                 match endpoint.accept(incoming, now, &mut buf, Some(server_cfg.clone())) {
                     Ok((ch, conn)) => {
@@ -753,12 +828,21 @@ fn handle_packet(
                         // 并立即记下客户端最近的 TSval，避免首个数据包回显 TSecr=0。
                         let mut clock = TcpClock::new_at(ts0.wrapping_add(2));
                         clock.observe(tsval_in);
+                        // 用户身份来自本包的首包解密结果。理论上走到这里
+                        // 一定有值（端 handle 之前必须先解密成功），
+                        // 拿不到就不建立连接——没有密钥的连接发不出任何包。
+                        let auth = pending_user.clone();
                         conns.insert(
                             ch,
                             ServerConn {
                                 conn,
                                 ch,
                                 client,
+                                obfs: auth.as_ref().map(|(o, _)| o.clone()),
+                                user: auth
+                                    .as_ref()
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_default(),
                                 local_ip,
                                 seq: data_seq,
                                 peer_seq: peer_isn.wrapping_add(1),
@@ -773,6 +857,11 @@ fn handle_packet(
                                 udp: HashMap::new(),
                             },
                         );
+                        // 地址索引只对已鉴权的连接建立：
+                        // 没有密钥的连接解不开任何后续包，建索引也没用。
+                        if let Some((obfs_ready, user)) = auth {
+                            by_client.insert(client, (ch, obfs_ready, user));
+                        }
                         tracing::info!(%client, "新的 QUIC 连接");
                     }
                     Err(e) => tracing::debug!(%client, ?e, "accept 失败"),
@@ -798,7 +887,7 @@ fn handle_packet(
                 // endpoint 直接产生响应（如 Retry / stateless reset）
                 if let Some(found) = find_by_client(conns, client) {
                     if let Some(c) = conns.get_mut(&found) {
-                        c.send_datagram_one(raw, port, obfs, &buf[..t.size]);
+                        c.send_datagram_one(raw, port, &buf[..t.size]);
                     }
                 }
             }
@@ -834,6 +923,43 @@ fn find_by_client(
         .map(|(ch, _)| *ch)
 }
 
+/// 尝试解密一条 ApplicationData 记录。
+///
+/// 返回 `(明文, 该用户密钥, 显示名, 是否首包)`。
+///
+/// 顺序刻意是「先按已有连接的密钥解，再按首包解」：
+/// 客户端重连时三元组地址会复用，旧连接还在 conns 里，
+/// 若先按首包处理，就会拿旧连接的密钥去解新连接的首包（含 17 字节首包头），
+/// 必然失败，然后白白多跑一次查表 + AEAD。
+///
+/// 反过来先试连接密钥也安全：后续包开头是 4 字节随机 nonce 前缀，
+/// 恰好等于某个用户的 auth id 且版本字节对得上的概率可以忽略，
+/// 即使撞上也过不了 AEAD 认证。
+fn decrypt_record(
+    conns: &HashMap<ConnectionHandle, ServerConn>,
+    by_client: &HashMap<SocketAddr, (ConnectionHandle, Arc<Obfs>, String)>,
+    client: SocketAddr,
+    user_map: &UserMap,
+    payload: &[u8],
+) -> Option<(Vec<u8>, Arc<Obfs>, String, bool)> {
+    // 1) 已建立连接：用该连接自己的密钥（共 99.9% 的包走这条）
+    if let Some((ch, obfs, user)) = by_client.get(&client) {
+        if conns.contains_key(ch) {
+            if let Some(plain) = obfs.open(payload) {
+                return Some((plain, obfs.clone(), user.clone(), false));
+            }
+        }
+    }
+    // 2) 首包：明文头里读版本 + auth id，查表拿密钥
+    let (ver, auth_id) = parse_first_header(payload)?;
+    if ver != PROTOCOL_VERSION {
+        return None;
+    }
+    let (user, obfs) = user_map.get(&auth_id)?;
+    let plain = obfs.open_first(payload)?;
+    Some((plain, obfs.clone(), user.clone(), true))
+}
+
 impl ServerConn {
     /// 把一个 QUIC 数据报封装成 TLS 记录 + TCP 包，写入 `out` 后由调用方批量发送。
     ///
@@ -845,12 +971,18 @@ impl ServerConn {
     fn build_datagram(
         &mut self,
         port: u16,
-        obfs: &Obfs,
         record: &mut Vec<u8>,
         out: &mut Vec<u8>,
         payload: &[u8],
         window: u16,
     ) -> Option<std::net::Ipv4Addr> {
+        // 每条连接用自己所属用户的密钥加密（多用户），
+        // 所以密钥必须从 self 取，不能再走参数传入的全局 Obfs。
+        //
+        // clone 一个 Arc 而不是长期借用 self.obfs：
+        // 函数后段要用 &mut self 改 seq / ip_id，借用会冲突；
+        // Arc 克隆只是一次原子自增，比重新组织借用关系便宜得多。
+        let obfs = self.obfs.clone()?;
         // 外层 AEAD：写进复用缓冲，不分配
         obfs.seal_into(record, payload);
         let std::net::IpAddr::V4(dst_ip) = self.client.ip() else {
@@ -951,13 +1083,17 @@ impl ServerConn {
         &mut self,
         raw: &Arc<RawSocket>,
         port: u16,
-        obfs: &Obfs,
         payload: &[u8],
     ) {
         let mut record = Vec::with_capacity(2048);
         let mut pkt = Vec::with_capacity(2048);
-        if let Some(dst_ip) = self.build_datagram(port, obfs, &mut record, &mut pkt, payload, advertised_window(0))
-        {
+        if let Some(dst_ip) = self.build_datagram(
+            port,
+            &mut record,
+            &mut pkt,
+            payload,
+            advertised_window(0),
+        ) {
             if let Err(e) = raw.send(&pkt, dst_ip) {
                 tracing::warn!(error = %e, "发送失败");
             }
@@ -974,7 +1110,6 @@ fn drain_transmits(
     c: &mut ServerConn,
     raw: &Arc<RawSocket>,
     port: u16,
-    obfs: &Obfs,
     batch: &mut PacketBatch,
     buf: &mut Vec<u8>,
     window: u16,
@@ -1010,7 +1145,6 @@ fn drain_transmits(
             // 明文 → 记录 → IP 报文，三步都写在复用缓冲上
             if c.build_datagram(
                 port,
-                obfs,
                 &mut batch.record,
                 &mut batch.bufs[n],
                 &batch.plain[off..end],

@@ -4,17 +4,35 @@
 //! 记录头只是外观，真正的安全性来自 QUIC 自身的 TLS 1.3；
 //! 外层 AEAD 的作用是让未授权方连 QUIC 状态机都进不来（解密失败即丢弃）。
 
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use rand::{Rng, RngCore};
 use sha2::Sha256;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// TLS 记录类型常量
 pub const REC_HANDSHAKE: u8 = 0x16;
 pub const REC_CCS: u8 = 0x14;
 pub const REC_APPDATA: u8 = 0x17;
+
+/// 线上协议版本。
+///
+/// v1（无版本位、单密码、解密成功即鉴权）从未发布，直接废弃，不做兼容。
+/// v2 引入两个变化：
+///   1. 每条连接的首包明文携带版本号与用户标识（支持多用户）；
+///   2. 版本号参与 AAD，跨版本重放/混淆解不开。
+pub const PROTOCOL_VERSION: u8 = 2;
+
+/// 用户身份标识长度。
+///
+/// 16 字节从密码独立派生，明文出现在首包。
+/// 选 16 而不是 32：多用户表里 2^128 空间足够避免碰撞，
+/// 首包开销少 16 字节；且与 AEAD 密钥无派生关系，泄露它也推不出密钥。
+pub const AUTH_ID_LEN: usize = 16;
+
+/// 首包明文头长度：version(1) + authID(16)
+pub const FIRST_HEADER_LEN: usize = 1 + AUTH_ID_LEN;
 
 /// 一条解析出来的 TLS 记录视图
 #[allow(dead_code)] // version 保留：核对记录头是否为 0x0303 时要看
@@ -24,9 +42,14 @@ pub struct TlsRecord<'a> {
     pub payload: &'a [u8],
 }
 
-/// 外层伪装编解码器，持有密码派生出的 AEAD 密钥。
+/// 外层伪装编解码器，持有密码派生出的 AEAD 密钥与用户身份标识。
 pub struct Obfs {
     cipher: ChaCha20Poly1305,
+    /// 该用户的明文身份标识，服务端靠它查表选密钥。
+    ///
+    /// 与 AEAD 密钥用**不同的 HKDF info** 派生，两者在密码学上无关：
+    /// 即使抓包拿到 auth_id，也无法借此解开任何密文。
+    auth_id: [u8; AUTH_ID_LEN],
     /// 发送侧 nonce 的固定前缀（4 字节），进程启动时随机生成。
     /// 与下面的 64 位计数器拼成 12 字节 nonce：
     /// 同一密钥下进程内计数器严格单调，nonce 永不重复，
@@ -38,24 +61,76 @@ pub struct Obfs {
     /// 在 11000 pps 下是纯粹的用户态浪费。AEAD 的安全性只要求
     /// 「同一密钥下 nonce 不重复」，递增计数器完全满足，且无锁无随机数生成。
     send_ctr: AtomicU64,
+    /// 发送时是否需要携带首包头（版本 + authID）。
+    ///
+    /// 只有**客户端**需要：服务端总是先收后发，首包方向固定是客户端→服务端。
+    send_first_header: bool,
+    /// 对端是否已证明能解我们的包。
+    ///
+    /// 初始 false：客户端在收到服务端第一个成功解密的包之前，**每个包都带**
+    /// 首包头。不能改成「只发一次」：QUIC Initial 丢包重传时会产生新记录，
+    /// 如果只在第一份上带首包头，后续重传的包服务端就无法识别用户、
+    /// 全部静默丢弃，表现为「客户端一直在重传、服务端完全没反应」。
+    /// 确认可达后置 true，此后每包不再多带 17 字节。
+    established: AtomicBool,
 }
 
 impl Obfs {
-    /// 由用户密码派生 AEAD 密钥。
-    /// 用 HKDF 而不是直接用密码，避免弱密码直接暴露为密钥。
-    pub fn new(password: &str) -> Self {
-        let hk = Hkdf::<Sha256>::new(Some(b"flowtls-faketcp-v1"), password.as_bytes());
+    /// 构建客户端侧编解码器。
+    ///
+    /// 发送时会在「确认服务端可通」之前带上首包头（版本 + authID）。
+    pub fn new_client(password: &str) -> Self {
+        let mut obfs = Self::derive(password);
+        obfs.send_first_header = true;
+        obfs
+    }
+
+    /// 构建服务端侧编解码器。
+    ///
+    /// 服务端从不携带首包头：它总是先收到客户端的首包才知道对方是谁。
+    pub fn new_server(password: &str) -> Self {
+        let mut obfs = Self::derive(password);
+        obfs.send_first_header = false;
+        // 服务端不需要「等待确认」，直接置位避免多一次判断
+        obfs.established.store(true, Ordering::Relaxed);
+        obfs
+    }
+
+    /// 标记对端已证明能解开我们的包（客户端收到第一个服务端包时调用）。
+    /// 之后发送不再携带首包头。
+    pub fn mark_established(&self) {
+        self.established.store(true, Ordering::Relaxed);
+    }
+
+    /// 由用户密码派生 AEAD 密钥与身份标识。
+    ///
+    /// 两个派生值用不同的 info 标签，保证互不可推导：
+    ///   - aead key：真正的加密密钥
+    ///   - auth id ：明文身份标识，只用于服务端查表
+    fn derive(password: &str) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(b"flowtls-faketcp-v2"), password.as_bytes());
         let mut key = [0u8; 32];
-        hk.expand(b"flowtls faketcp aead key", &mut key)
+        hk.expand(b"flowtls faketcp aead key v2", &mut key)
+            .expect("hkdf expand");
+        let mut auth_id = [0u8; AUTH_ID_LEN];
+        hk.expand(b"flowtls faketcp auth id v2", &mut auth_id)
             .expect("hkdf expand");
         // nonce 前缀只需一次随机，之后全部走计数器
         let mut nonce_prefix = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut nonce_prefix);
         Self {
             cipher: ChaCha20Poly1305::new(&key.into()),
+            auth_id,
             nonce_prefix,
             send_ctr: AtomicU64::new(0),
+            send_first_header: false,
+            established: AtomicBool::new(false),
         }
+    }
+
+    /// 该用户的明文身份标识（服务端建表用）。
+    pub fn auth_id(&self) -> [u8; AUTH_ID_LEN] {
+        self.auth_id
     }
 
     /// 取下一个发送 nonce：4 字节固定前缀 + 8 字节递增计数器（大端）。
@@ -69,53 +144,140 @@ impl Obfs {
     }
 
     /// 封装一个 QUIC 数据报为 TLS ApplicationData 记录。
-    /// 返回：17 03 03 len(2) + nonce(12) + 密文。
+    /// 首包带 version + authID，后续包只带 nonce。
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         // 保留原 API：内部转调零分配版本
-        let mut out = Vec::with_capacity(5 + 12 + plaintext.len() + 16);
+        let mut out = Vec::with_capacity(5 + FIRST_HEADER_LEN + 12 + plaintext.len() + 16);
         self.seal_into(&mut out, plaintext);
         out
     }
 
     /// 封装并写入调用方提供的缓冲区（可反复复用，不分配）。
     ///
-    /// 结构：`17 03 03 len(2) | nonce(12) | 密文+tag(16)`
-    /// 加密用 `encrypt_in_place`，密文直接覆盖在 `out` 的载荷区，
-    /// 只有明文需要从入参拷进来一次（这是 QUIC 明文缓冲 → 记录缓冲的必然搬运）。
+    /// 首包：`17 03 03 len(2) | ver(1) | authID(16) | nonce(12) | 密文+tag(16)`
+    /// 后续：`17 03 03 len(2) | nonce(12) | 密文+tag(16)`
+    ///
+    /// 加密用 detached 版本，密文直接覆盖在 `out` 的载荷区，
+    /// 只有明文需要从入参拷进来一次（QUIC 明文缓冲 → 记录缓冲的必然搬运）。
     pub fn seal_into(&self, out: &mut Vec<u8>, plaintext: &[u8]) {
+        // 用 load 而不是 swap：要的是「是否已经确认可达」这个持续状态，
+        // 不是「是不是第一次调用」。首包丢了重传时仍然要带首包头。
+        let first = self.send_first_header && !self.established.load(Ordering::Relaxed);
+        self.seal_into_with(out, plaintext, first);
+    }
+
+    /// 显式指定是否按首包封装（测试与特殊场景用）。
+    fn seal_into_with(&self, out: &mut Vec<u8>, plaintext: &[u8], first: bool) {
         let nonce = self.next_nonce();
-        // body = nonce(12) + 密文(len) + tag(16)
-        let body_len = 12 + plaintext.len() + 16;
+        let header_len = if first { FIRST_HEADER_LEN } else { 0 };
+        // body = [ver+authID] + nonce(12) + 密文(len) + tag(16)
+        let body_len = header_len + 12 + plaintext.len() + 16;
         out.clear();
         out.resize(5 + body_len, 0);
         out[0] = REC_APPDATA;
         out[1] = 0x03;
         out[2] = 0x03;
         out[3..5].copy_from_slice(&(body_len as u16).to_be_bytes());
-        out[5..17].copy_from_slice(&nonce);
+        let mut pos = 5;
+        if first {
+            out[pos] = PROTOCOL_VERSION;
+            out[pos + 1..pos + 1 + AUTH_ID_LEN].copy_from_slice(&self.auth_id);
+            pos += FIRST_HEADER_LEN;
+        }
+        out[pos..pos + 12].copy_from_slice(&nonce);
+        pos += 12;
         // 明文填入载荷区，之后**原地**加密：密文覆盖明文，tag 追加在末尾。
         // aead 0.5 的 `Buffer` 只为 Vec<u8> 实现，所以用 detached 版本
         // 直接对 `&mut [u8]` 操作，避免多分配一个 Vec。
         let plain_len = plaintext.len();
-        out[17..17 + plain_len].copy_from_slice(plaintext);
+        out[pos..pos + plain_len].copy_from_slice(plaintext);
+        let aad = self.aad(first);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), b"", &mut out[17..17 + plain_len])
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &aad[..if first { FIRST_HEADER_LEN } else { 1 }],
+                &mut out[pos..pos + plain_len],
+            )
             .expect("aead encrypt");
-        out[17 + plain_len..].copy_from_slice(&tag);
+        out[pos + plain_len..].copy_from_slice(&tag);
     }
 
-    /// 解开一条 ApplicationData 记录。
+    /// AAD 缓冲：首包是 `ver|authID`，后续包只有 `ver`。
+    ///
+    /// 把版本号纳入认证有实际作用：将来出 v3 时，v2 的包在 v3 下
+    /// 一定解密失败，不会出现「老包被新版本误当成自己的包解」。
+    /// 把 authID 也纳入，是防止有人篡改首包里的用户标识去撞别的密钥。
+    #[inline]
+    fn aad(&self, first: bool) -> [u8; FIRST_HEADER_LEN] {
+        let mut aad = [0u8; FIRST_HEADER_LEN];
+        aad[0] = PROTOCOL_VERSION;
+        if first {
+            aad[1..].copy_from_slice(&self.auth_id);
+        }
+        aad
+    }
+
+    /// 解开一条**后续** ApplicationData 记录（不含首包头）。
     /// 任何格式或认证失败都返回 None，调用方应静默丢弃。
     pub fn open(&self, record_payload: &[u8]) -> Option<Vec<u8>> {
         if record_payload.len() < 12 + 16 {
             return None;
         }
         let (nonce, ct) = record_payload.split_at(12);
+        let aad = self.aad(false);
         self.cipher
-            .decrypt(Nonce::from_slice(nonce), ct)
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &aad[..1],
+                },
+            )
             .ok()
     }
+
+    /// 解开**首包**记录（整段 payload，含 ver + authID + nonce + 密文）。
+    ///
+    /// 会先校验版本号与 authID 是否等于自己的，不匹配直接返回 None：
+    /// 服务端用错密钥时不该走到 AEAD 计算（那只是浪费 CPU）。
+    pub fn open_first(&self, record_payload: &[u8]) -> Option<Vec<u8>> {
+        if record_payload.len() < FIRST_HEADER_LEN + 12 + 16 {
+            return None;
+        }
+        if record_payload[0] != PROTOCOL_VERSION {
+            return None;
+        }
+        if record_payload[1..FIRST_HEADER_LEN] != self.auth_id {
+            return None;
+        }
+        let rest = &record_payload[FIRST_HEADER_LEN..];
+        let (nonce, ct) = rest.split_at(12);
+        let aad = self.aad(true);
+        self.cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &aad,
+                },
+            )
+            .ok()
+    }
+}
+
+/// 从首包里读出 `(版本, authID)`，**不做任何认证**。
+///
+/// 服务端在还不知道用户是谁的时候必须先读这两个字段才能查表选密钥，
+/// 所以这里只能解析明文。调用方拿到 auth_id 后必须用对应密钥
+/// `open_first` 认证成功，才算真正通过鉴权——解析本身不构成信任。
+pub fn parse_first_header(record_payload: &[u8]) -> Option<(u8, [u8; AUTH_ID_LEN])> {
+    if record_payload.len() < FIRST_HEADER_LEN {
+        return None;
+    }
+    let mut auth_id = [0u8; AUTH_ID_LEN];
+    auth_id.copy_from_slice(&record_payload[1..FIRST_HEADER_LEN]);
+    Some((record_payload[0], auth_id))
 }
 
 /// 解析一个 TCP 段里可能串联的多条 TLS 记录。
@@ -455,47 +617,124 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seal_open_roundtrip() {
-        let obfs = Obfs::new("test-password");
+    fn first_packet_carries_auth_id() {
+        let obfs = Obfs::new_client("test-password");
         let plain = b"quic datagram payload";
         let rec = obfs.seal(plain);
-        // 记录头必须是 ApplicationData
         assert_eq!(rec[0], REC_APPDATA);
         let records = parse_records(&rec);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].typ, REC_APPDATA);
-        let out = obfs.open(records[0].payload).expect("decrypt");
+        let payload = records[0].payload;
+        // 首包必须带 version + authID，且 authID 与派生值一致
+        assert_eq!(payload[0], PROTOCOL_VERSION);
+        assert_eq!(&payload[1..FIRST_HEADER_LEN], &obfs.auth_id());
+        assert_eq!(
+            parse_first_header(payload),
+            Some((PROTOCOL_VERSION, obfs.auth_id()))
+        );
+        let out = obfs.open_first(payload).expect("decrypt first");
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn subsequent_packet_has_no_header() {
+        // 确认服务端可达后，记录不再带首包头 —— 这是稳态零额外开销的前提
+        let obfs = Obfs::new_client("test-password");
+        let first = obfs.seal(b"one");
+        obfs.mark_established();
+        let second = obfs.seal(b"two");
+        let f = parse_records(&first);
+        let s = parse_records(&second);
+        assert_eq!(
+            f[0].payload.len() - s[0].payload.len(),
+            FIRST_HEADER_LEN,
+            "首包应比后续包多出 ver+authID 的开销"
+        );
+        // 第二包不能用 open_first 解（它没有首包头）
+        assert!(obfs.open_first(s[0].payload).is_none());
+        assert_eq!(obfs.open(s[0].payload).as_deref(), Some(&b"two"[..]));
+        // 首包也不能用 open 解（open 认为开头就是 nonce）
+        assert!(obfs.open(f[0].payload).is_none());
+    }
+
+    #[test]
+    fn retransmit_still_carries_header() {
+        // QUIC Initial 丢包重传必须仍然能被服务端鉴权：
+        // 客户端在收到服务端回包之前，每个包都带首包头。
+        let obfs = Obfs::new_client("test-password");
+        let a = obfs.seal(b"initial-1");
+        let b = obfs.seal(b"initial-2");
+        for rec in [&a, &b] {
+            let recs = parse_records(rec);
+            assert_eq!(recs[0].payload[0], PROTOCOL_VERSION, "重传包也必须带首包头");
+            assert!(obfs.open_first(recs[0].payload).is_some());
+        }
+        // 服务端侧永远不带首包头
+        let server = Obfs::new_server("test-password");
+        let s = server.seal(b"reply");
+        let recs = parse_records(&s);
+        assert!(server.open(recs[0].payload).is_some());
+        assert!(server.open_first(recs[0].payload).is_none());
     }
 
     #[test]
     fn wrong_password_fails() {
         // 密码不同必须解密失败，这是外层鉴权的核心保证
-        let a = Obfs::new("password-a");
-        let b = Obfs::new("password-b");
+        let a = Obfs::new_client("password-a");
+        let b = Obfs::new_client("password-b");
+        assert_ne!(a.auth_id(), b.auth_id(), "不同密码的 auth id 必须不同");
         let rec = a.seal(b"data");
         let records = parse_records(&rec);
-        assert!(b.open(records[0].payload).is_none());
+        // auth id 不匹配：open_first 连 AEAD 都不用算就拒绝
+        assert!(b.open_first(records[0].payload).is_none());
+        // 换成后续包，AEAD 认证失败
+        let rec2 = a.seal(b"data2");
+        let records2 = parse_records(&rec2);
+        assert!(b.open(records2[0].payload).is_none());
     }
 
-    /// `seal_into` 必须和 `seal` 产出完全同构的记录：
+    #[test]
+    fn tampered_auth_id_rejected() {
+        // 篡改首包里的 authID 必须解密失败：authID 参与了 AAD 认证，
+        // 否则攻击者可以改掉它去撞别人的密钥槽位。
+        let obfs = Obfs::new_client("test-password");
+        let mut rec = obfs.seal(b"data");
+        let records = parse_records(&rec);
+        // 复制一份再改第 1 个字节（payload 里 authID 的起始位置）
+        let mut payload = records[0].payload.to_vec();
+        payload[1] ^= 0xFF;
+        assert!(obfs.open_first(&payload).is_none());
+        // 版本字节被改也必须失败
+        let mut payload2 = records[0].payload.to_vec();
+        payload2[0] = 3;
+        assert!(obfs.open_first(&payload2).is_none());
+        rec.clear();
+    }
+
+    /// `seal_into` 必须和 `seal` 产出同构的记录：
     /// 记录头一致、长度一致、都能被同一密钥解开。
-    /// 这是零分配改造不破坏线上兼容性的关键回归用例。
+    /// 这是零分配改造不破坏线上格式的关键回归用例。
     #[test]
     fn seal_into_matches_seal() {
-        let obfs = Obfs::new("test-password");
+        // 用两个独立实例，保证各自都从「首包」状态开始比较
         for plain in [&b""[..], b"a", b"hello world", &vec![7u8; 1400][..]] {
-            let owned = obfs.seal(plain);
+            let a = Obfs::new_client("test-password");
+            let b = Obfs::new_client("test-password");
+            let owned = a.seal(plain);
             let mut reused = Vec::new();
-            obfs.seal_into(&mut reused, plain);
+            b.seal_into(&mut reused, plain);
             assert_eq!(owned.len(), reused.len(), "记录总长必须一致");
             assert_eq!(owned[..5], reused[..5], "记录头必须一致");
-            // 两次的 nonce 不同（计数器递增），但都必须能解回同样的明文
-            let a = parse_records(&owned);
-            let b = parse_records(&reused);
-            assert_eq!(obfs.open(a[0].payload).as_deref(), Some(plain));
-            assert_eq!(obfs.open(b[0].payload).as_deref(), Some(plain));
-            assert_ne!(a[0].payload[..12], b[0].payload[..12], "nonce 必须递增不重复");
+            // 两次的 nonce 不同（前缀随机），但都必须能解回同样的明文
+            let ra = parse_records(&owned);
+            let rb = parse_records(&reused);
+            assert_eq!(a.open_first(ra[0].payload).as_deref(), Some(plain));
+            assert_eq!(a.open_first(rb[0].payload).as_deref(), Some(plain));
+            // nonce 起点在 authID 之后
+            let na = &ra[0].payload[FIRST_HEADER_LEN..FIRST_HEADER_LEN + 12];
+            let nb = &rb[0].payload[FIRST_HEADER_LEN..FIRST_HEADER_LEN + 12];
+            assert_ne!(na, nb, "独立实例的 nonce 前缀应随机不同");
         }
     }
 
