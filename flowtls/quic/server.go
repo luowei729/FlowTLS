@@ -127,6 +127,11 @@ func (s *Server) Addr() string { return s.listener.Addr().String() }
 // ListenerStats 返回底层监听器统计。
 func (s *Server) ListenerStats() flowtls.Stats { return s.listener.Stats() }
 
+// ListenerRules 返回服务端本次启动落地的 iptables 规则结果。
+//
+// 由适配层取走记日志：print 模式下这份文本就是运维需要手工执行的命令。
+func (s *Server) ListenerRules() flowtls.RuleReport { return s.listener.Rules() }
+
 // Close 停止服务并关闭所有连接。
 func (s *Server) Close() error {
 	var err error

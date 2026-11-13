@@ -35,17 +35,36 @@
       "local_ip": "203.0.113.10",
 
       // 伪包识别标记：IP ID 高字节。每个部署应不同。
-      // Rust 版的 0xF107 在这里写成十进制 61687。
-      "ip_id_mark": 61687,
+      // Rust 版的 0xF107 在这里写成十进制 61703。
+      "ip_id_mark": 61703,
 
       // raw 表规则落地方式：
       //   none  — 不生成也不执行（默认；规则自己维护）
       //   print — 只把规则打印到日志（推荐先这样跑一次，确认规则合理）
-      //   auto  — 启动时执行（尚未接线，见 PROJECT_PLAN）
+      //   auto  — 启动时幂等写入（不会自动删除，卸载命令见 print 输出）
       "iptables_mode": "print",
 
       // UDP 会话空闲回收（秒）。UDP 走 QUIC DATAGRAM，不重传、不分片。
-      "udp_session_timeout": 120
+      "udp_session_timeout": 120,
+
+      // 同端口真证书网站（应对主动端口探测）。
+      //
+      // 不配时 inbound 只做隧道，端口由其它进程（nginx/caddy）负责。
+      // 配了就会**真 bind 内核 TCP 端口**：流控靠上面那条 raw 表规则——
+      // 带标记的伪造包被 DROP，剩下的包才落到这个站点上。
+      //
+      // 两个端口共存已验证：探测看得到真证书真页面，隧道同时可用。
+      "masquerade": {
+        // 静态站点根目录。留空返回占位页（503），
+        // 而占位页本身就是指纹——生产必须填真实内容。
+        "site_dir": "/var/www/lumen-edge",
+
+        // **真证书**，不能用自签：探测者能看到证书链。
+        // fullchain 必须是「站点证书 + 中间证书」，
+        // 私钥权限建议 600 且属主为运行 user。
+        "certificate_path": "/etc/ssl/private/fullchain.pem",
+        "key_path": "/etc/ssl/private/privkey.pem"
+      }
     }
   ],
 

@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,8 +59,12 @@ type Inbound struct {
 	tlsConf *tls.Config
 
 	server *ftquic.Server
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// masq 是同端口真证书网站，未配置时为 nil。
+	masq       *Masquerade
+	masqOpts   *option.FlowTLSMasqueradeOptions
+	masqListen netip.AddrPort
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // NewInbound 只做参数校验，不申请任何特权资源。
@@ -115,6 +120,25 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, E.Cause(err, "flowtls: generate inner TLS certificate")
 	}
 
+	// 伪装站只校验必填字段，不读文件：
+	// `sing-box check` 可能在证书还没挂载的机器上跑，
+	// 真读文件会把它变成一条对环境有依赖的检查。
+	// 缺少字段则一定能确定是配置笔误，可以在这里就拒掉。
+	if options.Masquerade != nil {
+		if options.Masquerade.CertificatePath == "" || options.Masquerade.KeyPath == "" {
+			return nil, E.New("flowtls: masquerade 必须提供 certificate_path 与 key_path")
+		}
+	}
+
+	// iptables 模式在这里解析并保存：拼错要报错，而不是拖到 Start 才
+	// 变成一句看不懂的 iptables 报错。真正落地在 Start 阶段
+	// （raw socket 之后），但模式值必须现在就确定下来——
+	// 漏传会让 print 模式静默退化成 none，日志里看不到任何规则。
+	iptablesMode, err := flowtls.ParseIPTablesMode(options.IPTablesMode)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Inbound{
 		Adapter: inbound.NewAdapter(C.TypeFlowTLS, tag),
 		ctx:     ctx,
@@ -128,7 +152,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			LocalIP:  localIP,
 			IPIDMark: options.IPIDMark,
 		},
-		lis: flowtls.ListenerOptions{IdleTimeout: idleTimeout},
+		lis: flowtls.ListenerOptions{
+			IdleTimeout:  idleTimeout,
+			IPTablesMode: iptablesMode,
+		},
+		// 伪装站与协议用同一个端口：流量分流靠 iptables 规则，
+		// 不靠端口差异。
+		masqOpts:   options.Masquerade,
+		masqListen: netip.AddrPortFrom(listenAddr, options.ListenPort),
 	}, nil
 }
 
@@ -151,6 +182,45 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	h.server = srv
 
+	// 规则文本含换行，必须拆开交给 logger，
+	// 否则多行会挤在一条日志里、后续行没有时间戳。
+	//
+	// print 用 WARN：这是需要人动手的事，不能被 INFO 淡化。
+	// auto 且本次无新增时用 Debug：重连/重启时规则早就存在，
+	// 每次 INFO 一遍只会把有用的日志冲掉。
+	if report := srv.ListenerRules(); !report.Empty() {
+		for _, line := range strings.Split(report.Text(), "\n") {
+			switch {
+			case report.Mode == flowtls.IPTablesPrint:
+				h.logger.Warn(line)
+			case report.Mode == flowtls.IPTablesAuto && report.Added == 0:
+				h.logger.Debug(line)
+			default:
+				h.logger.Info(line)
+			}
+		}
+	}
+
+	// 同端口真证书网站。
+	//
+	// 放在 raw socket 与 iptables 规则之后：先保证协议能用，
+	// 再补伪装。站点启动失败直接返回错误——一个「以为开了但没开」
+	// 的伪装站比没有更危险（以为探测已经处理好了）。
+	if h.masqOpts != nil {
+		masq, err := newMasquerade(h.ctx, netipAddr(h.masqListen), MasqueradeOptions{
+			SiteDir:         h.masqOpts.SiteDir,
+			CertificatePath: h.masqOpts.CertificatePath,
+			KeyPath:         h.masqOpts.KeyPath,
+		})
+		if err != nil {
+			_ = h.server.Close()
+			return err
+		}
+		h.masq = masq
+		h.logger.Info("flowtls masquerade site listening at ", masq.Addr(),
+			" (site_dir=", orDefault(h.masqOpts.SiteDir, "<内置占位页>"), ")")
+	}
+
 	// 派生 ctx：入站关闭时能主动唤醒所有阻塞中的 Accept。
 	ctx, cancel := context.WithCancel(h.ctx)
 	h.cancel = cancel
@@ -167,6 +237,9 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 func (h *Inbound) Close() error {
 	if h.cancel != nil {
 		h.cancel()
+	}
+	if h.masq != nil {
+		_ = h.masq.Close()
 	}
 	if h.server != nil {
 		_ = h.server.Close()

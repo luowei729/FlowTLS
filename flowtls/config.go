@@ -18,6 +18,12 @@ type ClientConfig struct {
 	SourcePort uint16
 	// IPIDMark 是 IP ID 高字节分流标记，每个部署应不同。
 	IPIDMark uint16
+	// IPTablesMode 决定客户端规则的落地方式，默认 print。
+	//
+	// 客户端规则必须在**发第一个包之前**就位：
+	// SYN-ACK 一到，内核就会因为没有对应 socket 而回 RST。
+	// 所以 Dial 一开头就落地规则，而不是等到握手成功。
+	IPTablesMode IPTablesMode
 	// Handshake 为 false 时跳过三次握手（要求客户端有公网 IP）。
 	Handshake bool
 	// HandshakeTimeout 限制 SYN-ACK 的等待时间。

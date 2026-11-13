@@ -101,9 +101,27 @@ TCP 192.0.2.10:44311 → 198.51.100.4:8443  [PSH, ACK]
 服务端在**同一端口**运行一个真实的 HTTPS 网站（真证书 + 真页面）。
 扫描器访问得到正常的 HTTPS 响应；只有外层 AEAD 能成功解密的包才会进入代理逻辑，失败静默丢弃。
 
-Rust 版把这个网站做在协议进程内（Rustls 内嵌）；
-Go 版里 flowtls inbound 只做隧道，需要另起一个进程监听同端口
-（nginx / caddy / 任意 HTTPS 服务，页面素材可用 `web/index.html`）。
+Go 版通过 `masquerade` 配置把站点做在 inbound 内（和 Rust 版行为一致）：
+
+```json
+"masquerade": {
+  "site_dir": "/var/www/lumen-edge",
+  "certificate_path": "/etc/ssl/private/fullchain.pem",
+  "key_path": "/etc/ssl/private/privkey.pem"
+}
+```
+
+同端口有两个 listener 并不冲突，靠一条 raw 表规则分流：
+
+```
+到达 8443 的包
+   ├─ IP ID 高字节 == 标记  →  iptables raw/PREROUTING DROP（内核看不到）
+   │                            AF_PACKET 在 netfilter 之前收包 → 进隧道
+   └─ 其余                  →  交给内核 TCP → 真网站
+```
+
+不开 `masquerade` 时 inbound 只做隧道，端口可以交给 nginx / caddy
+（页面素材可用 [`web/index.html`](web/index.html)）。
 
 ### 5. 自适应，零配置
 
@@ -184,8 +202,13 @@ make upstream-pull TO=v1.15.0  # 同步上游 sing-box
       "listen_port": 8443,
       "password": "换成你自己的密码",
       "local_ip": "1.2.3.4",
-      "ip_id_mark": 61687,
-      "iptables_mode": "print"
+      "ip_id_mark": 61703,
+      "iptables_mode": "print",
+      "masquerade": {
+        "site_dir": "/var/www/lumen-edge",
+        "certificate_path": "/etc/ssl/private/fullchain.pem",
+        "key_path": "/etc/ssl/private/privkey.pem"
+      }
     }
   ],
   "outbounds": [{ "type": "direct", "tag": "direct" }]
@@ -201,7 +224,7 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
 ```
 
 > 需要 root（raw socket + iptables），且机器必须**直接持有公网 IP**。
-> `iptables_mode` 当前只支持 `none` / `print`（`auto` 尚未接线，见项目计划）。
+> `iptables_mode` 建议先用 `print` 看清规则，确认无误后改 `auto`。
 
 ### 客户端
 
@@ -225,7 +248,7 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
       "server_port": 8443,
       "password": "与服务端一致",
       "source_port": 44300,
-      "ip_id_mark": 61687,
+      "ip_id_mark": 61703,
       "sni": "your.domain"
     }
   ]
@@ -290,14 +313,16 @@ bash docs/e2e_matrix.sh       # 真链路矩阵（需要 root）
 5. **默认避开 443 端口**
    国内出口设备对 443 的伪造 TCP 检查更严，建议 8443 / 9443。
 
-6. **伪装网站需要另起进程**
-   Rust 版把「同端口真证书网站」做在协议进程里；sing-box 的 flowtls inbound
-   只做隧道，防主动探测要另外跑一个监听同端口的 HTTPS 服务
-   （页面素材可用 [`web/index.html`](web/index.html)）。
+6. **伪装网站需要真证书**
+   不配 `masquerade` 时 inbound 只做隧道，需另起进程监听同端口。
+   配了则由 inbound 自己 bind 该端口（这是唯一会 bind 内核 TCP 的地方）。
+   两种方式都必须用真证书：探测者能看到证书链，自签等于自报家门。
 
-7. **iptables 规则尚未自动落地**
-   `iptables_mode` 只有 `none` / `print` 生效，`auto` 还没接线，
-   部署时需按打印出的规则手工维护。
+7. **iptables 规则不会自动删除**
+   `iptables_mode: auto` 会幂等写入规则，但**刻意不删除**（进程重启期间规则必须
+   继续生效，否则内核会回 RST 打断正在重建的隧道）。升级/卸载后要手工清，
+   卸载命令由 `iptables_mode: print` 直接打印出来。
+   `none` / `print` / `auto` 三种模式都可用。
 
 ## 项目结构
 
@@ -310,6 +335,7 @@ flowtls/                     ← 独立 Go 模块 github.com/luowei729/flowtls
 ├── socket_linux.go          # AF_PACKET 收包 / IPPROTO_RAW 发包 / ARP
 ├── session.go               # 单条会话（net.PacketConn 语义）
 ├── listener.go              # 服务端：共享 raw socket + 四元组分发 + SYN 状态机
+├── rules.go                 # iptables 规则构造（u32 匹配 IP ID 标记）
 ├── quic/
 │   ├── client.go            # quic-go 客户端（多流复用 + UDP DATAGRAM）
 │   └── server.go            # quic-go 服务端
@@ -321,7 +347,8 @@ flowtls/                     ← 独立 Go 模块 github.com/luowei729/flowtls
 sing-box/                    ← git subtree，上游源码 + 最小补丁
 ├── protocol/flowtls/
 │   ├── outbound.go          # 适配 adapter.Outbound
-│   └── inbound.go           # 适配 adapter.Inbound
+│   ├── inbound.go           # 适配 adapter.Inbound
+│   └── masquerade.go        # 同端口真证书伪装站（可选）
 ├── option/flowtls.go        # 配置结构
 ├── constant/flowtls.go      # 类型常量
 └── include/flowtls.go       # 编译期开关（with_flowtls tag）

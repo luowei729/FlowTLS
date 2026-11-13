@@ -55,6 +55,11 @@ type Session struct {
 	rx      chan []byte
 	closeCh chan struct{}
 	closed  atomic.Bool
+	// rules 是本次 Dial 落地的客户端规则结果，供上层记日志。
+	//
+	// 规则是部署级静态属性，不随会话关闭而删除（见 ApplyRules 的注释），
+	// 所以这里只做「一次性上报」，不参与 Close。
+	rules RuleReport
 	// readDeadline 是读超时的绝对时刻（UnixNano），0 表示不超时。
 	//
 	// 用 atomic 而不是 sync.Mutex：这是每包都可能读一次的热路径值，
@@ -286,6 +291,12 @@ func (s *Session) RemoteAddr() net.Addr {
 	return net.UDPAddrFromAddrPort(s.peer)
 }
 
+// Rules 返回本次 Dial 落地的客户端规则结果。
+//
+// 上层（sing-box outbound / 联调工具）用它把规则文本记进日志：
+// print 模式下这份文本就是运维需要手工安装的命令。
+func (s *Session) Rules() RuleReport { return s.rules }
+
 // SetDeadline 实现 net.PacketConn。quic-go 用它做握手与 idle 超时。
 func (s *Session) SetDeadline(t time.Time) error {
 	if err := s.SetReadDeadline(t); err != nil {
@@ -433,6 +444,20 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	if srcPort == 0 {
 		srcPort = 44300
 	}
+
+	// 客户端规则必须在**第一个包发出之前**就位。
+	//
+	// SYN-ACK 一回，内核就会发现没有对应 socket 并回 RST，
+	// RST 是协议合法的终止信号，中间设备会立即拆掉 NAT 映射。
+	// 所以这里不能在握手成功后再装规则。
+	//
+	// 规则是部署级静态属性，重复 Dial 只会命中 -C「已存在」，开销可忽略。
+	rules, err := ApplyRules(cfg.IPTablesMode, ClientRules(srcPort, cfg.Server.Port(), cfg.IPIDMark))
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+
 	codec, err := NewClientCodec(cfg.Password)
 	if err != nil {
 		_ = raw.Close()
@@ -454,6 +479,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		rx:         make(chan []byte, rxQueueDepth),
 		closeCh:    make(chan struct{}),
 		lastAck:    time.Now(),
+		rules:      rules,
 	}
 	// SYN 占 1 个序号
 	isn := uint32(time.Now().UnixNano())

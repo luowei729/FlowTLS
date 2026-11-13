@@ -50,7 +50,7 @@ udp:
       "password": "换成你自己的密码",
       "users": [{ "name": "alice", "password": "alice-pass" }],
       "local_ip": "1.2.3.4",
-      "ip_id_mark": 61687,
+      "ip_id_mark": 61703,
       "udp_session_timeout": 120,
       "iptables_mode": "print"
     }
@@ -66,39 +66,46 @@ udp:
 | `listen: "0.0.0.0:8443"` | `listen` + `listen_port` | 拆成两个字段 |
 | `password` | `password` | 一致；外层 AEAD 的密钥来源 |
 | `users[].name/password` | `users[].name/password` | 一致；`users` 非空时忽略 `password` |
-| `faketcp.ip_id_magic` | `ip_id_mark` | 改名；**十进制** JSON 数值（`0xF107` = `61687`） |
+| `faketcp.ip_id_magic` | `ip_id_mark` | 改名；**十进制** JSON 数值（`0xF107` = `61703`） |
 | `faketcp.local_ip` | `local_ip` | 提到顶层；NAT 后必须填公网 IP |
 | `faketcp.handshake` | —— | 服务端恒为「标准三次握手」，无开关 |
 | `udp.timeout_secs` | `udp_session_timeout` | 改名，单位仍是秒 |
 | `udp.enabled` | —— | DATAGRAM 恒开（不配就是不允许，配了就有） |
 | `udp.max_sessions` | —— | 由 QUIC 流控与内存自然约束，不再单独设上限 |
-| `net.mode` | `iptables_mode` | `none`/`print`/`auto` 语义相同 |
+| `net.mode` | `iptables_mode` | `none`/`print`/`auto` 语义相同，但默认是 `print` |
 | `net.max_cwnd` | —— | Go 侧交给 quic-go 的 BBR，不再手工设窗口上限 |
-| `tls.cert` / `tls.key` | —— | **注意**：这是伪装网站证书，不是协议证书（见下） |
-| `site.dir` | —— | 伪装网站不在 inbound 里实现（见下） |
+| `tls.cert` / `tls.key` | `masquerade.certificate_path` / `key_path` | 伪装网站的真证书，不是协议证书（见下） |
+| `site.dir` | `masquerade.site_dir` | 留空返回占位页，生产必须填真实内容 |
 
 ### 两个「消失」的字段怎么处理
 
 **1. `tls.cert` / `tls.key`（伪装网站证书）**
 
-· Rust 版：同一个进程既跑 FakeTCP 又跑内核 TCP 的 HTTPS 网站，所以需要真证书。
-· sing-box 版：flowtls inbound **只做隧道**，不监听内核 TCP。
+Go 版对应 `masquerade.certificate_path` / `masquerade.key_path`，
+语义完全一样：**真证书**（Let's Encrypt / CloudFlare Origin CA 等）。
 
-所以要继续防主动探测，需要另起一个进程监听同端口（8443）跑真网站：
-
-```bash
-# 任意 HTTP 服务器都行，只要能返回一个像样的页面
-caddy file-server --root /var/www --listen :8443 --tls you@example.com
+```json
+"masquerade": {
+  "site_dir": "/var/www/lumen-edge",
+  "certificate_path": "/etc/ssl/private/fullchain.pem",
+  "key_path": "/etc/ssl/private/privkey.pem"
+}
 ```
 
-页面素材可直接用仓库里的 [`web/index.html`](../web/index.html)。
+不配 `masquerade` 时 inbound 只做隧道，端口交给别的进程也行：
+
+```bash
+caddy file-server --root /var/www --listen :8443 --tls you@example.com
+```
 
 > 内层 QUIC 用的证书是**运行时自签**，不需要配置——安全性由外层 AEAD 保证。
 > 这两者不要混淆。
 
 **2. `site.dir`**
 
-同上，属于伪装网站，不再由协议进程负责。
+对应 `masquerade.site_dir`。留空会返回一个 503 占位页——
+**生产必须填真实内容**，占位页本身就是指纹。页面素材可用
+[`web/index.html`](../web/index.html)。
 
 ---
 
@@ -150,7 +157,7 @@ net:
       "server_port": 8443,
       "password": "与服务端一致",
       "source_port": 44300,
-      "ip_id_mark": 61687,
+      "ip_id_mark": 61703,
       "sni": "your.domain"
     }
   ]
@@ -165,7 +172,7 @@ net:
 | `password` | `password` | 一致 |
 | `sni` | `sni` | 一致，只影响伪 ClientHello 外观 |
 | `faketcp.source_port` | `source_port` | 一致；用于 iptables 精确匹配内核 RST |
-| `faketcp.ip_id_magic` | `ip_id_mark` | 改名，十进制（`0xF107` = `61687`） |
+| `faketcp.ip_id_magic` | `ip_id_mark` | 改名，十进制（`0xF107` = `61703`） |
 | `faketcp.handshake: symbolic` | （默认开启） | 无需配置 |
 | `faketcp.handshake: none` | `"disable_handshake": true` | **反向字段**：不写＝开启握手 |
 | `socks5.listen/username/password` | `socks` inbound 的 `listen_port`/`users` | 用 sing-box 自带的 |
@@ -188,7 +195,7 @@ net:
 | 路由 | 无 | 全套（`route.rules`、DNS、`rule_set`） |
 | TUN | 无 | 有 |
 | 面板 | 无 | Clash API / 官方面板 |
-| 伪装网站 | 内置 | 需另起进程（见上） |
+| 伪装网站 | 内置 | `masquerade` 开启后内置于 inbound（也可交给 nginx/caddy） |
 | 配置校验 | `flowtls check --server a.yaml --client b.yaml` | `sing-box check -c config.json`（**不需要 root**） |
 
 ---

@@ -45,11 +45,17 @@ func main() {
 		localIP  = flag.String("local-ip", "", "对外源 IP（NAT 后必须指定）")
 		ipidMark = flag.Uint("ip-id-mark", 0xF107, "IP ID 分流标记")
 		idle     = flag.Duration("idle-timeout", 120*time.Second, "会话空闲回收")
+		iptables = flag.String("iptables", "none", "iptables 模式：none / print / auto")
 	)
 	flag.Parse()
 
 	if *listen == "" {
 		flag.Usage()
+		os.Exit(2)
+	}
+	iptMode, err := flowtls.ParseIPTablesMode(*iptables)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 	addr, err := parseListen(*listen)
@@ -93,7 +99,7 @@ func main() {
 			LocalIP:  local,
 			IPIDMark: uint16(*ipidMark),
 		},
-		Listener: flowtls.ListenerOptions{IdleTimeout: *idle},
+		Listener: flowtls.ListenerOptions{IdleTimeout: *idle, IPTablesMode: iptMode},
 		TLS:      tlsConf,
 	})
 	if err != nil {
@@ -102,6 +108,11 @@ func main() {
 	}
 	defer srv.Close()
 	fmt.Printf("✓ 已就绪 local=%s users=%d\n", srv.Addr(), len(userList))
+	if report := srv.ListenerRules(); !report.Empty() {
+		for _, line := range strings.Split(report.Text(), "\n") {
+			fmt.Println(line)
+		}
+	}
 	fmt.Println("  提示：同端口的真证书网站需要另起一个程序监听（本工具只做协议联调）")
 
 	// 统计协程

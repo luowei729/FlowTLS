@@ -33,8 +33,8 @@
       // 固定源端口：客户端 iptables 靠它精确拦截内核 RST。
       "source_port": 44300,
 
-      // 与服务端 ip_id_mark 一致（0xF107 = 61687）
-      "ip_id_mark": 61687,
+      // 与服务端 ip_id_mark 一致（0xF107 = 61703）
+      "ip_id_mark": 61703,
 
       // 只影响伪 ClientHello 的外观，不参与任何校验
       "sni": "your.domain",
@@ -42,7 +42,13 @@
       // 标准三次握手默认开启。**不要关**：
       // 严格 NAT / 状态防火墙只放行握手完成的流量，关掉会直接被丢。
       // 仅在客户端有公网 IP 且链路无状态检查时可设为 true 省一个 RTT。
-      "disable_handshake": false
+      "disable_handshake": false,
+
+      // 客户端规则落地方式，取值同服务端。
+      // 客户端规则的作用：屏蔽内核对伪连接回的 RST。
+      // Session 走 raw socket，内核里没有对应 socket，收到 SYN-ACK 就回 RST，
+      // 而 RST 会让中间设备立即拆掉 NAT 映射。
+      "iptables_mode": "print"
     },
 
     { "type": "direct", "tag": "direct" }

@@ -22,6 +22,10 @@
 #   bash docs/e2e_matrix.sh                     # 自动探测本机网卡 IP
 #   LOCAL_IP=1.2.3.4 bash docs/e2e_matrix.sh
 #
+# 本脚本的 iptables_mode 固定为 none：矩阵验证的是协议互通，不是防火墙。
+# auto 会往宿主机写入持久规则（设计如此，见 flowtls.ApplyRules 的注释），
+# 由测试脚本静默改动系统状态不合适。想验证 auto 请看 DEVTIPS 第 74 条。
+#
 # 注意：LOCAL_IP 必须是**本机真实网卡地址**，不能是 127.0.0.1。
 # 原因见 DEVTIPS 第 71 条：Go 客户端按默认路由选网卡，
 # 发往 127.0.0.1 的裸包会被送到物理网卡，loopback 收不到。
@@ -165,7 +169,8 @@ cat >"$TMP/go-server.json" <<EOF
   "log": { "level": "warn" },
   "inbounds": [
     { "type": "flowtls", "tag": "ft-in", "listen": "0.0.0.0", "listen_port": $PORT,
-      "password": "$PASSWORD", "local_ip": "$LOCAL_IP", "ip_id_mark": $IPID_MARK }
+      "password": "$PASSWORD", "local_ip": "$LOCAL_IP", "ip_id_mark": $IPID_MARK,
+      "iptables_mode": "none" }
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" } ]
 }
@@ -181,7 +186,7 @@ cat >"$TMP/go-client.json" <<EOF
   "outbounds": [
     { "type": "flowtls", "tag": "ft-out", "server": "$LOCAL_IP", "server_port": $PORT,
       "password": "$PASSWORD", "source_port": $SRC_PORT, "ip_id_mark": $IPID_MARK,
-      "sni": "example.com" }
+      "sni": "example.com", "iptables_mode": "none" }
   ]
 }
 EOF

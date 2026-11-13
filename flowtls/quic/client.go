@@ -436,6 +436,11 @@ func (c *Client) Err() error { return context.Cause(c.conn.Context()) }
 // 不会显著超过保活周期**。远大于它就意味着链路可能已断。
 func (c *Client) IdleFor() time.Duration { return c.session.IdleFor() }
 
+// Rules 返回客户端本次建连落地的 iptables 规则结果。
+//
+// 由适配层取走记日志：print 模式下这份文本就是运维需要手工执行的命令。
+func (c *Client) Rules() flowtls.RuleReport { return c.session.Rules() }
+
 // Probe 主动探测连接是否还活着。
 //
 // 为什么需要探活：QUIC 连接「已死但未检测到」是常态。服务端重启后，

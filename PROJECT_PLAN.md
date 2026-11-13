@@ -432,14 +432,12 @@ ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
 
 ### 剩余待办（P5，按优先级）
 
-1. **`iptables_mode: auto` 接线**（最高优先）
-   现在只有 `none` / `print` 生效。需要把 Rust `src/rules.rs` 的规则文本
-   搬到 Go，并在 `Start` 成功后写入、`Close` 时撤销。
-   规则本体可以从 `legacy-rust:src/rules.rs` 直接对照。
-2. **同端口真证书网站**
-   两个方案，选一个：
-   a. inbound 内嵌一个最小 HTTPS 服务（复用 `web/index.html` 与真证书）；
-   b. 文档明确要求另起 nginx/caddy，并提供现成配置片段。
+1. ~~**`iptables_mode: auto` 接线**~~ —— ✅ 2026-11-13 完成
+   `flowtls/rules.go` + `rules_linux.go` / `rules_stub.go`，三种模式全部可用；
+   规则文本与 Rust 版逐字一致（便于从旧部署延续）。
+2. ~~**同端口真证书网站**~~ —— ✅ 2026-11-13 完成
+   选了方案 a：`protocol/flowtls/masquerade.go`，用真证书 + `site_dir`，
+   与隧道同端口共存已验证。
 3. **CI**
    把 `make test` + `make interop` 接进 GitHub Actions（不需要特权，容易）；
    `e2e_matrix.sh` 需要 `CAP_NET_RAW`，可以只跑在自托管 runner 上。
@@ -447,3 +445,32 @@ ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
    README 的实测数据来自 Rust 版。协议相同，但 Go 的 quic-go 参数
    （InitialPacketSize / 流窗口 / 自适应策略）需要在自己的链路上重新跑一遍
    `docs/bench.sh`，把真实数字补上。
+---
+
+## 2026-11-13 14:25（北京时间）更新：P5-1 / P5-2 完成
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| iptables 规则层（`none`/`print`/`auto`） | ✅ |
+| 服务端规则在 raw socket 之后落地 | ✅ |
+| 客户端规则在第一个包之前落地 | ✅ |
+| `print` 输出含卸载命令 | ✅ |
+| 同端口真证书伪装站（`masquerade`） | ✅ |
+| 伪装站与隧道同端口共存实测 | ✅ |
+| 恢复被误删的 `ssl/` 真证书 | ✅ |
+| 修正 `0xF107` 十进制值（61703，不是 61687） | ✅ |
+
+### 剩余待办（P5）
+
+1. **CI**
+   把 `make test` + `make interop` 接进 GitHub Actions（无需特权，容易）；
+   `e2e_matrix.sh` 需要 `CAP_NET_RAW`，可只跑在自托管 runner。
+2. **跨境链路重测**
+   README 的实测数据来自 Rust 版。协议相同，但 quic-go 的参数
+   （InitialPacketSize / 流窗口 / 自适应策略）需要在真实链路上重跑
+   `docs/bench.sh`，把数字换成 Go 版的。
+3. **伪装站细节打磨**（可选）
+   - 支持反向代理模式（`masquerade.proxy_url`，对齐 hysteria2）；
+   - 支持 HTTP/3（当前只有 h2 + http/1.1）。

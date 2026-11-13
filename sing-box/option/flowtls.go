@@ -25,6 +25,23 @@ type FlowTLSInboundOptions struct {
 	IPTablesMode string `json:"iptables_mode,omitempty"`
 	// UDPSessionTimeout 是 UDP 会话空闲回收时间（秒）。
 	UDPSessionTimeout int `json:"udp_session_timeout,omitempty"`
+	// Masquerade 是同端口真证书网站（应对主动端口探测）。
+	//
+	// 不配时 inbound 只做隧道，端口由其它进程（nginx/caddy）负责。
+	// 配了就会****真 bind 内核 TCP 端口**：
+	// flowtls 的伪造包在 raw 表被 DROP，剩下的包才落到这个站点上。
+	Masquerade *FlowTLSMasqueradeOptions `json:"masquerade,omitempty"`
+}
+
+// FlowTLSMasqueradeOptions 是同端口伪装站点的配置。
+type FlowTLSMasqueradeOptions struct {
+	// SiteDir 是静态站点根目录。
+	// 留空返回占位页——**生产环境必须填真实内容**，占位页本身就是指纹。
+	SiteDir string `json:"site_dir,omitempty"`
+	// CertificatePath / KeyPath 是**真证书**（Let's Encrypt / CloudFlare
+	// Origin CA 等）。探测者能看到证书链，自签证书等于自报家门。
+	CertificatePath string `json:"certificate_path,omitempty"`
+	KeyPath         string `json:"key_path,omitempty"`
 }
 
 // FlowTLSUser 是多用户条目。
@@ -45,6 +62,16 @@ type FlowTLSOutboundOptions struct {
 	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
 	// SNI 只影响伪 ClientHello 的外观，不参与握手校验。
 	SNI string `json:"sni,omitempty"`
+	// IPTablesMode 控制客户端规则的落地方式，与服务端同名。
+	//
+	// 客户端规则的作用是屏蔽内核对伪连接回的 RST：
+	// Session 走 raw socket，内核里没有对应 socket，收到 SYN-ACK 就会回 RST，
+	// RST 是协议合法的终止信号，会让中间设备立刻拆掉 NAT 映射。
+	//
+	//   none  — 不生成也不执行，部署方自行维护；
+	//   print — 只把规则文本写进日志（默认，最安全）；
+	//   auto  — 启动时执行 iptables。
+	IPTablesMode string `json:"iptables_mode,omitempty"`
 	// DisableHandshake 关闭三次握手表演。
 	//
 	// **字段名故意是反向的**：Go 的 bool 零值是 false，若写成

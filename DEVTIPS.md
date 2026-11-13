@@ -1808,3 +1808,89 @@ printf '%s\n' "$out" | grep -q '^ok' || { echo FAIL; exit 1; }
 ```
 
 同一原则适用于任何「长命令 | grep -q」的检查。
+
+## 74. iptables 规则的两条硬约束
+
+`flowtls/rules.go` 里有两件事看着能简化，实际一简化就出错。
+
+### u32 的右值必须带 `0x` 前缀
+
+```bash
+# ✓ 正确
+-m u32 --u32 "0x4&0xff00ffff=0xf1004000"
+# ✗ 规则能装上，但永不命中
+-m u32 --u32 "0x4&0xff00ffff=f1004000"
+```
+
+内核解析器用 `simple_strtoul(..., base=0)`：不带 `0x` 就按十进制解析，
+`f1004000` 解析失败返回 0，而左边算出来的是几千，永远不相等。
+
+失败现象极其隐蔽——`iptables -C` 报告规则**存在**，`iptables -L` 也看得见，
+但内核照旧回 RST 把连接打断，日志里一点异常都没有。
+`TestU32ExprHasHexPrefix` 钉住了它。
+
+### 规则必须在 raw socket 就绪**之后**落地
+
+`NewListener` 的顺序是：申请 raw socket → 成功后才装规则。
+
+反过来（先装规则再申请 socket）会在申请失败时留下一堆指向
+「一个根本不会运行的服务端」的 DROP 规则。运维看到启动失败，
+通常会立刻重试，不会想到去 `iptables -t raw -S` 清理残留。
+
+客户端顺序相反但不是矛盾：规则必须在**第一个包发出之前**就位
+（`Dial` 一开头就装），因为 SYN-ACK 一回，内核就会因为没有对应
+socket 而回 RST。
+
+### 规则刻意不删
+
+`ApplyRules` 只在 `-C` 判不存在时 `-A`，任何时候都不 `-D`（与 Rust 版一致）：
+
+- 规则是部署级静态属性，每次启动都一样；
+- 进程重启期间规则必须继续生效，否则那段时间内核会回 RST
+  打断正在重建的隧道；
+- 被 `kill -9` 时不会留下「规则已删」的半状态。
+
+代价是升级/卸载后要手工清。所以 `IPTablesPrint` 模式的输出里
+**同时给了安装和卸载两种命令**，复制粘贴即可。
+
+### 验证 auto 的正确姿势
+
+```bash
+# 1. 服务端 auto
+sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json   # iptables_mode: auto
+
+# 2. 规则真的进了内核
+iptables -t raw -C PREROUTING -p tcp --dport 8443 \
+  -m u32 --u32 '0x4&0xff00ffff=0xf1004000' -j DROP && echo 已安装
+
+# 3. 最关键：装了 DROP 之后流量还通吗？
+#    AF_PACKET 在 netfilter 之前收包，所以必须仍然 PASS。
+#    如果这一步失败，说明规则写宽了（把非伪包也丢掉了）。
+/tmp/ftdial -server <IP>:8443 -password xxx -target example.com:443 -insecure
+
+# 4. 幂等：再启动一次，日志应是「新增 0 条，已存在 N 条」，规则只有一份
+iptables -t raw -S PREROUTING | grep -c 0xf1004000   # 必须是 1
+
+# 5. 清理
+sudo iptables -t raw -D PREROUTING -p tcp --dport 8443 \
+  -m u32 --u32 '0x4&0xff00ffff=0xf1004000' -j DROP
+```
+
+`ftserver -iptables print|auto` 和 `ftdial -iptables print|auto`
+可以不启动 sing-box 就单独验证规则。
+
+## 75. `0xF107` 不是 61687
+
+写文档时把 `0xF107` 手算成十进制 `61687`，实际是 **`61703`**
+（`61687` = `0xF0F7`）。
+
+这种错误在 JSON 里完全看不出来——配置合法、能启动、能互通
+（两端用同一个错值），但：
+- 规则与 Rust 版部署**不一致**，从旧版迁移过来的机器会失配；
+- 所有按文档手工配的部署特征都相同，正好破坏「每部署一个标记」的初衷。
+
+抓出它的方式很偶然：`iptables_mode=print` 打出来的表达式是
+`0xf0004000` 而不是 `0xf1004000`——**高字节看着不对**。
+`print` 模式的价值就在这里：它把内部派生值暴露到了日志里。
+
+教训：文档里的进制换算不要手算，`python3 -c "print(0xF107)"`。

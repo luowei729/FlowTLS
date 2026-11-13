@@ -47,6 +47,11 @@ flowtls 传输层（服务端，AEAD 验签失败静默丢弃）
         │
         ▼
 flowtls/quic → 流 / DATAGRAM 交回 router → 出站
+
+同端口的真证书网站（可选，masquerade）：
+  内核 TCP listener 绑同一个端口，靠 raw/PREROUTING 那条 DROP 规则分流——
+  带标记的伪造包被 DROP 后内核看不到，AF_PACKET 在 netfilter 之前照旧收包；
+  其余包（真实浏览器）落到内核 TCP，由伪装站回应。
 ```
 
 ## 目录结构
@@ -61,6 +66,8 @@ flowtls/                    独立 Go 模块 github.com/luowei729/flowtls
   socket_stub.go            非 Linux 空实现（保证能交叉编译）
   session.go                单条会话，net.PacketConn 语义
   listener.go               服务端：共享 raw socket + 单收包协程 + 四元组分发
+  rules.go                  iptables 规则构造（u32 匹配 IP ID 标记）+ 三种模式
+  rules_linux.go            Linux 上执行 iptables / 非 Linux 为 rules_stub.go
   quic/client.go            quic-go 客户端
   quic/server.go            quic-go 服务端
   cmd/ftdial/               联调：TCP（-streams N）
@@ -69,7 +76,7 @@ flowtls/                    独立 Go 模块 github.com/luowei729/flowtls
   testdata/                 wire format v2 冻结向量（兼容性基线，勿删）
 
 sing-box/                   git subtree，上游源码 + 最小补丁
-  protocol/flowtls/         outbound.go / inbound.go（适配层）
+  protocol/flowtls/         outbound.go / inbound.go / masquerade.go（适配层）
   option/flowtls.go         配置结构
   constant/flowtls.go       类型常量与错误
   include/flowtls.go        编译期开关（with_flowtls tag）+ stub
@@ -145,6 +152,11 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 10. **不要引入 `golang.org/x/sys`**：它缺 `Sendmmsg` / `IfNametoindex`，
     且 go directive 会强制升到 1.26。用标准库 `syscall` + `net.InterfaceByName`。
 11. 不要为了省事删除已有功能或绕过 iptables 分支。
+12. **u32 的右值必须带 `0x` 前缀**（`...=0xf1004000`）：内核用
+    `simple_strtoul(base=0)` 解析，不带前缀会失败返回 0，规则永不命中，
+    而 `iptables -C` 依然报告规则存在（`DEVTIPS.md` 第 74 条）。
+13. **iptables 规则刻意不自动删除**。重启期间规则必须继续生效，
+    否则内核会回 RST 打断重建中的隧道。卸载命令由 `print` 模式打印。
 
 ## 已知限制
 
@@ -157,7 +169,9 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 - **443 端口不可用**：国内出口设备对 443 的伪造 TCP 检查更严，建议用 8443/9443。
 - **单流窗口受 quic-go 组装器约束**：高丢包时窗口过大会积累大量乱序空洞，
   因此用自适应窗口规避。
-- **伪装网站需另起进程**：Go 版 inbound 只做隧道。
-- **`iptables_mode: auto` 尚未接线**：目前只有 `none` / `print` 生效，
-  部署需手工维护规则（P5 待办）。
+- **伪装网站必须用真证书**：不开 `masquerade` 时 inbound 只做隧道，
+  需另起进程监听同端口；开了则由 inbound 自己 bind（唯一会 bind 内核 TCP 的地方）。
+  自签证书等于自报家门，两种方式都不行。
+- **iptables 规则不会自动删除**：`auto` 幂等写入但不清理，
+  升级/卸载后按 `print` 输出里的卸载命令手工清。
 - 内层 QUIC 证书是运行时自签，安全由外层 AEAD 保证。

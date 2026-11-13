@@ -1,5 +1,78 @@
 # CHANGELOG
 
+## 2026-11-13 14:25 (北京时间)
+
+### P5-1/P5-2 完成：iptables 三种模式接线 + 同端口真证书伪装站（证书恢复）
+
+**先说一次事故**：冻结 Rust 时我把 `ssl/` 当成临时联调夹具一起删了，
+里面其实是 CloudFlare Origin CA 签发的 `*.example.com` 真证书。
+已从 `/root/FlowTCP/ssl/` 恢复，并核对私钥与证书公钥指纹一致（MATCH）。
+`/ssl/` 一直在 `.gitignore` 里，所以从未入库，恢复后也不会入库。
+
+**新增：iptables 规则层（`flowtls/rules.go`）**
+
+| 项 | 内容 |
+|---|---|
+| 规则构造 | `ServerRules` / `ClientRules`，u32 匹配 IP ID 高字节 |
+| 三种模式 | `none` / `print`（默认，只打日志）/ `auto`（幂等写入） |
+| 平台隔离 | `rules_linux.go` 执行 iptables，`rules_stub.go` 保证交叉编译 |
+| 挂载点 | 服务端 `NewListener`（raw socket 之后）、客户端 `Dial`（第一个包之前） |
+
+`print` 模式同时打印**安装与卸载**命令，运维复制粘贴即可。
+规则刻意不自动删除：重启期间规则必须继续生效，否则内核会回 RST 打断重建中的隧道。
+
+**新增：同端口真证书伪装站（`protocol/flowtls/masquerade.go`）**
+
+```json
+"masquerade": {
+  "site_dir": "/var/www/lumen-edge",
+  "certificate_path": "/etc/ssl/private/fullchain.pem",
+  "key_path": "/etc/ssl/private/privkey.pem"
+}
+```
+
+恢复 Rust 版行为：inbound 自己 bind 同一个端口跑 HTTPS 站点，
+靠 raw/PREROUTING 的 DROP 规则分流——伪造包被 DROP（内核看不到，
+AF_PACKET 照旧收包），其余包落到内核 TCP 由站点回应。
+
+**修复**
+
+| 问题 | 原因 | 处理 |
+|---|---|---|
+| 文档里 `0xF107 = 61687` | 手算错，`0xF107` 其实是 **61703**（61687 = 0xF0F7） | 全仓修正；此类错误在 JSON 里看不出来，两端用同一错值也能互通，但会与旧部署特征失配 |
+| `print` 模式静默退化成 `none` | inbound 只解析了模式却没传进 `ListenerOptions` | 解析后保存并传入；`print` 时打 WARN |
+| 伪装站 `/` 返回 301 | 自写的路径重写把 `/` 改成 `/index.html`，触发 FileServer 回跳 | 直接用 `http.FileServer`（它本身已处理 `/` 与 pretty URL） |
+| 重新连时规则日志刷屏 | `auto` 每次建连都把同一份规则 INFO 一遍 | `Added == 0` 时降为 Debug |
+
+**实测**
+
+| 项 | 结果 |
+|---|---|
+| `print` 输出 | WARN 级，含安装 + 卸载命令，表达式 `0x4&0xff00ffff=0xf1004000` |
+| `auto` 首次 | 新增 2 条（客户端）/ 1 条（服务端），`iptables -C` 命中 |
+| `auto` 幂等 | 再启动一次：「新增 0 条，已存在 N 条」，规则仍只有 1 份 |
+| DROP 规则在位时隧道 | TCP 4 流 PASS、UDP PASS（证明 AF_PACKET 在 netfilter 之前收包） |
+| 伪装站（真证书） | `/` → 200 / 10174 字节 / HTTP/2，证书 CloudFlare Origin CA，ALPN h2 |
+| 伪装站 404 | `/nonexistent` → 404 |
+| 同端口共存 | 隧道 PASS 的同时站点正常响应 |
+| `check` 校验 | 缺 `certificate_path` 时 FATAL，正常配置 PASS（非 root） |
+| `e2e_matrix.sh` | 4 通过 / 0 失败 / 3 跳过，跑完无 iptables 残留 |
+
+**验证 auto 的方法**（已写入 DEVTIPS 第 74 条）
+
+```bash
+iptables -t raw -C PREROUTING -p tcp --dport 8443 \
+  -m u32 --u32 '0x4&0xff00ffff=0xf1004000' -j DROP && echo 已安装
+# 装了 DROP 之后流量必须仍然通，否则说明规则写宽了
+/tmp/ftdial -server <IP>:8443 -password xxx -target example.com:443 -insecure
+```
+
+**文档**
+
+`README.md`（抗探测小节 + 限制）、`AGENTS.md`（架构图 + 约束 12/13）、
+`docs/MIGRATION.md`（`tls.cert` → `masquerade.*`）、
+`deploy.example/*.json`（两个新配置块）、`DEVTIPS.md`（第 74、75 条）。
+
 ## 2026-11-13 13:45 (北京时间)
 
 ### 冻结 Rust：主分支转为 Go 单实现

@@ -47,11 +47,13 @@ type Listener struct {
 	// sessionDone 用于把「会话结束」事件回传主循环，做集中清理。
 	sessionDone chan netip.AddrPort
 
+	// rules 是本次启动落地的 iptables 规则结果，供上层记日志。
+	rules RuleReport
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
 	wg        sync.WaitGroup
-
 	// 统计
 	statAccepted atomic.Uint64
 	statDropped  atomic.Uint64
@@ -79,6 +81,11 @@ type ListenerOptions struct {
 	HandshakeTimeout time.Duration
 	// AcceptQueue 是待上层接管的会话队列长度，默认 64。
 	AcceptQueue int
+	// IPTablesMode 决定 raw 表规则的落地方式，默认 print。
+	//
+	// 规则由 NewListener 在 raw socket 建好之后落地：
+	// 先有能收包的能力，再去改防火墙，失败时顺序可回退。
+	IPTablesMode IPTablesMode
 }
 
 // NewListener 绑定端口并启动收包协程。
@@ -117,6 +124,20 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		mark = IPIDMark
 	}
 
+	// raw socket 就绪后再落地 iptables 规则。
+	//
+	// 顺序理由：规则的作用是「让内核别碰我们的伪包」。
+	// 若反过来（先改防火墙再申请 socket），申请失败时会留下一堆
+	// 指向一个根本不会运行的服务端的 DROP 规则，运维很难意识到要清理。
+	//
+	// 规则落地失败直接返回错误：没有规则的 auto 模式等于静默失效，
+	// 比启动失败更难查。
+	rules, err := ApplyRules(opts.IPTablesMode, ServerRules(cfg.Listen.Port(), cfg.IPIDMark))
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
 		raw:              raw,
@@ -129,6 +150,7 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		pending:          make(map[netip.AddrPort]*synState),
 		acceptCh:         make(chan *Session, opts.AcceptQueue),
 		sessionDone:      make(chan netip.AddrPort, opts.AcceptQueue),
+		rules:            rules,
 		ctx:              ctx,
 		cancel:           cancel,
 	}
@@ -149,6 +171,12 @@ func (l *Listener) LocalIP() netip.Addr { return l.raw.LocalIP }
 
 // Users 返回用户表大小（供启动日志展示）。
 func (l *Listener) Users() int { return l.users.len() }
+
+// Rules 返回本次启动落地的 iptables 规则结果。
+//
+// 上层（sing-box inbound / 联调工具）用它把规则文本记进日志：
+// print 模式下这份文本就是运维需要手工安装的命令。
+func (l *Listener) Rules() RuleReport { return l.rules }
 
 // Accept 阻塞等待一条已鉴权的会话。
 //

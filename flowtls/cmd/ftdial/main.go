@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/luowei729/flowtls"
@@ -30,6 +31,7 @@ func main() {
 		sni      = flag.String("sni", "", "伪装 SNI（默认取 target 的域名）")
 		srcPort  = flag.Uint("source-port", 44300, "客户端源端口")
 		ipidMark = flag.Uint("ip-id-mark", 0xF107, "IP ID 分流标记")
+		iptables = flag.String("iptables", "none", "iptables 模式：none / print / auto")
 		timeout  = flag.Duration("timeout", 30*time.Second, "总超时")
 		doTLS    = flag.Bool("tls", true, "在流上再做一次 TLS（访问 https 站点）")
 		insecure = flag.Bool("insecure", true, "跳过目标证书校验（自签站点测试用）")
@@ -41,6 +43,11 @@ func main() {
 
 	if *server == "" || *password == "" {
 		flag.Usage()
+		os.Exit(2)
+	}
+	iptMode, err := flowtls.ParseIPTablesMode(*iptables)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 	serverAddr, err := netip.ParseAddrPort(*server)
@@ -64,12 +71,13 @@ func main() {
 	start := time.Now()
 	client, err := ftquic.NewClient(ctx, ftquic.ClientOptions{
 		FlowTLS: flowtls.ClientConfig{
-			Server:     serverAddr,
-			Password:   *password,
-			SNI:        *sni,
-			SourcePort: uint16(*srcPort),
-			IPIDMark:   uint16(*ipidMark),
-			Handshake:  true,
+			Server:       serverAddr,
+			Password:     *password,
+			SNI:          *sni,
+			SourcePort:   uint16(*srcPort),
+			IPIDMark:     uint16(*ipidMark),
+			IPTablesMode: iptMode,
+			Handshake:    true,
 		},
 		DialTimeout: *timeout,
 	})
@@ -79,6 +87,12 @@ func main() {
 	}
 	defer client.Close()
 	fmt.Printf("✓ 通道已建立（%v）\n", time.Since(start).Round(time.Millisecond))
+	// 规则文本多行，逐行打印，避免挤成一条
+	if report := client.Rules(); !report.Empty() {
+		for _, line := range strings.Split(report.Text(), "\n") {
+			fmt.Println(line)
+		}
+	}
 
 	// 多流并发：sing-box 的 outbound 就是这样用——**一条 QUIC 连接上
 	// 为每个本地连接开一条流**，而不是每次重新握手。

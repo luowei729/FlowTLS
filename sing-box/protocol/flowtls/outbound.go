@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,6 +79,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if options.IPIDMark == 0 {
 		options.IPIDMark = 0xF107
+	}
+	// iptables 模式在这里就解析：拼错时要报错，而不是拖到建连时
+	// 才变成一句「握手超时」。
+	//
+	// 解析结果只是校验，实际值在建连时再解析一次（connect 会用到），
+	// 好处是 `sing-box check` 也能拓出配置错误——它只走构造函数。
+	if _, err := ft.ParseIPTablesMode(options.IPTablesMode); err != nil {
+		return nil, err
 	}
 
 	networkList := options.Network.Build()
@@ -170,6 +179,10 @@ func (o *Outbound) connect() error {
 	if sni == "" {
 		sni = o.opts.Server
 	}
+	iptablesMode, err := ft.ParseIPTablesMode(o.opts.IPTablesMode)
+	if err != nil {
+		return err
+	}
 	c, err := ftquic.NewClient(o.ctx, ftquic.ClientOptions{
 		FlowTLS: ft.ClientConfig{
 			Server:     server,
@@ -177,6 +190,9 @@ func (o *Outbound) connect() error {
 			SNI:        sni,
 			SourcePort: o.opts.SourcePort,
 			IPIDMark:   o.opts.IPIDMark,
+			// 客户端规则必须在第一个包发出前就位，
+			// 所以模式随 ClientConfig 一起带进 Dial。
+			IPTablesMode: iptablesMode,
 			// 默认开启三次握手：严格 NAT/状态防火墙只放行握手完成的流量。
 			// 字段是反向命名的 DisableHandshake，零值即「开启」。
 			Handshake: !o.opts.DisableHandshake,
@@ -185,6 +201,24 @@ func (o *Outbound) connect() error {
 	})
 	if err != nil {
 		return err
+	}
+	// print 模式要把规则文本逐行写进日志：它有换行，
+	// 必须拆开交给 logger，否则每行都会缺时间戳和级别。
+	//
+	// print 用 WARN：这是需要人动手的事。
+	// auto 且本次无新增时用 Debug：outbound 会因空闲、链路抖动而重连，
+	// 每次重连都把同一份规则 INFO 一遍只会刷掉有用的日志。
+	if report := c.Rules(); !report.Empty() {
+		for _, line := range strings.Split(report.Text(), "\n") {
+			switch {
+			case report.Mode == ft.IPTablesPrint:
+				o.logger.Warn(line)
+			case report.Mode == ft.IPTablesAuto && report.Added == 0:
+				o.logger.Debug(line)
+			default:
+				o.logger.Info(line)
+			}
+		}
 	}
 	o.mu.Lock()
 	o.client = c
