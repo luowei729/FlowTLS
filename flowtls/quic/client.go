@@ -600,7 +600,8 @@ func NewClient(ctx context.Context, opts ClientOptions) (*Client, error) {
 	//
 	// `Attach` 做两件事：换上带窗口钳制的 BBR，并把这条连接
 	// 纳入丢包率采样（每 2 秒按实测丢包率升降窗口上限，同 Rust）。
-	winCtl.Attach(conn)
+	// 传入 session 是为了把「本地发送队列深度/等待时间」带进统计日志。
+	winCtl.Attach(conn, session)
 
 	return &Client{session: session, transport: transport, conn: conn, winCtl: winCtl}, nil
 }

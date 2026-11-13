@@ -26,7 +26,27 @@ import (
 	quicgo "github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+
+	"github.com/luowei729/flowtls"
 )
+
+// txStatsProvider 是底层 Session 的发送侧统计接口。
+//
+// 用它把「本地发送队列深度/等待时间」带进状态日志：
+// RTT 高时第一件事就是区分「链路真的慢」还是「本地队列积压」。
+type txStatsProvider interface {
+	TxStats() flowtls.TxStats
+}
+
+// connEntry 是一条被统计的连接及其附属信息。
+type connEntry struct {
+	conn *quicgo.Conn
+	tx   txStatsProvider
+	// cwnd / inflight 由 cappedBbr 在每次读写时记录（quic-go 的
+	// ConnectionStats 不暴露这两个值）。
+	cwnd     *atomic.Uint64
+	inflight *atomic.Uint64
+}
 
 // PathStats 是一次采样周期内的 QUIC 路径统计。
 //
@@ -37,9 +57,12 @@ import (
 //   - WinCap 停在上限 → 说明 BBR 吃饱了，瓶颈在带宽而不是窗口；
 //   - 完全没有日志 → 说明自适应循环没起来（或连接没 attach）。
 type PathStats struct {
-	// RTT 是最近一次 RTT 采样；SmoothedRTT 是平滑值。
+	// Remote 是本条连接的对端地址（多客户端时用于归属 RTT）。
+	Remote string
+	// RTT 是最近一次 RTT 采样；SmoothedRTT / MinRTT 是平滑值/最小值。
 	RTT         time.Duration
 	SmoothedRTT time.Duration
+	MinRTT      time.Duration
 	// SentPackets / LostPackets 是**累计**计数（不是本周期增量）。
 	SentPackets uint64
 	LostPackets uint64
@@ -47,6 +70,22 @@ type PathStats struct {
 	LossPct uint64
 	// WinCap 是调整后的窗口上限（字节）。
 	WinCap uint64
+	// Cwnd / InFlight 是拥塞窗口与在途字节（由 cappedBbr 记录）。
+	//
+	// 与 RTT/TxQueue 一起看即可二分：
+	//   - Cwnd 卡在 1.5MB → 丢包率持续偏高，窗口被压；
+	//   - Cwnd 正常但 InFlight 远小于 Cwnd → 应用层没数据可发；
+	//   - TxQueue 满 → 发送侧瓶颈；两者都正常 → 链路/对端问题。
+	Cwnd     uint64
+	InFlight uint64
+	// TxQueueDepth / TxMaxDepth 是底层 Session 的数据发送队列当前/最大深度。
+	TxQueueDepth int
+	TxMaxDepth   uint64
+	// TxWait 是 WriteTo 在满队列上等待的累计时间。
+	TxWait time.Duration
+	// TxDropped / TxSendErr 是关闭时丢弃与整批发送失败次数。
+	TxDropped uint64
+	TxSendErr uint64
 	// Conns 是参与统计的连接数。
 	Conns int
 	// CC 是当前拥塞控制算法名（"bbr" 或 "brutal"），仅用于日志。
@@ -105,6 +144,13 @@ type cappedBbr struct {
 	congestion.CongestionControlEx
 	// cap 是共享的窗口上限（字节），由 windowController 的自适应循环调整。
 	cap *atomic.Uint64
+	// lastCwnd / lastInFlight 记录控制器对外可见的窗口与在途字节。
+	//
+	// quic-go 的 ConnectionStats 不暴露这两个值，但它们是把
+	// 「窗口太小」和「应用没数据/接收流控卡住」区分开的唯一手段。
+	// 每次 GetCongestionWindow / CanSend 被调用时更新，读侧无锁。
+	lastCwnd     atomic.Uint64
+	lastInFlight atomic.Uint64
 }
 
 // newCappedBbr 用给定初始包大小和共享上限构造控制器。
@@ -137,13 +183,15 @@ func (c *cappedBbr) limit() congestion.ByteCount {
 func (c *cappedBbr) GetCongestionWindow() congestion.ByteCount {
 	w := c.CongestionControlEx.GetCongestionWindow()
 	if limit := c.limit(); w > limit {
-		return limit
+		w = limit
 	}
+	c.lastCwnd.Store(uint64(w))
 	return w
 }
 
 // CanSend 同样按上限判断，避免 BBR 内部认为「还能发」而绕开窗口限制。
 func (c *cappedBbr) CanSend(bytesInFlight congestion.ByteCount) bool {
+	c.lastInFlight.Store(uint64(bytesInFlight))
 	if bytesInFlight >= c.limit() {
 		return false
 	}
@@ -167,7 +215,7 @@ type windowController struct {
 	cfgMaxCwnd uint64
 
 	mu     sync.Mutex
-	conns  map[*quicgo.Conn]struct{}
+	conns  map[*quicgo.Conn]*connEntry
 	closed bool
 	stop   chan struct{}
 	// onStats 是可选统计回调（nil 表示不输出）。
@@ -203,7 +251,7 @@ func newWindowControllerEx(cfgMaxCwnd uint64, onStats func(PathStats),
 	}
 	w := &windowController{
 		cfgMaxCwnd:       cfgMaxCwnd,
-		conns:            make(map[*quicgo.Conn]struct{}),
+		conns:            make(map[*quicgo.Conn]*connEntry),
 		stop:             make(chan struct{}),
 		onStats:          onStats,
 		brutalBPS:        brutalBPS,
@@ -230,7 +278,8 @@ func (w *windowController) Window() uint64 { return w.cap.Load() }
 //     直接误导排查（实测服务端 BBR 模式 254KB/s，Brutal 模式 10.7MB/s，
 //     而 Rust 服务端同链路 BBR 能跑 14.5MB/s —— 差距根本不是算法选择问题，
 //     而是我们压根没把自己那套控制器装上）。
-func (w *windowController) Attach(conn *quicgo.Conn) {
+func (w *windowController) Attach(conn *quicgo.Conn, tx txStatsProvider) {
+	entry := &connEntry{conn: conn, tx: tx}
 	// Brutal 模式：丢包不减窗，按配置带宽硬发（hy1 风格）。
 	// 这时窗口由 bps × rtt × multiplier 推导，不受 cap 影响。
 	if w.brutalBPS > 0 {
@@ -242,7 +291,11 @@ func (w *windowController) Attach(conn *quicgo.Conn) {
 		// 注意传的是 &w.cap（共享原子值的地址），不是当前值快照：
 		// 自适应循环之后改 w.cap 会立刻被这条连接读到，无需重建控制器
 		// （重建会把 BBR 的带宽估计与 pacing 历史清零，见 cappedBbr 注释）。
-		conn.SetCongestionControl(newCappedBbr(conn.InitialPacketSize(), &w.cap))
+		cc := newCappedBbr(conn.InitialPacketSize(), &w.cap)
+		conn.SetCongestionControl(cc)
+		// 把控制器的窗口/在途记录暴露给统计循环（只读原子值）。
+		entry.cwnd = &cc.lastCwnd
+		entry.inflight = &cc.lastInFlight
 	}
 
 	// **两种模式都要登记**：统计日志（RTT/丢包/批大小）是排障的唯一依据，
@@ -253,7 +306,7 @@ func (w *windowController) Attach(conn *quicgo.Conn) {
 		w.mu.Unlock()
 		return
 	}
-	w.conns[conn] = struct{}{}
+	w.conns[conn] = entry
 	w.mu.Unlock()
 }
 
@@ -308,13 +361,13 @@ func (w *windowController) loop() {
 		// 汇总全部连接的发送/丢包计数
 		// （Rust 服务端也是汇总 total_sent / total_lost）。
 		w.mu.Lock()
-		conns := make([]*quicgo.Conn, 0, len(w.conns))
-		for c := range w.conns {
-			conns = append(conns, c)
+		entries := make([]*connEntry, 0, len(w.conns))
+		for _, e := range w.conns {
+			entries = append(entries, e)
 		}
 		w.mu.Unlock()
 
-		if len(conns) == 0 {
+		if len(entries) == 0 {
 			// 没有活跃连接时重置基线：否则下次建连时会把
 			// 「断开期间的 0」当成一次采样，算出 0% 丢包率把窗口放大。
 			lastSent, lastLost = 0, 0
@@ -329,14 +382,10 @@ func (w *windowController) loop() {
 		}
 
 		var totalSent, totalLost uint64
-		var rtt, srtt time.Duration
-		for _, c := range conns {
-			s := c.ConnectionStats()
+		for _, e := range entries {
+			s := e.conn.ConnectionStats()
 			totalSent += s.PacketsSent
 			totalLost += s.PacketsLost
-			// 取最后一条连接的 RTT 作为代表（Rust 客户端只有一条，
-			// 服务端日志里也只报汇总丢包率，不报每条连接的 RTT）。
-			rtt, srtt = s.LatestRTT, s.SmoothedRTT
 		}
 
 		// PacketsLost 不单调递增（判丢的包可能后来又收到，会被减回去），
@@ -400,16 +449,39 @@ func (w *windowController) loop() {
 		w.cap.Store(next)
 
 		if w.onStats != nil {
-			w.onStats(PathStats{
-				RTT:         rtt,
-				SmoothedRTT: srtt,
-				SentPackets: totalSent,
-				LostPackets: totalLost,
-				LossPct:     uint64(loss * 100),
-				WinCap:      next,
-				Conns:       len(conns),
-				CC:          cc,
-			})
+			// **每条连接单独上报**。旧实现只报「循环里最后一条连接」的 RTT，
+			// 服务端同时挂着多个客户端时，日志里的 rtt= 到底属于谁无法判断
+			// （DEVTIPS 88/91 记录过由此得出的错误结论）。
+			for _, e := range entries {
+				s := e.conn.ConnectionStats()
+				ps := PathStats{
+					Remote:      e.conn.RemoteAddr().String(),
+					RTT:         s.LatestRTT,
+					SmoothedRTT: s.SmoothedRTT,
+					MinRTT:      s.MinRTT,
+					SentPackets: s.PacketsSent,
+					LostPackets: s.PacketsLost,
+					LossPct:     uint64(loss * 100),
+					WinCap:      next,
+					Conns:       len(entries),
+					CC:          cc,
+				}
+				if e.cwnd != nil {
+					ps.Cwnd = e.cwnd.Load()
+				}
+				if e.inflight != nil {
+					ps.InFlight = e.inflight.Load()
+				}
+				if e.tx != nil {
+					ts := e.tx.TxStats()
+					ps.TxQueueDepth = ts.QueueDepth
+					ps.TxMaxDepth = ts.MaxDepth
+					ps.TxWait = ts.Wait
+					ps.TxDropped = ts.Dropped
+					ps.TxSendErr = ts.SendErr
+				}
+				w.onStats(ps)
+			}
 		}
 	}
 }

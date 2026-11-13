@@ -258,13 +258,19 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		// 实测教训：Go 客户端报 216ms、Rust 客户端报 89ms，而服务端自己
 		// 的 rtt 看不到，只能靠改代码逐步二分，代价极高。
 		OnStats: func(s ftquic.PathStats) {
+			// 每条连接单独一行：旧实现只报最后一条连接，多客户端时
+			// rtt= 的归属无法判断（DEVTIPS 88/91）。
 			h.logger.Debug("flowtls: QUIC 路径统计 ",
-				"cc=", s.CC,
-				" rtt=", s.RTT,
+				"cc=", s.CC, " peer=", s.Remote,
+				" rtt=", s.RTT, " srtt=", s.SmoothedRTT, " min_rtt=", s.MinRTT,
+				" cwnd=", humanBytes(s.Cwnd), " inflight=", humanBytes(s.InFlight),
 				" conns=", s.Conns,
 				" sent=", s.SentPackets, " lost=", s.LostPackets,
 				" loss%=", s.LossPct,
-				" win_cap=", humanBytes(s.WinCap))
+				" win_cap=", humanBytes(s.WinCap),
+				" tx_q=", s.TxQueueDepth, "/", s.TxMaxDepth,
+				" tx_wait=", s.TxWait.Round(time.Millisecond),
+				" tx_drop=", s.TxDropped, " tx_err=", s.TxSendErr)
 		},
 	})
 	if err != nil {

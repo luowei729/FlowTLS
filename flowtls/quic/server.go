@@ -254,7 +254,8 @@ func (s *Server) serveSession(sess *flowtls.Session, quicConf *quicgo.Config) {
 	// 服务端也要 BBR + 窗口上限，理由与客户端一致（见 quic/client.go）。
 	// 两端都用 BBR 才能避免「一端 BBR 猛发、另一端 Cubic 丢包减半」的错配。
 	// 服务端所有连接共享同一个窗口上限（同 Rust 的 Arc<AtomicU64>）。
-	s.winCtl.Attach(conn)
+	// 传入本会话的 Session 以便日志区分每条连接的发送队列/RTT。
+	s.winCtl.Attach(conn, sess)
 
 	s.mu.Lock()
 	s.conns[conn] = struct{}{}

@@ -96,20 +96,52 @@ type Session struct {
 	// AF_PACKET 驱动队列满后大量丢包（QUIC 侧 lost>10%，吞吐崩到 0.7Mbps）。
 	// Rust 版用 sendmmsg 一次 32 包，同样链路 lost 只有 0.57%。
 	//
-	// 顺序保证：入队发生在持有 s.mu 的临界区内（与 seq 推进同一把锁），
-	// 因此队列顺序 == TCP 序号顺序；纯 ACK 与数据包共用同一队列，
-	// 不会出现「ACK 的 seq 超过尚未发出的数据包」这种抓包可见的异常。
+	// **队列深度必须很小，且满了要阻塞生产者**。这条是 2026-11-14 修复
+	// 「Go 版 RTT 3~14 倍于 ICMP、吞吐剧烈抖动」的核心：
+	//
+	// quic-go 在**打包时**就调用 sentPacketHandler.SentPacket(now, ...) 记录
+	// 发送时刻，然后才把包交给 sendQueue → Session.WriteTo。如果 WriteTo 只是
+	// 入队并立刻返回，而 flushLoop 落后，包会在本地队列里排几百毫秒；
+	// 这段本地排队时间会被 quic-go 当成**网络 RTT**，进而：
+	//   - BBR 的带宽估计被 RTT 污染，cwnd/pacing 忽高忽低；
+	//   - PTO 与丢包判定基于被污染的 RTT，队列里的包可能被提前判丢并重传，
+	//     重传又加剧队列积压，形成正反馈。
+	// 实测抓包：链路 p50 约 73ms，而 outer ACK p50 213ms、服务端日志
+	// rtt=166ms~1.02s；把队列从 4096 降到 32 并阻塞生产者后回到链路量级。
+	//
+	// 深度 32 与 Rust `PacketBatch` 一致：最坏本地排队 = 一批报文的上线时间
+	// （100Mbps 下约 3.5ms），远小于一个 RTT，不会污染 RTT/丢包判定。
 	txCh   chan []byte
 	txWake chan struct{}
-	txStop chan struct{}
-	txWG   sync.WaitGroup
-	// txDropped 统计队列满丢弃的报文数（UDP 语义，QUIC 会重传）。
+	// ctrlCh 是纯 ACK 专用队列。
+	//
+	// 为什么与数据分开：下载方向服务端数据队列经常是满的，若 ACK 排在
+	// 几千个数据包后面，对端测到的 RTT 会凭空多出数百毫秒（Rust 版
+	// `send_pure_ack` 是直接发送的，从不排数据队列）。
+	// ACK 不进数据队列就不会被数据洪峰拖慢；两个队列的报文在线上可能
+	// 少量乱序，但 fake TCP 的对端只用 ack 做单调推进，QUIC 自身也不依赖
+	// 外层 TCP 的可靠/有序语义——这与 Rust 的取舍一致。
+	ctrlCh   chan []byte
+	ctrlWake chan struct{}
+	txStop   chan struct{}
+	txWG     sync.WaitGroup
+	// txDropped 统计因会话关闭而未能入队的报文数（正常应为 0）。
 	txDropped atomic.Uint64
 	// txSendErr 统计 flushLoop 批量发送整批失败的次数。
 	//
 	// 为什么单独计：发送失败会把整批报文一起丢，而在「阻塞 fd」语义下它
 	// 本不应该发生；一旦非零，说明链路/驱动在丢包，是吞吐下降的第一线索。
 	txSendErr atomic.Uint64
+	// txMaxDepth 记录数据队列出现过的最大深度（包）。
+	//
+	// 只用于诊断：它与 RTT 一起看就能区分「链路真的慢」和
+	// 「本地发送队列积压」。正常应长期 ≤ 32。
+	txMaxDepth atomic.Uint64
+	// txWaitNS 是 WriteTo 在满队列上等待的累计纳秒数。
+	//
+	// 它代表背压是否真的生效：值持续增长说明发送侧被链路限速，
+	// 这是正确的（而不是把报文堆在内存里）。
+	txWaitNS atomic.Uint64
 
 	// 统计（供上层日志用）
 	pktsSent atomic.Uint64
@@ -237,19 +269,21 @@ func (s *Session) WriteTo(p []byte, addr net.Addr) (int, error) {
 	// 记录复用：稳态下除入队拷贝外零分配
 	s.wRecord = s.codec.Seal(s.wRecord[:0], p)
 	pkt := s.appendSegmentLocked(s.wPkt[:0], s.wRecord, TCPPSH|TCPACK)
-	s.enqueueLocked(pkt)
+	// 必须在锁内拷贝：wRecord/wPkt 是复用缓冲，下一包会覆盖。
+	buf := copyToTxPool(pkt)
 	s.mu.Unlock()
+
+	// **在锁外阻塞入队**：队列满时等待 flushLoop 腾出空间。
+	// 不能持 s.mu 等待：收包协程也要 s.mu 更新 peerSeq/发 ACK，
+	// 持锁阻塞会让收发互相卡死。
+	if !s.enqueueData(buf) {
+		return 0, net.ErrClosed
+	}
 	return len(p), nil
 }
 
-// enqueueLocked 把一个已构造好的报文放进发送队列（调用方必须持有 s.mu）。
-//
-// 必须持锁调用：入队顺序就是 TCP 序号顺序，这是纯 ACK 与数据包
-// 共用队列后仍然「抓包看不出异常」的前提。
-//
-// 报文要拷贝：pkt 指向 s.wPkt 这条复用缓冲，下一包会覆盖它。
-// 队列满时按 UDP 语义丢弃——这是最坏情况的兜底，quic-go 会重传。
-func (s *Session) enqueueLocked(pkt []byte) {
+// copyToTxPool 把报文复制进池缓冲，返回所有权交给发送侧。
+func copyToTxPool(pkt []byte) *[]byte {
 	buf := txPool.Get().(*[]byte)
 	if cap(*buf) < len(pkt) {
 		*buf = make([]byte, len(pkt))
@@ -257,17 +291,85 @@ func (s *Session) enqueueLocked(pkt []byte) {
 		*buf = (*buf)[:len(pkt)]
 	}
 	copy(*buf, pkt)
+	return buf
+}
+
+// enqueueData 把数据报文放进发送队列；队列满时**阻塞**。
+//
+// 为什么必须阻塞而不是丢弃：伪造 TCP 层没有重传，QUIC 只能靠 PTO 兜底。
+// 在本层丢一个包，quic-go 会以为它已经上线并开始等 ACK，等到 PTO 才重传；
+// 而 PTO 又基于被污染的 RTT，容易越等越久。阻塞则把背压一路传回
+// quic-go 的 pacing，符合 UDP socket 的常规语义。
+//
+// 只允许 quic-go 的发送协程调用（WriteTo），绝不能由收包协程调用。
+func (s *Session) enqueueData(buf *[]byte) bool {
+	start := time.Now()
+	// 先看一下是否已经停止：避免 select 在 txCh 可写与 txStop 同时就绪时
+	// 随机选中 txCh，把报文投进一个已经没有消费者的队列。
+	select {
+	case <-s.txStop:
+		txPool.Put(buf)
+		s.txDropped.Add(1)
+		return false
+	default:
+	}
 	select {
 	case s.txCh <- *buf:
+		s.noteTxDepth()
 		// 非阻塞唤醒 flush 协程：已有唤醒信号时不必重复发
 		select {
 		case s.txWake <- struct{}{}:
 		default:
 		}
-	default:
-		// 队列满：归还缓冲并丢弃
+		s.txWaitNS.Add(uint64(time.Since(start).Nanoseconds()))
+		return true
+	case <-s.txStop:
 		txPool.Put(buf)
 		s.txDropped.Add(1)
+		s.txWaitNS.Add(uint64(time.Since(start).Nanoseconds()))
+		return false
+	}
+}
+
+// enqueueCtrl 把纯 ACK 放进控制队列；**绝不阻塞收包协程**。
+//
+// 控制队列满（极端情况）时退化为同步发送：单包 sendto 的几十微秒
+// 远好于让共享 recvLoop 停摆。正常路径下 ACK 会被 flushCtrlLoop
+// 按 32 包批量发出。
+func (s *Session) enqueueCtrl(buf *[]byte) {
+	select {
+	case <-s.txStop:
+		txPool.Put(buf)
+		return
+	default:
+	}
+	select {
+	case s.ctrlCh <- *buf:
+		select {
+		case s.ctrlWake <- struct{}{}:
+		default:
+		}
+	case <-s.txStop:
+		txPool.Put(buf)
+	default:
+		// 队列满：直接发，绝不阻塞收包协程。
+		if err := s.raw.Send(*buf, s.peer.Addr()); err == nil {
+			s.pktsSent.Add(1)
+		} else {
+			s.txSendErr.Add(1)
+		}
+		txPool.Put(buf)
+	}
+}
+
+// noteTxDepth 记录数据队列的历史最大深度（只用于诊断）。
+func (s *Session) noteTxDepth() {
+	d := uint64(len(s.txCh))
+	for {
+		old := s.txMaxDepth.Load()
+		if d <= old || s.txMaxDepth.CompareAndSwap(old, d) {
+			return
+		}
 	}
 }
 
@@ -277,8 +379,11 @@ func (s *Session) enqueueLocked(pkt []byte) {
 // 握手阶段的 SYN / SYN-ACK / ClientHello 仍走直接 Send，
 // 因为它们必须在状态机推进前立刻上线。
 func (s *Session) startSender() {
-	s.txWG.Add(1)
+	// 两个发送协程：数据面与纯 ACK 分开。
+	// 这样下载方向的数据洪峰不会把 ACK 拖到几百毫秒之后。
+	s.txWG.Add(2)
 	go s.flushLoop()
+	go s.flushCtrlLoop()
 }
 
 // txPool 复用发送队列里的报文缓冲。
@@ -317,18 +422,8 @@ func (s *Session) flushLoop() {
 			if len(batch) == 0 {
 				break
 			}
-			sent, err := s.raw.SendBatch(batch, s.peer.Addr())
-			if err != nil {
-				// 整批发送失败：计数并（开关下）记日志。以前这里是完全静默的，
-				// 导致「吞吐不知为何上不去」时无从查起。
-				s.txSendErr.Add(1)
-				if os.Getenv("FLOWTLS_DEBUG_SEND") == "1" {
-					log.Printf("flowtls: 批量发送失败 %d 包: %v", len(batch), err)
-				}
-			} else {
-				s.pktsSent.Add(uint64(sent))
-			}
-			// 归还缓冲。SendBatch 返回后内核已拷贝走报文内容。
+			s.sendBatch(batch)
+			// 归还缓冲。sendBatch 返回后内核已拷贝走报文内容。
 			for _, pkt := range batch {
 				p := pkt[:cap(pkt)]
 				txPool.Put(&p)
@@ -338,6 +433,106 @@ func (s *Session) flushLoop() {
 				break
 			}
 		}
+	}
+}
+
+// flushCtrlLoop 与 flushLoop 相同，但消费纯 ACK 队列。
+//
+// 单独协程是刻意的：ACK 不排在任何数据包之后，服务端 RTT 才不会
+// 被自己的数据洪峰抬高（见 Session.ctrlCh 注释）。
+func (s *Session) flushCtrlLoop() {
+	defer s.txWG.Done()
+	batch := make([][]byte, 0, maxSendBatch)
+	for {
+		select {
+		case <-s.txStop:
+			return
+		case <-s.ctrlWake:
+		}
+		for {
+			batch = batch[:0]
+			for len(batch) < maxSendBatch {
+				select {
+				case pkt := <-s.ctrlCh:
+					batch = append(batch, pkt)
+				default:
+					goto send
+				}
+			}
+		send:
+			if len(batch) == 0 {
+				break
+			}
+			s.sendBatch(batch)
+			for _, pkt := range batch {
+				p := pkt[:cap(pkt)]
+				txPool.Put(&p)
+			}
+			if len(batch) < maxSendBatch {
+				break
+			}
+		}
+	}
+}
+
+// sendBatch 确保这一批报文**全部**交给内核后才返回。
+//
+// SendBatch 在驱动队列满时可能只发出前 n 个（返回 total < len(batch)）。
+// 旧实现直接 break，剩余报文被静默丢弃——在伪造 TCP 上这等于永久丢包，
+// QUIC 只能等 PTO 重传，表现为 RTT 抖动和吞吐下滑。
+//
+// 这里对剩余报文重试；只有连续重试 200 次（10ms）仍无进展才放弃并计数。
+// 阻塞 fd + 小队列下，正常路径不会走到重试分支。
+func (s *Session) sendBatch(batch [][]byte) {
+	retries := 0
+	for len(batch) > 0 {
+		sent, err := s.raw.SendBatch(batch, s.peer.Addr())
+		if err != nil {
+			// 整批发送失败：计数并（开关下）记日志。以前这里是完全静默的，
+			// 导致「吞吐不知为何上不去」时无从查起。
+			s.txSendErr.Add(1)
+			if os.Getenv("FLOWTLS_DEBUG_SEND") == "1" {
+				log.Printf("flowtls: 批量发送失败 %d 包: %v", len(batch), err)
+			}
+			return
+		}
+		if sent <= 0 {
+			retries++
+			if retries > 200 {
+				s.txSendErr.Add(1)
+				return
+			}
+			// 驱动/队列暂时没有空间：让出 CPU 后重试。
+			time.Sleep(50 * time.Microsecond)
+			continue
+		}
+		s.pktsSent.Add(uint64(sent))
+		batch = batch[sent:]
+	}
+}
+
+// TxStats 是发送侧的诊断快照。
+//
+// 与 RTT 一起看即可区分「链路慢」和「本地队列积压」：
+// MaxDepth 长期接近 txQueueDepth、Wait 持续增长，说明瓶颈在发送侧；
+// 两者都正常而 RTT 高，才是链路/对端问题。
+type TxStats struct {
+	QueueDepth int
+	MaxDepth   uint64
+	Wait       time.Duration
+	Dropped    uint64
+	SendErr    uint64
+}
+
+// TxStats 返回发送侧统计。并发安全。
+func (s *Session) TxStats() TxStats {
+	// txCh 可能尚未初始化（只构造未 Dial 的测试会话），len(nil)=0，安全。
+	return TxStats{
+		QueueDepth: len(s.txCh),
+		MaxDepth:   s.txMaxDepth.Load(),
+		Wait:       time.Duration(s.txWaitNS.Load()),
+		Dropped:    s.txDropped.Load(),
+		SendErr:    s.txSendErr.Load(),
 	}
 }
 
@@ -402,9 +597,11 @@ func (s *Session) sendPureACK() {
 	s.lastAck = time.Now()
 	pkt := s.appendSegmentLocked(s.wPkt[:0], nil, TCPACK)
 	// 纯 ACK 不占序号：appendSegmentLocked 已按 seqLen 判断。
-	// 与数据包共用队列，保证 seq 顺序与发出顺序一致。
-	s.enqueueLocked(pkt)
+	// 拷贝后释放 s.mu 再入队：sendPureACK 由收包协程调用，
+	// 绝不能持锁阻塞，也不能让 ACK 排在数据队列后面。
+	buf := copyToTxPool(pkt)
 	s.mu.Unlock()
+	s.enqueueCtrl(buf)
 }
 
 // sendFIN 发 FIN 拆除连接，让拆除过程像真实 TCP。
@@ -872,15 +1069,24 @@ func (s *Session) exchangeSyn(timeout time.Duration) (synAckInfo, error) {
 func (s *Session) newTxQueues() {
 	s.txCh = make(chan []byte, txQueueDepth)
 	s.txWake = make(chan struct{}, 1)
+	s.ctrlCh = make(chan []byte, ctrlQueueDepth)
+	s.ctrlWake = make(chan struct{}, 1)
 	s.txStop = make(chan struct{})
 }
 
-// txQueueDepth 是发送队列深度（单位：包）。
+// txQueueDepth 是数据发送队列深度（单位：包）。
 //
-// 4096 × 1417B ≈ 5.8MB，覆盖连接级 BDP 的突发；
-// 队列存在只为吸收「构造速度 > sendmmsg 速度」的瞬时差额，
-// 持续过载时满即丢（UDP 语义）。
-const txQueueDepth = 4096
+// **必须小**：quic-go 在打包时记录发送时刻，队列里的排队时间会被计入 RTT。
+// 32 与 Rust `PacketBatch` 的批次大小一致，最坏本地排队只有一批报文的上线
+// 时间（100Mbps 下约 3.5ms）。旧值 4096 会把本地排队放大到数百毫秒，
+// 实测 RTT 从链路 73ms 虚高到 166ms~1.02s，并导致吞吐剧烈抖动。
+const txQueueDepth = 32
+
+// ctrlQueueDepth 是纯 ACK 队列深度（单位：包）。
+//
+// 比数据队列大：ACK 不占带宽，但下载方向 ACK 速率可达数千 pps，
+// 需要吸收 flushCtrlLoop 的调度抖动。队列满时退化同步发送，绝不停摆。
+const ctrlQueueDepth = 256
 
 // StartReceiver 启动常驻接收协程。
 //

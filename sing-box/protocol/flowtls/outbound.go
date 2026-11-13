@@ -208,11 +208,15 @@ func (o *Outbound) connect() error {
 		// 但排查「连接活着却没速度」时它是第一现场证据。
 		OnStats: func(s ftquic.PathStats) {
 			o.logger.Debug("flowtls: QUIC 路径统计 ",
-				"cc=", s.CC,
-				" rtt=", s.RTT, " srtt=", s.SmoothedRTT,
+				"cc=", s.CC, " peer=", s.Remote,
+				" rtt=", s.RTT, " srtt=", s.SmoothedRTT, " min_rtt=", s.MinRTT,
+				" cwnd=", humanBytes(s.Cwnd), " inflight=", humanBytes(s.InFlight),
 				" sent=", s.SentPackets, " lost=", s.LostPackets,
 				" loss%=", s.LossPct,
-				" win_cap=", humanBytes(s.WinCap))
+				" win_cap=", humanBytes(s.WinCap),
+				" tx_q=", s.TxQueueDepth, "/", s.TxMaxDepth,
+				" tx_wait=", s.TxWait.Round(time.Millisecond),
+				" tx_drop=", s.TxDropped, " tx_err=", s.TxSendErr)
 		},
 	})
 	if err != nil {
