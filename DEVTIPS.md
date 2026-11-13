@@ -1478,7 +1478,136 @@ pseudoversion 依赖（如 `sagernet/sing`）同理：抄错分支会让类型�
 4. 能用标准库就用标准库——本轮 x/sys 的 `Sendmmsg`/`IfNametoindex`
    在当前版本里已不可用，换回 `syscall` 反而更稳。
 
-## 64. 常用调试命令
+## 64. 在「可靠的伪造传输」上跑 QUIC，绝不能主动丢包
+
+把 FlowTLS 移植到 Go 时，接收队列最初照搬 UDP 语义：满了就丢。
+**这个类比是错的**，而且错得很隐蔽。
+
+QUIC 认为下层是 UDP，会自己处理丢包重传。但我们的下层是伪造 TCP——
+socket 层不重传，而 QUIC 又只对「它能感知到的丢包」重传。于是：
+
+```
+Session 主动丢包 → quic-go 认为已投递成功 → 不发 ACK、不重传
+                                    ↓
+                          服务端 PTO 盲猜、重传
+                                    ↓
+                          重传的包又被丢 → 死循环
+```
+
+现象非常难查，因为它**只在数据量达到某个阈值时出现**：
+
+| 场景 | 结果 |
+|---|---|
+| 单流 20MB | 正常（队列够用） |
+| 2 流 16MB | 服务端报 `背压等待超过 30 秒，放弃该流` |
+| 单流 40MB | 正常 |
+
+服务端那句「背压等待」具有误导性——它在等客户端消费，而客户端在丢包。
+第一反应会去查服务端的窗口/背压逻辑，方向完全错了。
+
+**正确做法：阻塞投递，让背压传导下去。**（`deliver` 里去掉 `default` 分支，
+只留 `case s.rx <-` 和 `case <-s.closeCh`）
+
+阻塞的代价是 recvLoop 停读 raw socket、内核缓冲填满后由内核丢包。
+那比我们主动丢好：内核丢的是**整个加密 TCP 段**，服务端伪造 TCP 与 QUIC
+两侧都能感知并重传；而我们主动丢的是一个已解密、QUIC 已认定送达的数据报，
+永久丢失。
+
+## 65. 接收队列容量必须覆盖 QUIC 连接级接收窗口
+
+改成阻塞投递后仍然会丢——只是变成了内核丢包。根因是**队列装不下窗口允许的
+在途数据**：
+
+```
+队列容量 = rxQueueDepth × 单包大小(≈1340)
+若 队列容量 < MaxConnectionReceiveWindow，则窗口一填满队列就阻塞，
+进而内核丢包；而 FakeTCP 层没有重传，丢了就是永久丢。
+```
+
+quic-go 默认 `MaxConnectionReceiveWindow = 15MB`，所以队列至少要 15MB。
+实测演进（**每一步都是压测出来的，不要凭感觉设**）：
+
+| rxQueueDepth | 容量 | 结果 |
+|---|---|---|
+| 256 | 0.3MB | 单流 20MB 勉强，40MB 失败 |
+| 8192 | 10.7MB | 单流 40MB ✓、2 流 16MB ✓、4 流 40MB ✗ |
+| 16384 | 21.9MB | 4 流 40MB ✓ |
+
+顺带一条反直觉的结论：**连接级接收窗口不要手动设**。
+曾把 `MaxConnectionReceiveWindow` 设成 16MB，结果单流下载到 16.7MB
+永久卡死（窗口耗尽后 MAX_DATA 没回补）。保持 quic-go 默认的自适应窗口
+反而正常；只有 stream 级窗口需要显式调大（默认初始 512KB，爬升太慢会
+触发对端背压判定）。
+
+## 66. quic-go 会剥离 ctx 的取消信号
+
+`transport.Dial(ctx, ...)` 内部第一件事是 `context.WithoutCancel(ctx)`——
+**故意不让 ctx 取消生效**，只用它传值。所以：
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+defer cancel()
+conn, err := transport.Dial(ctx, ...)   // 15 秒后不会返回！
+```
+
+为什么这个坑在代理场景下特别致命：密码错误时服务端会**静默丢弃**所有
+Initial（这正是设计要求的，不暴露探测面），但客户端仍在正常收 SYN-ACK
+和纯 ACK，所以握手期永远不会「空闲」，`HandshakeIdleTimeout` 也不触发。
+实测必须用外部 `timeout` 命令才能杀掉进程。
+
+正确写法是自己包一层：
+
+```go
+ch := make(chan result, 1)          // 容量 1：先超时返回也不会泄漏 goroutine
+go func() { c, e := transport.Dial(...); ch <- result{c, e} }()
+select {
+case r := <-ch:            return r.conn, r.err
+case <-ctx.Done():         transport.Close(); return nil, ctx.Err()
+}
+```
+
+## 67. 包装 net.PacketConn 的三个关闭陷阱
+
+**陷阱一：关闭顺序**。`quic.Transport.Close()` 会等它内部的 reader goroutine
+退出，而那个 goroutine 阻塞在我们 `ReadFrom` 上；`ReadFrom` 只有
+`Session.Close()` 才返回。所以：
+
+```go
+// 错误：功能完全正常，但进程永不退出（exit=124）
+transport.Close()
+session.Close()
+
+// 正确
+conn.CloseWithError(0, "")   // 先发 CONNECTION_CLOSE
+session.Close()              // 唤醒阻塞的 ReadFrom
+transport.Close()            // 现在才不会卡
+```
+
+**陷阱二：`Close` 必须真的关掉底层 fd**。接收协程阻塞在 `raw.Recv()` 的
+syscall 上，它不看任何标志位，等的是 syscall 返回。只 `closed.Store(true)`
+不会唤醒它，结果是泄漏一个 goroutine 和两个 fd。必须在 `Close` 里
+`raw.Close()`。
+
+**陷阱三：`closeCh` 与 `close(rx)` 要分开保护**。两者都用同一个 `sync.Once`
+会导致「先到者执行，后者再也关不了」，让另一方永久阻塞。
+
+## 68. `SetReadDeadline` 不能是空实现
+
+quic-go 把握手超时、idle 超时全部挂在 `PacketConn.SetReadDeadline` 上。
+空实现等于「永不超时」。
+
+而且返回的错误必须是 `net.Error` 且 `Timeout() == true`：
+
+```go
+type timeoutError struct{}
+func (timeoutError) Error() string   { return "flowtls: i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+```
+
+否则 quic-go 会把正常超时当成致命错误直接关闭连接。
+
+## 69. 常用调试命令
 
 ```bash
 

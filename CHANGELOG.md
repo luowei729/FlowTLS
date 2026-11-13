@@ -1,5 +1,113 @@
 # CHANGELOG
 
+## 2026-11-13 12:25 (北京时间)
+
+### Go P2 完成：`quic/` 子包，Go 客户端打通 Rust 服务端
+
+**定位决策**：FlowTLS 的权威实现改为 Go 独立协议库 (`github.com/luowei729/flowtls`)，
+与 hy2/anytls 平级；Rust 版后续冻结，只作为互通基准与生产回滚版本。
+
+**新增**
+
+| 文件 | 内容 |
+|---|---|
+| `flowtls/addr.go` | 地址帧编解码（`[len u16][ATYP][ADDR][PORT]`），支持 IPv4/IPv6/域名 |
+| `flowtls/quic/client.go` | `quic.Transport{Conn: session}` 接线、ALPN、`StreamConn`、`DialConn` |
+| `flowtls/cmd/ftdial/` | 联调工具（支持 `-streams N` 单连接多流并发） |
+
+**实测结果（本机，Rust 服务端）**
+
+| 用例 | Rust 基线 | Go |
+|---|---|---|
+| 小包（example.com，928B） | — | PASS，rtt 4.2ms |
+| 单流 40MB | 18.7s / 2.14 MB/s | 18.5s / **2.16 MB/s** |
+| 单连接 4 流 × 10MB | — | 19.2s / 1.99 MB/s，0 背压 |
+| 多用户 alice/bob | — | PASS，服务端正确识别 user |
+| 错误密码 | — | 10.5s 明确失败 |
+| 8 条独立连接并发 | — | PASS |
+
+**关键 bug 1：`deliver` 不能静默丢包**
+
+第一版接收队列满就丢（照搬 UDP 语义）。但**我们跑在伪造 TCP 上，QUIC 以为下层
+是 UDP**：丢掉的包 quic-go 认定已投递，既不发 ACK 也不重传；服务端只能靠 PTO
+盲猜，重传进来又被丢，形成死循环。
+
+现象极隐蔽：单流 20MB 正常，2 流 16MB 时服务端报
+`背压等待超过 30 秒，放弃该流`（它在等客户端消费，而客户端在丢包）。
+
+改为**阻塞投递**，把背压传导到 recvLoop → raw socket → 内核缓冲。
+
+**关键 bug 2：队列容量必须覆盖连接级接收窗口**
+
+阻塞后仍会丢（转成内核丢包，而 FakeTCP 层没有重传机制）。数学关系：
+
+```
+队列容量 = rxQueueDepth × 1340
+quic-go 默认 MaxConnectionReceiveWindow = 15MB
+队列容量 < 15MB → 窗口允许的在途数据能填满队列 → 必然丢包
+```
+
+调优演进（每次都是实测出来的，不是猜的）：
+
+| 队列深度 | 容量 | 结果 |
+|---|---|---|
+| 256 | 0.3MB | 单流 20MB 勉强，40MB 失败 |
+| 8192 | 10.7MB | 单流 40MB ✓、2 流 16MB ✓、4 流 40MB ✗ |
+| **16384** | **21.9MB** | **4 流 40MB ✓** |
+
+**关键 bug 3：quic-go 会剥离 ctx 取消**
+
+`transport.Dial(ctx, ...)` 内部调用 `context.WithoutCancel(ctx)`——**故意
+剥离取消信号**，只用 ctx 传值。所以传带超时的 ctx 完全无效。
+
+密码错误时格外致命：服务端静默丢弃 Initial，但客户端仍在收 SYN-ACK/纯 ACK，
+握手期永不"空闲"，连 `HandshakeIdleTimeout` 都不触发。实测要外部 `timeout`
+命令才能杀掉进程。
+
+修复：`dialWithTimeout` 自己起 goroutine 跑 Dial，用 select 抢 ctx.Done()，
+超时后主动 `transport.Close()` 结束内部等待。
+
+**关键 bug 4：Close 顺序导致进程不退出**
+
+`transport.Close()` 会等它内部的 reader goroutine 退出，而那个 goroutine
+阻塞在 `Session.ReadFrom` 上；`ReadFrom` 只有 `Session.Close()` 才返回。
+所以必须**先关 Session 再关 Transport**。反过来写功能完全正常，
+但进程永不退出（`exit=124`），只能被 timeout 杀掉。
+
+同时补上：`Session.Close` 必须关 raw socket——recvLoop 阻塞在 `raw.Recv`
+的 syscall 上，只标 closed 标志不会唤醒它，会泄漏 goroutine + 2 个 fd。
+
+**关键 bug 5：`SetReadDeadline` 空实现**
+
+quic-go 把握手与 idle 超时都挂在 `SetReadDeadline` 上。空实现会让它永远
+收不到超时信号。已实现真正的 deadline（atomic 存绝对时刻 + timer），
+并返回实现了 `net.Error`（`Timeout() == true`）的错误——否则 quic-go
+会把正常超时当致命错误。
+
+**其他调整**
+
+- `MaxStreamReceiveWindow` 从 8MB 回到 4MB（与 Rust 侧一致）。
+- **不设** `MaxConnectionReceiveWindow`：曾设成 16MB，结果单流下载到
+  16.7MB 永久卡住（连接级窗口耗尽后没回补）。保持 quic-go 默认的自适应
+  连接窗口反而正常。
+- 接收缓冲改用 `sync.Pool`：40MB 下载约 3 万次分配，池化后 GC 压力明显下降。
+- `Stats` 去掉拥塞窗口：sagernet/quic-go 此版本的 `ConnectionStats`
+  没有 `CongestionWindow` 字段。
+
+**验收**
+
+```
+cargo test                    → 25 passed
+cd flowtls && go test ./...   → 17 passed（含 2 个互通）
+go vet                        → 干净
+GOOS=windows/darwin go build  → OK
+bash docs/interop_check.sh    → PASS
+sing-box with_flowtls 编译     → OK
+```
+
+**未做**：`flowtls/listener.go`（服务端 Accept）、`protocol/flowtls/outbound.go`
+（sing-box 适配层）、UDP。
+
 ## 2026-11-13 11:29 (北京时间)
 
 ### Go P1：`flowtls/` 传输层移植完成，与 Rust 双向互通已验证

@@ -1,6 +1,56 @@
 # PROJECT_PLAN
 
-## 当前状态（2026-11-13 11:29 北京时间）
+## 当前状态（2026-11-13 12:25 北京时间）
+
+### 定位调整（用户决策）
+
+**FlowTLS 的权威实现改为 Go 独立协议库** `github.com/luowei729/flowtls`，
+与 hysteria2 / anytls 平级。**Rust 版后续冻结**，只保留两个职责：
+
+1. 互通门禁的「另一个独立实现」（防止自测全绿、上线全挂）
+2. 生产环境的回滚版本（新加坡机当前跑的是 Rust）
+
+策略是「先开发，后冻结」：Go 侧 P2~P4 开发期间 Rust 不动；
+Go 通过全部互通与压测后再冻结 Rust。
+
+### 里程碑
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| P0 | subtree + 补丁 + stub 注册 + Makefile | ✅ |
+| P1 | `flowtls/` 主包：packet/codec/socket/session | ✅ |
+| **P2** | **`quic/` 子包 + Go 客户端打通 Rust 服务端** | ✅ |
+| P3 | UDP（udpnat2 + session 映射） | 待办 |
+| P4 | `Listener.Accept` + `protocol/flowtls/outbound.go` | 待办 |
+| P5 | 打包、CI 互通矩阵、配置迁移文档、冻结 Rust | 待办 |
+
+### P2 实测（Rust 服务端，本机）
+
+| 用例 | Rust 基线 | Go |
+|---|---|---|
+| 小包 928B | — | PASS，rtt 4.2ms |
+| 单流 40MB | 18.7s / 2.14 MB/s | 18.5s / **2.16 MB/s** |
+| 单连接 4 流 × 10MB | — | 19.2s / 1.99 MB/s，0 背压 |
+| 多用户 alice/bob | — | PASS，服务端正确识别 |
+| 错误密码 | — | 10.5s 明确失败 |
+
+**协议层已与 Rust 等价，单流性能 1:1。** 剩下的差距在 QUIC 集成层，
+本轮已修掉 5 个真实 bug（详见 DEVTIPS 64~68）：
+
+1. `deliver` 静默丢包 → 改为阻塞投递（QUIC 认为包已送达，永不重传）
+2. 队列容量 10.7MB < 连接级窗口 15MB → 提到 21.9MB
+3. quic-go 剥离 ctx 取消 → 自建 `dialWithTimeout`
+4. `Close` 顺序导致进程不退出（exit=124）
+5. `SetReadDeadline` 空实现 → quic-go 永不知超时
+
+### P3 起点
+
+`flowtls/quic` 加 `ListenPacket`；服务端方向仍用 Rust，
+先验证 Go 客户端 UDP 能通（DNS 查询）。
+
+---
+
+## 上一阶段状态（2026-11-13 11:29 北京时间）
 
 ### Go P1 完成：`flowtls/` 传输层移植 + 双向互通门禁
 

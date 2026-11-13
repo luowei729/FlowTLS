@@ -146,10 +146,30 @@ make verify
 |---|---|---|
 | P0 | subtree + 补丁 + stub 注册 + Makefile，`version`/`check` 可用 | ✅ 2026-11-13 |
 | P1 | `flowtls/` 主包：packet/codec/socket/session + 单测 | ✅ 2026-11-13 |
-| P2 | `quic/` 子包 + outbound 适配，TCP 打通 Rust 服务端 | 待办 |
+| P2 | `quic/` 子包 + Go 客户端打通 Rust 服务端 | ✅ 2026-11-13 |
 | P3 | UDP（udpnat2 + session 映射），dig 通 | 待办 |
-| P4 | inbound 适配（含 `Listener.Accept`）+ 与 Rust 客户端互通 | 待办 |
+| P4 | `Listener.Accept` + outbound/inbound 适配 | 待办 |
 | P5 | 打包脚本、CI 互通矩阵、配置迁移文档 | 待办 |
+
+### P2 实测（Rust 服务端）
+
+| 用例 | Rust 基线 | Go |
+|---|---|---|
+| 小包 928B | — | PASS，rtt 4.2ms |
+| 单流 40MB | 18.7s / 2.14 MB/s | 18.5s / **2.16 MB/s** |
+| 单连接 4 流 × 10MB | — | 19.2s / 1.99 MB/s，0 背压 |
+| 多用户 | — | 服务端正确识别 user |
+| 错误密码 | — | 10.5s 明确失败 |
+
+**协议层已与 Rust 等价。** P2 期间修掉的 5 个真实 bug 见 DEVTIPS 64~68，
+全部集中在 QUIC 集成层（丢包语义、队列容量、ctx 取消、关闭顺序、deadline），
+与协议格式无关——这印证了「Go 化不是翻译，而是重新踩 QUIC 栈的坑」。
+
+### 权威实现与冻结策略
+
+Go 版为权威实现；Rust 版在 P4 通过后冻结，仅作为互通基准与回滚版本。
+wire format 的**权威定义是 `docs/DESIGN.md` 第 1 节 + `docs/interop_vectors/`**，
+两份代码都只是「实现」。
 
 P1 已完成的部分（均已有单测）：
 

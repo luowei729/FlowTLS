@@ -44,7 +44,18 @@ type Session struct {
 	rx      chan []byte
 	closeCh chan struct{}
 	closed  atomic.Bool
-	once    sync.Once
+	// readDeadline 是读超时的绝对时刻（UnixNano），0 表示不超时。
+	//
+	// 用 atomic 而不是 sync.Mutex：这是每包都可能读一次的热路径值，
+	// 而写入只发生在 quic-go 设置/清除 deadline 时（低频）。
+	// 不必拆成「读锁 + 写锁」两套机制。
+	readDeadline atomic.Uint64
+	// once 保护「关闭动作」（sendFIN + close(closeCh)）
+	once sync.Once
+	// rxOnce 单独保护 close(rx)：Close 与接收协程退出都会走到这里，
+	// 共用 once 会导致「先到者执行，后者再也无法关 rx」，
+	// 让另一方永久阻塞在读通道上。
+	rxOnce sync.Once
 
 	// 收发缓冲复用。写侧由 quic-go 串行调用，读侧由接收协程独占。
 	wRecord []byte
@@ -53,31 +64,86 @@ type Session struct {
 	// 统计（供上层日志用）
 	pktsSent atomic.Uint64
 	pktsRecv atomic.Uint64
+	// rxDropped 统计因队列满而丢弃的包数（应为 0；非 0 说明背压链路断了）
+	rxDropped atomic.Uint64
 }
 
 // net.PacketConn 接口断言。编译期即可发现签名不一致。
 var _ net.PacketConn = (*Session)(nil)
 
+// timeoutError 是 net.Error 的最小实现，Timeout() 返回 true。
+//
+// quic-go 靠 `err.(net.Error).Timeout()` 区分「读超时」和「真错误」：
+// 前者是正常的 deadline 到期（握手期、空闲期都可能发生），
+// 后者才需要上报。不实现这个接口会让它把超时当成致命错误。
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "flowtls: i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+var _ net.Error = timeoutError{}
+
 // ReadFrom 读取一个 QUIC 数据报。
 //
 // 返回的 addr 恒为对端地址：伪造 TCP 是点对点的，不存在「一个 socket 收
 // 多个对端」的场景，quic-go 也只是拿它做日志和连接标识。
+//
+// **必须实现 deadline**：quic-go 把握手超时、idle 超时都挂在
+// SetReadDeadline 上。空实现会让 Dial 永远不超时——联调时表现为
+// 「密码错误时客户端永久挂起」，只能被外部 timeout 杀掉。
 func (s *Session) ReadFrom(p []byte) (int, net.Addr, error) {
-	// 快路径：已经有数据就直接返回
+	// 快路径：已经有数据就直接返回，避免每次读都创建一个 timer
 	select {
 	case data, ok := <-s.rx:
 		if !ok {
 			return 0, nil, net.ErrClosed
 		}
-		return copy(p, data), s.peerUDPAddr(), nil
+		n := copy(p, data)
+		// 归还缓冲到池（data 是 deliver 从池里取的切片）。
+		// 这里只归还底层数组，不改长度：池里的元素仍可容纳同样大小的数据。
+		putBack := data[:cap(data)]
+		bufPool.Put(&putBack)
+		return n, s.peerUDPAddr(), nil
 	default:
 	}
+
+	// 慢路径：带 deadline 的等待
+	if dl := s.readDeadline.Load(); dl != 0 {
+		d := time.Unix(0, int64(dl))
+		if !d.IsZero() {
+			wait := time.Until(d)
+			if wait <= 0 {
+				return 0, nil, timeoutError{}
+			}
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case data, ok := <-s.rx:
+				if !ok {
+					return 0, nil, net.ErrClosed
+				}
+				n := copy(p, data)
+				putBack := data[:cap(data)]
+				bufPool.Put(&putBack)
+				return n, s.peerUDPAddr(), nil
+			case <-timer.C:
+				return 0, nil, timeoutError{}
+			case <-s.closeCh:
+				return 0, nil, net.ErrClosed
+			}
+		}
+	}
+
 	select {
 	case data, ok := <-s.rx:
 		if !ok {
 			return 0, nil, net.ErrClosed
 		}
-		return copy(p, data), s.peerUDPAddr(), nil
+		n := copy(p, data)
+		putBack := data[:cap(data)]
+		bufPool.Put(&putBack)
+		return n, s.peerUDPAddr(), nil
 	case <-s.closeCh:
 		return 0, nil, net.ErrClosed
 	}
@@ -149,12 +215,25 @@ func (s *Session) sendFIN() {
 }
 
 // Close 关闭会话。幂等。
+//
+// 关闭顺序有严格要求，否则会死锁：
+// quic.Transport.Close 会等它内部的 reader goroutine 退出，
+// 而那个 goroutine 正阻塞在本 Session 的 ReadFrom 上。
+// ReadFrom 只有靠 close(closeCh) 才能返回 —— 而释放 closeCh 的只能是
+// Session.Close 自己。因此**必须先闭 Session 再闭 Transport**。
+// （反过来写时现象是：程序功能正常但进程永不退出，只能被 timeout 杀掉。）
 func (s *Session) Close() error {
 	s.once.Do(func() {
 		s.closed.Store(true)
 		s.sendFIN()
 		close(s.closeCh)
-		// rx 由接收协程关闭：这里不能直接关，否则接收协程再发会 panic
+		// 关 rx 让上层仍阻塞在 ReadFrom 的调用同样被唤醒：
+		// closeCh 只影响 select，而有数据分支可能先选中 rx。
+		s.rxOnce.Do(func() { close(s.rx) })
+		// 必须关 raw socket：recvLoop 阻塞在 raw.Recv 上，
+		// 只标 closed 不会唤醒它（它不看标志，等的是 syscall 返回）。
+		// 不关会泄漏一个 goroutine 和两个 fd。
+		_ = s.raw.Close()
 	})
 	return nil
 }
@@ -169,34 +248,109 @@ func (s *Session) peerUDPAddr() net.Addr {
 	return net.UDPAddrFromAddrPort(s.peer)
 }
 
-// SetDeadline 实现 net.PacketConn。quic-go 用它做 idle timeout。
-func (s *Session) SetDeadline(t time.Time) error      { return nil }
-func (s *Session) SetReadDeadline(t time.Time) error  { return nil }
+// RemoteAddr 返回对端地址。quic.Transport 的 Dial 需要它作为目的地址。
+func (s *Session) RemoteAddr() net.Addr {
+	return net.UDPAddrFromAddrPort(s.peer)
+}
+
+// SetDeadline 实现 net.PacketConn。quic-go 用它做握手与 idle 超时。
+func (s *Session) SetDeadline(t time.Time) error {
+	if err := s.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return s.SetWriteDeadline(t)
+}
+
+// SetReadDeadline 设置读超时。零值表示不超时。
+func (s *Session) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		s.readDeadline.Store(0)
+		return nil
+	}
+	s.readDeadline.Store(uint64(t.UnixNano()))
+	return nil
+}
+
+// SetWriteDeadline 设置写超时。
+//
+// 写方向不需要真实现：底层 sendto 在 FIFO/raw socket 上是非阻塞语义的
+// 尽力投递（队列满返回 ENOBUFS），不会无限阻塞。这里只接受值不做事,
+// 避免 net.PacketConn 调用方因返回错误而中断。
 func (s *Session) SetWriteDeadline(t time.Time) error { return nil }
+
+// rxQueueDepth 是接收队列的深度（单位：包）。
+//
+// **这个值必须覆盖 QUIC 连接级接收窗口上限**，否则一定丢包。推导：
+//
+//	队列容量 = rxQueueDepth × ~1340 字节
+//	quic-go 默认 MaxConnectionReceiveWindow = 15MB
+//	队列容量 < 窗口上限 → 窗口允许的在途数据能填满队列 → 阻塞 →
+//	recvLoop 停读 raw socket → 内核缓冲（8MB）满 → 内核丢包
+//
+// 而 FakeTCP 层**本身没有重传机制**（它只是外观像 TCP），
+// 丢一个包就是永久丢；QUIC 靠 PTO 重传，重传又可能继续被丢，
+// 形成「发→丢→重传→再丢」死循环，最终服务端报
+// 「背压等待超过 30 秒，放弃该流」。
+//
+// 实测演进：
+//
+//	256 包（0.3MB）→ 单流 20MB 勉强，40MB 失败
+//	8192 包（10.7MB）→ 单流 40MB 成功，2 流 16MB 成功，4 流 40MB 失败
+//	16384 包（21.9MB）→ 覆盖 15MB 连接窗口，4 流稳定
+//
+// 内存代价：16384 × 1500B ≈ 24MB 上限，且只在真有流量时才占满
+// （切片从 sync.Pool 取，空闲时会被 GC 回收）。
+const rxQueueDepth = 16384
 
 // deliver 由接收协程调用：把解密后的数据报投进 rx。
 //
-// 通道满就丢：这是 UDP 语义，QUIC 自己会重传关键帧。
-// 若改成阻塞，接收协程会被上层拖死，整条连接的所有流一起卡住。
+// **必须阻塞，不能丢包。**这一点与普通 UDP 代理相反，原因是：
+//
+//	我们跑在「可靠」的伪造 TCP 之上，但 QUIC 认为下层是 UDP。
+//	如果在这里静默丢包，quic-go 会以为包已投递成功——它既不会发 ACK，
+//	也不会触发重传；而服务端的 QUIC 只能靠重传定时器盲猜，
+//	重传的包进来又可能继续被丢，形成「发包→丢弃→重传→再丢」的死循环。
+//	实测现象：单流 40MB 正常，但 2 流共 16MB 时服务端报
+//	「背压等待超过 30 秒，放弃该流」——因为它一直在等客户端消费。
+//
+// 阻塞的代价是 recvLoop 会暂停读 raw socket，内核缓冲（8MB）填满后
+// 由内核丢包。那比我们主动丢好：内核丢的是**整个加密 TCP 段**，
+// 服务端的伪造 TCP/QUIC 两侧都会感知到并重传；而我们主动丢的是
+// 一个已经解密、QUIC 已认定送达的数据报，永久丢失。
 func (s *Session) deliver(payload []byte) {
-	// 必须拷贝：payload 指向接收缓冲，下一轮会被覆盖
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
+	// 必须拷贝：payload 指向接收缓冲，下一轮会被覆盖。
+	// 从池里取而不是每次 make：高吞吐下每包一次分配会带来明显 GC 压力。
+	buf := bufPool.Get().(*[]byte)
+	if cap(*buf) < len(payload) {
+		*buf = make([]byte, len(payload))
+	} else {
+		*buf = (*buf)[:len(payload)]
+	}
+	copy(*buf, payload)
 	select {
-	case s.rx <- buf:
-	default:
-		// 队列满：丢弃并记一次（UDP 语义，与 hysteria2 一致）
+	case s.rx <- *buf:
+	case <-s.closeCh:
+		// 会话已关闭：归还缓冲后退出，不阻塞
+		bufPool.Put(buf)
 	}
 }
 
-// closeRx 关闭接收通道（只允许接收协程调用一次）。
+// bufPool 复用接收缓冲。
+//
+// 尺寸按常见 QUIC 数据报取整，避免频繁扩容；超出时 deliver 会重新分配
+// 一块更大的（并归还旧块）。
+var bufPool = sync.Pool{New: func() any {
+	b := make([]byte, 1500)
+	return &b
+}}
+
+// closeRx 标记会话结束并唤醒阻塞的读取方（接收协程退出时调用）。
+//
+// 与 Close 共用 rxOnce，保证 rx 只被关一次。
 func (s *Session) closeRx() {
-	s.once.Do(func() {
-		// 只有接收协程会走到这里时 Close 还没执行过
-		s.closed.Store(true)
-		close(s.closeCh)
-		close(s.rx)
-	})
+	s.closed.Store(true)
+	s.once.Do(func() { close(s.closeCh) })
+	s.rxOnce.Do(func() { close(s.rx) })
 }
 
 // ---- 客户端 ----
@@ -244,7 +398,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		ipid:       RandomIPID(mark),
 		mark:       mark,
 		clock:      NewTcpClock(),
-		rx:         make(chan []byte, 256),
+		rx:         make(chan []byte, rxQueueDepth),
 		closeCh:    make(chan struct{}),
 		lastAck:    time.Now(),
 	}
