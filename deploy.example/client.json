@@ -1,0 +1,59 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+
+  "inbounds": [
+    {
+      // 入口全部用 sing-box 自带的：mixed 同时支持 SOCKS5 与 HTTP。
+      // 想全局代理就把这里换成 "tun"，想透明代理换成 "tproxy" / "redirect"，
+      // flowtls 侧不需要改任何配置。
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080,
+      "users": [
+        { "username": "admin", "password": "CHANGE_ME_LOCAL_PASSWORD" }
+      ]
+    }
+  ],
+
+  "outbounds": [
+    {
+      "type": "flowtls",
+      "tag": "flowtls-out",
+
+      "server": "203.0.113.10",
+      "server_port": 8443,
+
+      // 必须与服务端一致
+      "password": "CHANGE_ME_STRONG_PASSWORD",
+
+      // 固定源端口：客户端 iptables 靠它精确拦截内核 RST。
+      "source_port": 44300,
+
+      // 与服务端 ip_id_mark 一致（0xF107 = 61687）
+      "ip_id_mark": 61687,
+
+      // 只影响伪 ClientHello 的外观，不参与任何校验
+      "sni": "your.domain",
+
+      // 标准三次握手默认开启。**不要关**：
+      // 严格 NAT / 状态防火墙只放行握手完成的流量，关掉会直接被丢。
+      // 仅在客户端有公网 IP 且链路无状态检查时可设为 true 省一个 RTT。
+      "disable_handshake": false
+    },
+
+    { "type": "direct", "tag": "direct" }
+  ],
+
+  "route": {
+    "final": "flowtls-out",
+
+    // 私有网段直连，避免把内网流量塞进隧道
+    "rules": [
+      { "ip_is_private": true, "outbound": "direct" }
+    ]
+  }
+}

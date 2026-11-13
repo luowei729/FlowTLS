@@ -407,5 +407,43 @@ ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
    剩余工作只是把它接进 GitHub Actions（需要 runner 具备 CAP_NET_RAW）。
 4. **配置迁移文档**
    Rust 的 YAML 与 sing-box 的 JSON 字段对照表（`docs/MIGRATION.md`）。
-5. **冻结 Rust**
-   等 P5 的 1~3 稳定后，Rust 代码只作为参考实现保留，不再加特性。
+5. ~~**冻结 Rust**~~ —— ✅ 2026-11-13 已完成
+   Rust 源码归档到 `legacy-rust` 分支 + `rust-frozen-2026-11-13` 标签，
+   主分支只维护 Go；黄金向量已入库（`flowtls/testdata/`），
+   兼容性门禁不再依赖 Rust 工具链。详见 `docs/EVOLUTION.md`。
+
+---
+
+## 2026-11-13 13:45（北京时间）更新：Rust 冻结完成
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| Rust 归档到 `legacy-rust` 分支 + 标签 | ✅ |
+| 主分支删除 `src/` / `Cargo.*` / Rust 时代脚本 / YAML 示例 | ✅ |
+| 黄金向量入库 `flowtls/testdata/`（120B 记录 + authID） | ✅ |
+| 互通门禁改造成「纯 Go 消费冻结向量」，不再需要 cargo | ✅ |
+| `docs/EVOLUTION.md`（演进史 + 怎么查历史） | ✅ |
+| `docs/MIGRATION.md`（YAML→JSON 逐字段对照） | ✅ |
+| `deploy.example/*.json`（`sing-box check` 已通过） | ✅ |
+| `Makefile` 新增 `test` / `interop` / `e2e` | ✅ |
+| `docs/e2e_matrix.sh` Rust 单元格改为可选（`RUST_FLOWTLS`） | ✅ |
+
+### 剩余待办（P5，按优先级）
+
+1. **`iptables_mode: auto` 接线**（最高优先）
+   现在只有 `none` / `print` 生效。需要把 Rust `src/rules.rs` 的规则文本
+   搬到 Go，并在 `Start` 成功后写入、`Close` 时撤销。
+   规则本体可以从 `legacy-rust:src/rules.rs` 直接对照。
+2. **同端口真证书网站**
+   两个方案，选一个：
+   a. inbound 内嵌一个最小 HTTPS 服务（复用 `web/index.html` 与真证书）；
+   b. 文档明确要求另起 nginx/caddy，并提供现成配置片段。
+3. **CI**
+   把 `make test` + `make interop` 接进 GitHub Actions（不需要特权，容易）；
+   `e2e_matrix.sh` 需要 `CAP_NET_RAW`，可以只跑在自托管 runner 上。
+4. **跨境链路重测**
+   README 的实测数据来自 Rust 版。协议相同，但 Go 的 quic-go 参数
+   （InitialPacketSize / 流窗口 / 自适应策略）需要在自己的链路上重新跑一遍
+   `docs/bench.sh`，把真实数字补上。

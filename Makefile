@@ -65,6 +65,21 @@ verify: build
 check: build
 	@./$(BIN) check -c $(CONFIG)
 
+# 单测（含竞态检测）。Rust 参考实现已冻结，主分支只跑 Go。
+.PHONY: test
+test:
+	cd flowtls && go test -race ./...
+
+# 冻结向量门禁：验证 wire format 没有漂移，不需要 root、不需要 Rust
+.PHONY: interop
+interop:
+	bash docs/interop_check.sh
+
+# 真链路矩阵（需要 root）。未设 RUST_FLOWTLS 时只跑 Go↔Go
+.PHONY: e2e
+e2e: build
+	bash docs/e2e_matrix.sh
+
 # 同步上游：pull 后预期只有 include/registry.go 的 2 行冲突
 .PHONY: upstream-pull
 upstream-pull:

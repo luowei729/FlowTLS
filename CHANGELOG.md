@@ -1,5 +1,81 @@
 # CHANGELOG
 
+## 2026-11-13 13:45 (北京时间)
+
+### 冻结 Rust：主分支转为 Go 单实现
+
+**归档**
+
+| 引用 | 内容 |
+|---|---|
+| 分支 `legacy-rust` | Rust 源码 + `Cargo.toml`/`Cargo.lock` + Rust 时代测试脚本 |
+| 标签 `rust-frozen-2026-11-13` | 同一提交的永久锚点（带说明） |
+
+**删除（主分支）**
+
+| 路径 | 原因 |
+|---|---|
+| `src/`（22 个 .rs 文件） | 实现已由 `flowtls/` Go 模块取代 |
+| `Cargo.toml` / `Cargo.lock` | 同上 |
+| `docs/test_udp_recover.py` / `docs/test_udp_stale.py` | 断言的是 Rust 实现内部的重连语义，Go 侧无对应状态机 |
+| `deploy.example/*.yaml` | 换成 sing-box JSON 示例 |
+| 本地 `target/` `test/` `ssl/` | 构建产物与 Rust 联调夹具 |
+
+**新增**
+
+| 文件 | 内容 |
+|---|---|
+| `flowtls/testdata/wire_v2_rust.bin` | 冻结前用 Rust 导出的黄金向量（120 字节） |
+| `flowtls/testdata/wire_v2_rust_authid.txt` | 同密码派生的 authID（hex） |
+| `docs/EVOLUTION.md` | 为什么从 Rust 换到 Go、冻结点在哪、怎么查历史 |
+| `docs/MIGRATION.md` | Rust YAML → sing-box JSON 逐字段对照 |
+| `deploy.example/server.json` / `client.json` | sing-box 配置示例（`check` 已通过） |
+| `Makefile` 新增 `test` / `interop` / `e2e` | 单测、冻结向量门禁、真链路矩阵 |
+
+**改写**
+
+| 文件 | 变化 |
+|---|---|
+| `flowtls/interop_test.go` | 从「读 /tmp 临时向量、缺失即跳过」改为「读入库向量、缺失即失败」——Rust 删了，门禁反而变硬 |
+| `docs/interop_check.sh` | 不再调用 cargo，纯 Go 消费冻结向量；并修掉 `pipefail`+`grep -q` 的假失败 |
+| `docs/e2e_matrix.sh` | Rust 单元格改为**可选**：设 `RUST_FLOWTLS` 才跑，否则明确报告跳过；Rust 服务端证书缺失时自动生成 |
+| `README.md` / `AGENTS.md` | 全面切到 Go/sing-box 口径，加「实现状态」与演进指引 |
+| `.gitignore` | 移除 `/target/`、`/test/` |
+
+**关键设计：删代码不能删基线**
+
+Rust 源码删了，但它产出的**字节**留在 `testdata/`。
+`TestInteropRustToGo` 现在钉的是绝对字节：authID 逐字节相同、两条记录必须能解出
+`first-datagram` / `second-datagram`。任何改动 HKDF 参数、AAD 组成、nonce 布局
+或记录头格式的行为都会立刻变红——不需要 Rust 工具链，不需要 root。
+
+**验证**
+
+| 项 | 结果 |
+|---|---|
+| `make build` / `make verify` | PASS |
+| `make test`（`go test -race`） | PASS |
+| `make interop`（冻结向量门禁） | PASS |
+| `bash docs/e2e_matrix.sh`（Go↔Go，含 3 格跳过提示） | 3 通过 / 0 失败 / 3 跳过 |
+| `sing-box check -c deploy.example/*.json` | PASS（非 root） |
+| `GOOS=windows` / `GOOS=darwin` 交叉编译 | PASS |
+
+**怎么查 Rust 历史**
+
+```bash
+git switch legacy-rust                     # 切过去看
+git worktree add /tmp/flowtls-rust legacy-rust   # 或并行检出
+cd /tmp/flowtls-rust && cargo test         # 25 个单测
+```
+
+含 Rust 的四向互通矩阵：
+
+```bash
+git worktree add /tmp/flowtls-rust legacy-rust
+(cd /tmp/flowtls-rust && cargo build)
+RUST_FLOWTLS=/tmp/flowtls-rust/target/debug/flowtls bash docs/e2e_matrix.sh
+```
+
 ## 2026-11-13 13:30 (北京时间)
 
 ### Go P4 完成：服务端（共享 raw socket 的 Listener + sing-box inbound）+ 四向互通矩阵全绿

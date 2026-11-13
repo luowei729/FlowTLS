@@ -1,0 +1,55 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true,
+    "output": "/var/log/flowtls-server.log"
+  },
+
+  "inbounds": [
+    {
+      "type": "flowtls",
+      "tag": "flowtls-in",
+
+      // flowtls 不 bind 内核端口：这两个字段只用于计算会话四元组
+      // 和生成 iptables 规则。同端口的真证书网站要另起进程。
+      "listen": "0.0.0.0",
+      "listen_port": 8443,
+
+      // 代理密码：外层 AEAD 的密钥来源（HKDF-SHA256）。请换成强密码。
+      // 客户端必须完全一致。
+      "password": "CHANGE_ME_STRONG_PASSWORD",
+
+      // 多用户（可选）。结构与 sing-box 的 hysteria2 / anytls 一致：
+      //   - name 只用于日志，可留空；
+      //   - password 才是凭证，同时是 AEAD 密钥来源。
+      // 线上不会传 name，也不会传 password 本身，只传 password 派生出的
+      // 16 字节不透明 authID，服务端用它查表选密钥（O(1)，不逐个试解）。
+      // 两个用户用同一个 password 会让 authID 冲突、后者覆盖前者。
+      "users": [
+        // { "name": "alice", "password": "CHANGE_ME_ALICE_STRONG_PASSWORD" },
+        // { "name": "bob",   "password": "CHANGE_ME_BOB_STRONG_PASSWORD" }
+      ],
+
+      // 云主机在 NAT 后面时路由探测只能拿到内网地址，
+      // 必须显式填写对外的公网 IP，否则客户端会丢弃回包。
+      "local_ip": "203.0.113.10",
+
+      // 伪包识别标记：IP ID 高字节。每个部署应不同。
+      // Rust 版的 0xF107 在这里写成十进制 61687。
+      "ip_id_mark": 61687,
+
+      // raw 表规则落地方式：
+      //   none  — 不生成也不执行（默认；规则自己维护）
+      //   print — 只把规则打印到日志（推荐先这样跑一次，确认规则合理）
+      //   auto  — 启动时执行（尚未接线，见 PROJECT_PLAN）
+      "iptables_mode": "print",
+
+      // UDP 会话空闲回收（秒）。UDP 走 QUIC DATAGRAM，不重传、不分片。
+      "udp_session_timeout": 120
+    }
+  ],
+
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}

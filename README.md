@@ -3,6 +3,11 @@
 > 外观是 HTTPS 的 TCP 连接，内核是 QUIC。
 > 面向跨境高丢包链路的 TCP 伪装代理。
 
+**实现状态**：主分支只维护 Go 实现，形态是 **sing-box 的一个独立协议库**
+（与 hysteria2 / anytls 平级），发行版为 `sing-box 1.14.4-rev.N`。
+最早验证协议的 Rust 实现已冻结在 `legacy-rust` 分支，仅作参考实现与历史记录
+（详见 [`docs/EVOLUTION.md`](docs/EVOLUTION.md)）。
+
 ## 它解决什么问题
 
 | 场景 | 传统方案的问题 | FlowTLS 的做法 |
@@ -22,7 +27,7 @@
 ┌──────▼──────────────────────────────────────────────────┴──────┐
 │                          FlowTLS 客户端                        │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  QUIC 状态机（quinn-proto）：多流复用 / 丢包恢复 / BBR    │  │
+│  │  QUIC 状态机（quic-go）：多流复用 / 丢包恢复 / BBR      │  │
 │  └──────────────────────────┬───────────────────────────────┘  │
 │  ┌──────────────────────────▼───────────────────────────────┐  │
 │  │  伪装层：HKDF 派生密钥 + ChaCha20-Poly1305                │  │
@@ -93,8 +98,12 @@ TCP 192.0.2.10:44311 → 198.51.100.4:8443  [PSH, ACK]
 
 ### 4. 抗主动探测
 
-服务端在**同一端口**用内核 TCP 运行真实网站（Rustls + 真证书 + 静态页面）。
+服务端在**同一端口**运行一个真实的 HTTPS 网站（真证书 + 真页面）。
 扫描器访问得到正常的 HTTPS 响应；只有外层 AEAD 能成功解密的包才会进入代理逻辑，失败静默丢弃。
+
+Rust 版把这个网站做在协议进程内（Rustls 内嵌）；
+Go 版里 flowtls inbound 只做隧道，需要另起一个进程监听同端口
+（nginx / caddy / 任意 HTTPS 服务，页面素材可用 `web/index.html`）。
 
 ### 5. 自适应，零配置
 
@@ -106,7 +115,7 @@ TCP 192.0.2.10:44311 → 198.51.100.4:8443  [PSH, ACK]
 范围        →  1.5MB ~ 8MB
 ```
 
-同时受 quinn 接收组装器的硬限制约束（单流最多 1024 个乱序空洞），
+同时受 quic-go 接收组装器的硬限制约束（单流最多 1024 个乱序空洞），
 按 `窗口 ÷ 包大小 × 丢包率 < 1024` 反算安全上限，避免高丢包时直接断连。
 
 ### 6. 断线自愈
@@ -142,86 +151,115 @@ UDP 走 QUIC 的 **DATAGRAM 扩展（RFC 9221）**，入口是 SOCKS5 的 `UDP A
 
 ## 快速开始
 
-### 编译
+### 构建
 
 ```bash
-cargo build --release
-# 静态链接（推荐，方便部署到各种发行版）
-cargo build --release --target x86_64-unknown-linux-musl
+# 唯一构建入口：从仓库根目录构建 rev 发行版
+make build
+
+# 产物
+#   dist/sing-box-1.14.4-rev.1-linux-amd64
+```
+
+版本号由根目录 `VERSION` 文件驱动，构建期用 ldflags 注入，
+**不改上游任何源码**。二进制名保持 `sing-box`，只靠版本号区分官方版。
+
+```bash
+make verify                  # 验收：版本号带 rev、tags 带 with_flowtls
+make build GOARCH=arm64      # 交叉编译
+make release-musl            # 静态 musl（软路由/NAS）
+make upstream-pull TO=v1.15.0  # 同步上游 sing-box
 ```
 
 ### 服务端
 
-```yaml
-# server.yaml
-listen: ":8443"
-password: "换成你自己的密码"
-tls:
-  cert: "/path/to/fullchain.pem"
-  key: "/path/to/privkey.pem"
-site:
-  dir: ""                # 留空使用内置页面，也可指向静态站点目录
-faketcp:
-  ip_id_magic: 0xF107
-  handshake: symbolic
-  # 机器在 NAT 后面时显式指定公网 IP（否则路由探测会拿到内网地址）
-  # local_ip: "1.2.3.4"
-net:
-  mode: "auto"           # 自动写入 iptables 规则
+```json
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "flowtls",
+      "tag": "flowtls-in",
+      "listen": "0.0.0.0",
+      "listen_port": 8443,
+      "password": "换成你自己的密码",
+      "local_ip": "1.2.3.4",
+      "ip_id_mark": 61687,
+      "iptables_mode": "print"
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }]
+}
 ```
 
 ```bash
-sudo ./flowtls server -c server.yaml
+# 先做配置校验（不需要 root，这是硬要求）
+./dist/sing-box-1.14.4-rev.1-linux-amd64 check -c server.json
+
+# 再启动（需要 root 或 CAP_NET_RAW）
+sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
 ```
 
 > 需要 root（raw socket + iptables），且机器必须**直接持有公网 IP**。
+> `iptables_mode` 当前只支持 `none` / `print`（`auto` 尚未接线，见项目计划）。
 
 ### 客户端
 
-```yaml
-# client.yaml
-server: "1.2.3.4:8443"
-password: "与服务端一致"
-sni: "your.domain"
-faketcp:
-  source_port: 44300     # 固定源端口，用于精确拦截内核 RST
-  handshake: symbolic
-  ip_id_magic: 0xF107
-socks5:
-  listen: "0.0.0.0:1080"
-  username: "admin"
-  password: "abcd1234"
-http:
-  listen: "0.0.0.0:8080"
-  username: "admin"
-  password: "abcd1234"
-udp:
-  enabled: true           # SOCKS5 UDP ASSOCIATE（DNS / 语音 / 游戏 / HTTP3）
-  max_sessions: 256
-  timeout_secs: 120
-# HTTPS 入口默认开启（127.0.0.1:8443），证书默认自签，鉴权沿用 SOCKS5。
-# 需要局域网访问或自定义证书时再显式配置：
-# https:
-#   listen: "0.0.0.0:8443"
-#   username: "admin"
-#   password: "abcd1234"
-#   cert: "/path/to/fullchain.pem"
-#   key: "/path/to/privkey.pem"
-net:
-  mode: "auto"
+```json
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080,
+      "users": [{ "username": "admin", "password": "abcd1234" }]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "flowtls",
+      "tag": "flowtls-out",
+      "server": "1.2.3.4",
+      "server_port": 8443,
+      "password": "与服务端一致",
+      "source_port": 44300,
+      "ip_id_mark": 61687,
+      "sni": "your.domain"
+    }
+  ]
+}
 ```
 
 ```bash
-sudo ./flowtls client -c client.yaml
-# 之后三种入口都可用：
-#   SOCKS5  curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
-#   HTTP    curl -x http://admin:abcd1234@127.0.0.1:8080 https://www.google.com
-#   HTTPS   curl -x https://admin:abcd1234@127.0.0.1:8443 --proxy-insecure https://www.google.com
+sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json
+
+# SOCKS5 / HTTP 共用 mixed 入口
+curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
+curl -x http://admin:abcd1234@127.0.0.1:1080 https://www.google.com
+```
+
+`mixed` 是 sing-box 自带的入口，还能直接换成 `tun`（全局代理）、
+`redirect`、`tproxy` 等，不需要改 flowtls 任何代码。
+
+### 从 Rust 版迁移
+
+配置格式从 YAML 变成 JSON，字段有改名。逐字段对照表见
+[`docs/MIGRATION.md`](docs/MIGRATION.md)。
+
+### 自检
+
+```bash
+bash docs/interop_check.sh    # 冻结向量门禁（不需要 root，不需要 Rust）
+bash docs/e2e_matrix.sh       # 真链路矩阵（需要 root）
 ```
 
 ## 实测数据
 
 测试环境：100M 上下行的跨境链路（RTT 约 70ms，链路丢包 20%~44%）。
+数据来自 Rust 参考实现（协议相同，wire format 未变）；Go 侧在回环链路上的
+吞吐/时延与它一致，跨境链路尚未重测。
 
 | 项目 | 结果 |
 |---|---|
@@ -238,55 +276,71 @@ sudo ./flowtls client -c client.yaml
    云主机只给内网地址 + NAT 映射时，网关会对 TCP 做状态检查，
    FakeTCP 的裸 SYN 会被丢弃（实测 Oracle Cloud 上完全不可用）。
 
-2. **单流窗口受 quinn 空洞上限约束**
-   quinn-proto 的接收组装器硬编码 `MAX_CHUNKS = 1024`，
-   高丢包时窗口过大会以 `too many gaps in stream buffer` 断连。
-   本项目用自适应窗口规避，但这也意味着极端丢包下窗口会被压到 1.5MB。
-
-3. **只支持 IPv4**
+2. **只支持 IPv4**
    FakeTCP 层目前只处理 IPv4 报文。
 
-4. **UDP 不做重传也不做分片**
+3. **UDP 不做重传也不做分片**
    这是刻意选择（UDP 语义 + 对齐 hysteria2）。单包上限约 1200 字节，
    更大的 UDP 报文会被丢弃；5~10% 的包会在跨境链路上丢失，
    依赖应用层自己重试。
 
-5. **需要 root 权限**
-   raw socket、AF_PACKET、iptables 都需要 root。
+4. **需要 root 权限**
+   raw socket、AF_PACKET 需要 root 或 `CAP_NET_RAW`；iptables 规则同理。
+
+5. **默认避开 443 端口**
+   国内出口设备对 443 的伪造 TCP 检查更严，建议 8443 / 9443。
+
+6. **伪装网站需要另起进程**
+   Rust 版把「同端口真证书网站」做在协议进程里；sing-box 的 flowtls inbound
+   只做隧道，防主动探测要另外跑一个监听同端口的 HTTPS 服务
+   （页面素材可用 [`web/index.html`](web/index.html)）。
+
+7. **iptables 规则尚未自动落地**
+   `iptables_mode` 只有 `none` / `print` 生效，`auto` 还没接线，
+   部署时需按打印出的规则手工维护。
 
 ## 项目结构
 
 ```
-src/
-├── main.rs            # 入口与日志初始化
-├── cli.rs             # 命令行（server / client / check / rules）
-├── check.rs           # 配置校验：两端一致性、证书真实解析、规则
-├── config.rs          # 配置结构与默认值
-├── rules.rs           # iptables 规则管理
-├── faketcp/
-│   ├── socket.rs      # AF_PACKET 收发 + sendmmsg 批量发送
-│   ├── packet.rs      # IP/TCP 头构造、校验和、TS/wscale 选项
-│   └── codec.rs       # 伪 TLS 记录/ClientHello、HKDF + ChaCha20-Poly1305
+flowtls/                     ← 独立 Go 模块 github.com/luowei729/flowtls
+├── packet.go                # IP/TCP 头构造与解析、校验和、TS/wscale
+├── codec.go                 # 伪 TLS 记录 + AEAD + 多用户 authID
+├── addr.go                  # 地址帧编解码（流首帧 / DATAGRAM 内嵌）
+├── udp.go                   # UDP 会话帧编解码
+├── socket_linux.go          # AF_PACKET 收包 / IPPROTO_RAW 发包 / ARP
+├── session.go               # 单条会话（net.PacketConn 语义）
+├── listener.go              # 服务端：共享 raw socket + 四元组分发 + SYN 状态机
 ├── quic/
-│   ├── config.rs      # quinn-proto 传输参数
-│   └── capped.rs      # 带自适应窗口上限的 BBR 控制器
-├── proxy/
-│   ├── socks5.rs      # SOCKS5 入口（CONNECT + UDP ASSOCIATE）
-│   ├── udp.rs         # UDP 会话帧编解码（QUIC DATAGRAM 载荷）
-│   └── http.rs        # HTTP / HTTPS 入口
-├── site/mod.rs        # 同端口伪装网站（内核 TCP + 真证书）
-├── server.rs          # 服务端主流程
-└── client.rs          # 客户端主流程（含自动重连）
+│   ├── client.go            # quic-go 客户端（多流复用 + UDP DATAGRAM）
+│   └── server.go            # quic-go 服务端
+├── cmd/ftdial/              # 联调：TCP（-streams N）
+├── cmd/ftudp/               # 联调：UDP（-sessions N -rounds N）
+├── cmd/ftserver/            # 联调：服务端
+└── testdata/                # wire format v2 冻结向量（兼容性基线）
 
-docs/
-└── test_udp.py        # UDP 端到端测试（DNS / session 复用 / 连接关闭）
+sing-box/                    ← git subtree，上游源码 + 最小补丁
+├── protocol/flowtls/
+│   ├── outbound.go          # 适配 adapter.Outbound
+│   └── inbound.go           # 适配 adapter.Inbound
+├── option/flowtls.go        # 配置结构
+├── constant/flowtls.go      # 类型常量
+└── include/flowtls.go       # 编译期开关（with_flowtls tag）
+
+docs/                        # 设计、迁移、演进史、门禁脚本
+web/index.html               # 伪装网站页面素材
+Makefile + VERSION           # rev 发行版构建
 ```
+
+Rust 参考实现的源码不在主分支，见 `legacy-rust` 分支。
 
 ## 文档
 
 - [`CHANGELOG.md`](CHANGELOG.md) — 每个版本的改动与实测数据
 - [`DEVTIPS.md`](DEVTIPS.md) — 踩过的坑与调试方法（强烈建议先读）
-- [`docs/DESIGN.md`](docs/DESIGN.md) — 协议与架构设计细节
+- [`docs/DESIGN.md`](docs/DESIGN.md) — 协议与架构设计细节（wire format 权威文档）
+- [`docs/EVOLUTION.md`](docs/EVOLUTION.md) — 为什么从 Rust 换到 Go、Rust 冻结在哪
+- [`docs/MIGRATION.md`](docs/MIGRATION.md) — Rust YAML → sing-box JSON 字段对照
+- [`docs/SINGBOX_INTEGRATION.md`](docs/SINGBOX_INTEGRATION.md) — 接入 sing-box 的工程细节
 - [`PROJECT_PLAN.md`](PROJECT_PLAN.md) — 里程碑与后续计划
 
 ## 免责声明

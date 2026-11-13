@@ -1,5 +1,11 @@
 # DEVTIPS — 踩坑与调试手册
 
+> **阅读提示**：第 1~68 条记录的是 **Rust 参考实现**时期的坑（quinn-proto、
+> Rustls、tokio、rusqlite 等），对应源码已冻结在 `legacy-rust` 分支；
+> 第 69 条起是 **Go 实现**（quic-go / sing-box 适配层）。
+> 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
+> 演进的来龙去脉见 `docs/EVOLUTION.md`。
+
 ## 1. quinn-proto 0.11.19 的 poll_transmit 会追加写 buf
 
 `Connection::poll_transmit(now, max_datagrams, &mut buf)` **不会清空** buf。
@@ -1764,3 +1770,41 @@ loopback 上根本没有——表现是 `handshake timeout` 而服务端毫无�
 会对每个伪造包回 RST（抓包能看到 `Flags [R]`）。
 这些 RST 不影响已建立的会话，但会让第一条 SYN 的路径更曲折——
 正式部署请让 iptables 规则生效（`net.mode: auto`）。
+
+## 72. 删掉一种语言的实现前，先把它的「字节」留下来
+
+Rust 冻结时最容易犯的错是：源码一删，兼容性基线也跟着没了。
+之后 Go 侧改 HKDF 参数或 AAD 组成，测试全绿，但再也无法和老版本互通。
+
+正确顺序（本次执行的就是这个）：
+
+1. 用**待删实现**的单测导出黄金向量到 `testdata/`：
+   - `wire_v2_rust.bin`（两条记录，120 字节）
+   - `wire_v2_rust_authid.txt`（authID，32 字节 hex）
+2. 把互通测试从「读 `/tmp` 的临时文件、缺失就跳过」改成「读入库向量、缺失即失败」。
+3. 确认 `go test` 在没有 Rust 的环境里也能跑这道门禁。
+4. **然后**才 `git rm` 源码。
+
+判定标准很简单：删完之后，`bash docs/interop_check.sh` 必须是 PASS，
+而不是「跳过」。
+
+## 73. `set -o pipefail` + `grep -q` 会把成功判成失败
+
+门禁脚本里这个写法是坑：
+
+```bash
+# ❌ 偶发假失败
+if ! go test ./... | grep -q '^ok'; then echo FAIL; exit 1; fi
+```
+
+`grep -q` 命中第一行就退出，管道读端关闭 → `go test` 写入时收到 `EPIPE`
+（退出码 141）→ `pipefail` 让整条管道返回非零 → 判定失败。
+输出量小的时候靠内核缓冲可能侥幸不触发，所以表现为「有时红有时绿」。
+
+```bash
+# ✅ 先落变量，再判断
+if ! out=$(go test ./... 2>&1); then printf '%s\n' "$out"; exit 1; fi
+printf '%s\n' "$out" | grep -q '^ok' || { echo FAIL; exit 1; }
+```
+
+同一原则适用于任何「长命令 | grep -q」的检查。

@@ -1,13 +1,9 @@
-# 构建产物
-/target/
-
 # sing-box rev 发行版构建产物
 /dist/
 
 # Go 构建缓存与工作区文件（不入库）
 go.work
 go.work.sum
-
 
 # 证书与私钥：绝不入库
 /ssl/
@@ -17,7 +13,6 @@ go.work.sum
 # 部署与凭据（含真实密码/服务器地址，本地维护）
 DEPLOY_CREDENTIALS.md
 /deploy/
-/test/
 
 # IDE 与工具缓存
 .qoder-cn/

@@ -245,6 +245,22 @@ if [[ -z "$RUST_FLOWTLS" ]]; then
 	skip "Rust→Go（未设置 RUST_FLOWTLS）"
 	skip "Go→Rust（未设置 RUST_FLOWTLS）"
 else
+	# Rust 服务端需要真证书（它自己监听内核 TCP 跑伪装网站）。
+	# 主分支已不再携带 ssl/，这里缺了就现生成一张自签的，仅供联调。
+	RUST_CERT="$PWD/ssl/fullchain.pem"
+	RUST_KEY="$PWD/ssl/privkey.pem"
+	if [[ ! -f "$RUST_CERT" || ! -f "$RUST_KEY" ]]; then
+		mkdir -p "$PWD/ssl"
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+			-nodes -days 2 -subj "/CN=example.com" \
+			-keyout "$RUST_KEY" -out "$RUST_CERT" >/dev/null 2>&1 ||
+			{
+				log "生成联调证书失败"
+				exit 1
+			}
+		log "已生成联调自签证书：$RUST_CERT"
+	fi
+
 	# ---------- 单元格 1：Rust → Rust ----------
 	log ""
 	log "==> Rust 客户端 → Rust 服务端"

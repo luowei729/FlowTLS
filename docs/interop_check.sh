@@ -39,13 +39,22 @@ done
 echo "==> 2/3 用冻结向量验证 Go 实现（Rust → Go 方向）"
 (
 	cd flowtls
-	"$GO" test -run 'TestInteropRustToGo' -v ./... 2>&1 |
-		grep -E '^(=== RUN|--- (PASS|FAIL|SKIP))'
-	# SKIP 视为失败：门禁环境里向量必须存在，跳过说明检查没生效
-	if ! "$GO" test -run 'TestInteropRustToGo' ./... 2>&1 | grep -q '^ok'; then
-		echo "FAIL: TestInteropRustToGo 未通过（或向量被跳过）"
+	# 先把输出抓成变量再判断，不要用 `go test | grep -q`：
+	# grep -q 命中即退出，管道关闭会让 go test 收到 EPIPE，
+	# 配合 pipefail 会把一次成功的测试判成失败。
+	if ! out=$("$GO" test -run 'TestInteropRustToGo' -v ./... 2>&1); then
+		printf '%s\n' "$out"
+		echo "FAIL: TestInteropRustToGo 未通过（冻结向量对不上 = wire format 已漂移）"
 		exit 1
 	fi
+	# 单独确认不是 SKIP：门禁环境里向量必须存在，跳过等于没检查
+	printf '%s\n' "$out" | grep -qE '^(--- PASS|ok)' || {
+		printf '%s\n' "$out"
+		echo "FAIL: TestInteropRustToGo 没有真正执行（被跳过？）"
+		exit 1
+	}
+	printf '%s\n' "$out" | grep -E '^(=== RUN|--- (PASS|FAIL|SKIP))' || true
+	echo "    ✓ 冻结向量解密通过，authID 一致"
 )
 
 echo "==> 3/3 全量单测（含竞态检测）"
