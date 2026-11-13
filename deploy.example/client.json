@@ -48,7 +48,14 @@
       // 客户端规则的作用：屏蔽内核对伪连接回的 RST。
       // Session 走 raw socket，内核里没有对应 socket，收到 SYN-ACK 就回 RST，
       // 而 RST 会让中间设备立即拆掉 NAT 映射。
-      "iptables_mode": "print"
+      "iptables_mode": "print",
+
+      // QUIC 拥塞窗口上限（字节），默认 8MB（可省略）。
+      //
+      // 对应老 Rust 版的 net.max_cwnd。**必须与服务端填同一个值**，
+      // 否则两边自适应上限不同步，容易单侧过早降速。
+      // 小带宽跨境链路（20~50Mbps）建议 1048576（1MB）。
+      "max_cwnd": 8388608
     },
 
     { "type": "direct", "tag": "direct" }

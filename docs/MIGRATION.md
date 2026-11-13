@@ -71,9 +71,9 @@ udp:
 | `faketcp.handshake` | —— | 服务端恒为「标准三次握手」，无开关 |
 | `udp.timeout_secs` | `udp_session_timeout` | 改名，单位仍是秒 |
 | `udp.enabled` | —— | DATAGRAM 恒开（不配就是不允许，配了就有） |
-| `udp.max_sessions` | —— | 由 QUIC 流控与内存自然约束，不再单独设上限 |
+| `udp.max_sessions` | `udp_max_sessions` | 同名；默认 8192（Rust 默认 2048，Go 上调） |
 | `net.mode` | `iptables_mode` | `none`/`print`/`auto` 语义相同，但默认是 `print` |
-| `net.max_cwnd` | —— | Go 侧交给 quic-go 的 BBR，不再手工设窗口上限 |
+| `net.max_cwnd` | `max_cwnd` | 同名同默认值 8388608；两端必须填同一个值 |
 | `tls.cert` / `tls.key` | `masquerade.certificate_path` / `key_path` | 伪装网站的真证书，不是协议证书（见下） |
 | `site.dir` | `masquerade.site_dir` / `proxy_url` | 二选一；`proxy_url` 是 Rust 版没有的能力 |
 

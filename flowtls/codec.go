@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -163,7 +164,11 @@ func (c *Codec) Seal(dst, plaintext []byte) []byte {
 	bodyLen := headerLen + 12 + len(plaintext) + c.aead.Overhead()
 
 	base := len(dst)
-	dst = append(dst, make([]byte, 5+bodyLen)...)
+	// 用切片扩容而不是 make：make 会每包新分配 ~1.3KB，
+	// 9000pps 下就是每秒 12MB 的垃圾，GC 停顿会直接拖慢收包。
+	// dst 在稳定态来自复用缓冲，扩容路径只在首次发生。
+	dst = slices.Grow(dst, 5+bodyLen)
+	dst = dst[:base+5+bodyLen]
 	out := dst[base:]
 
 	out[0] = RecAppData
@@ -181,6 +186,24 @@ func (c *Codec) Seal(dst, plaintext []byte) []byte {
 	copy(out[pos:pos+12], nonce[:])
 	pos += 12
 	return c.aead.Seal(dst[:base+pos], nonce[:], plaintext, c.aadFor(first))
+}
+
+// OpenTo 与 Open 相同，但把明文写进调用方提供的 dst（通常是池缓冲）。
+//
+// 高包速率下每包一次 1.3KB 分配会让 GC 成为瓶颈（实测 9000pps 时
+// 每秒 12MB 垃圾）。dst 容量不足时 AEAD 会自行重新分配，调用方应传
+// 容量 ≥ 1500 的切片（bufPool 的默认大小）。
+func (c *Codec) OpenTo(dst, payload []byte) ([]byte, bool) {
+	if len(payload) < 12+c.aead.Overhead() {
+		return nil, false
+	}
+	nonce := payload[:12]
+	ct := payload[12:]
+	out, err := c.aead.Open(dst[:0], nonce, ct, c.aadFor(false))
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // Open 解开一条**后续** ApplicationData 记录（不含首包头）。
@@ -260,6 +283,26 @@ func ParseRecords(buf []byte) []TlsRecord {
 		buf = buf[5+l:]
 	}
 	return out
+}
+
+// ForEachRecord 是 ParseRecords 的零分配版本：逐条回调，不构造切片。
+//
+// 热路径（每包解密）必须用它：ParseRecords 对单记录包也会 append 一次，
+// 9000pps 下每秒多出 9000 个小对象，GC 压力与缓存污染都实打实。
+// 回调返回 false 可提前终止。
+func ForEachRecord(buf []byte, fn func(TlsRecord) bool) {
+	for len(buf) >= 5 {
+		typ := buf[0]
+		ver := binary.BigEndian.Uint16(buf[1:3])
+		l := int(binary.BigEndian.Uint16(buf[3:5]))
+		if len(buf) < 5+l {
+			return
+		}
+		if !fn(TlsRecord{Type: typ, Version: ver, Payload: buf[5 : 5+l]}) {
+			return
+		}
+		buf = buf[5+l:]
+	}
 }
 
 // userTable 是多用户表：authID → (显示名, 该用户编解码器)。

@@ -12,6 +12,9 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -204,7 +207,110 @@ func (m *Masquerade) handler() http.Handler {
 			_, _ = w.Write([]byte(placeholderPage))
 		})
 	}
-	return http.FileServer(http.Dir(m.opts.SiteDir))
+	return m.staticHandler()
+}
+
+// staticHandler 处理静态站点请求，行为**逐项对齐 Rust `site/mod.rs`**。
+//
+// 为什么不能用 http.FileServer：
+//
+//	FileServer 在目录没有 index.html 时返回**目录列表**。实测服务器上
+//	site_dir 只放了 100m.bin，访问 / 得到的是一个 113 字节的目录索引页——
+//	一个只有一行下载链接的「网站」比 404 更像靶子。
+//	Rust 版的做法是：找不到文件就退回内置首页，永远不会露出目录。
+//
+// Rust 的完整规则（site/mod.rs 的 serve 函数）：
+//
+//	GET/HEAD + /robots.txt   → 固定 robots 文本
+//	GET/HEAD + /favicon.ico  → 204 空响应（比 404 更像正常站点）
+//	GET/HEAD + 实体文件      → 该文件（按扩展名给 Content-Type）
+//	GET/HEAD + 其它          → site_dir/index.html，**失败则退回内置首页**
+//	其它方法                 → 405
+//	响应头带 Server: nginx 与 Cache-Control: public, max-age=300
+func (m *Masquerade) staticHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 与 Rust 一致：只允许只读方法。异常方法返回 405 而不是 200，
+		// 避免看起来像可写的业务系统。
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write([]byte("Method Not Allowed"))
+			}
+			return
+		}
+
+		path := r.URL.Path
+		switch path {
+		case "/robots.txt":
+			m.writeResponse(w, r, http.StatusOK, "text/plain; charset=utf-8",
+				[]byte("User-agent: *\nAllow: /\n"))
+			return
+		case "/favicon.ico":
+			// 204 比 404 更像正常站点（真实站点几乎都有 favicon）
+			m.writeResponse(w, r, http.StatusNoContent, "image/x-icon", nil)
+			return
+		}
+
+		// 静态文件优先：既用于带宽测试，也给运维放置真实资源的入口。
+		rel := strings.TrimPrefix(path, "/")
+		if rel != "" && !strings.Contains(rel, "..") {
+			fp := filepath.Join(m.opts.SiteDir, rel)
+			if data, err := os.ReadFile(fp); err == nil {
+				m.writeResponse(w, r, http.StatusOK, contentTypeOf(rel), data)
+				return
+			}
+		}
+
+		// 兜底：site_dir/index.html，读不到就用**编译期内置**的首页。
+		//
+		// 内置首页是 Rust 版的关键设计（`include_str!("../../web/index.html")`）：
+		// 即使 site_dir 为空、被清空、或运维忘了放文件，
+		// 访问根路径也是一个完整站点而不是目录列表。
+		page, err := os.ReadFile(filepath.Join(m.opts.SiteDir, "index.html"))
+		if err != nil {
+			page = embeddedIndexHTML
+		}
+		m.writeResponse(w, r, http.StatusOK, "text/html; charset=utf-8", page)
+	})
+}
+
+// writeResponse 写一个与 Rust 版响应头一致的响应。
+//
+// 响应头刻意模仿 nginx：Server 字段、Cache-Control 都与 Rust 版逐字一致。
+// 少了这几个头（或写成 Go 默认的空值）本身就是可枚举的指纹。
+func (m *Masquerade) writeResponse(w http.ResponseWriter, r *http.Request,
+	status int, contentType string, body []byte) {
+	h := w.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Set("Server", "nginx")
+	h.Set("Cache-Control", "public, max-age=300")
+	w.WriteHeader(status)
+	// HEAD 不能带 body（但必须带 Content-Length，上面已设）
+	if r.Method != http.MethodHead && len(body) > 0 {
+		_, _ = w.Write(body)
+	}
+}
+
+// contentTypeOf 按扩展名返回 Content-Type，取值与 Rust 版一致。
+func contentTypeOf(name string) string {
+	switch {
+	case strings.HasSuffix(name, ".bin"):
+		return "application/octet-stream"
+	case strings.HasSuffix(name, ".png"):
+		return "image/png"
+	case strings.HasSuffix(name, ".jpg"), strings.HasSuffix(name, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(name, ".css"):
+		return "text/css"
+	case strings.HasSuffix(name, ".js"):
+		return "application/javascript"
+	case strings.HasSuffix(name, ".html"):
+		return "text/html; charset=utf-8"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // Addr 返回实际监听地址。

@@ -198,6 +198,22 @@ func (o *Outbound) connect() error {
 			Handshake: !o.opts.DisableHandshake,
 		},
 		DialTimeout: 15 * time.Second,
+		// 窗口上限：0 时由 quic 包退回默认 8MB。
+		MaxCwnd: maxCwndOf(o.opts.MaxCwnd),
+		// Brutal：up_mbps > 0 时丢包不减窗，按配置带宽硬发。
+		BrutalBPS:        bpsOf(o.opts.UpMbps),
+		BrutalMultiplier: o.opts.BrutalMultiplier,
+		// 每 2 秒输出一次路径统计（对应 Rust 的「QUIC 路径统计」）。
+		// 用 Debug 级别：正常运行时它只是背景噪声，
+		// 但排查「连接活着却没速度」时它是第一现场证据。
+		OnStats: func(s ftquic.PathStats) {
+			o.logger.Debug("flowtls: QUIC 路径统计 ",
+				"cc=", s.CC,
+				" rtt=", s.RTT, " srtt=", s.SmoothedRTT,
+				" sent=", s.SentPackets, " lost=", s.LostPackets,
+				" loss%=", s.LossPct,
+				" win_cap=", humanBytes(s.WinCap))
+		},
 	})
 	if err != nil {
 		return err
@@ -220,6 +236,9 @@ func (o *Outbound) connect() error {
 			}
 		}
 	}
+	// 发送路径与源地址：与服务端同一理由，出向链路出问题时这行是第一个要看的信息
+	// （源地址被替换成网卡地址意味着配置里写的是 NAT 公网地址）。
+	o.logger.Debug("flowtls 发送路径: ", c.SendMode())
 	o.mu.Lock()
 	o.client = c
 	o.mu.Unlock()

@@ -23,14 +23,45 @@ type FlowTLSInboundOptions struct {
 	//   print — 只打印规则文本（默认，最安全）；
 	//   auto  — 启动时执行 iptables，需要额外确认。
 	IPTablesMode string `json:"iptables_mode,omitempty"`
-	// UDPSessionTimeout 是 UDP 会话空闲回收时间（秒）。
+	// UDPSessionTimeout 是 UDP 会话空闲回收时间（秒），默认 60。
+	//
+	// 注意这与 fake-TCP 会话的空闲回收是两件事：
+	// 前者是一次 SOCKS5 UDP ASSOCIATE，可能只查一次 DNS；
+	// 后者是一条 QUIC 连接，用户在线就一直有流量。
 	UDPSessionTimeout int `json:"udp_session_timeout,omitempty"`
+	// UDPMaxSessions 是每条 QUIC 连接上同时存在的 UDP 会话上限，默认 8192。
+	//
+	// 超出后淘汰最久未活动的会话。这是兜底：即使 udp_session_timeout
+	// 配得偏大，也不会无限增长。每个会话在服务端占一个出站 UDP socket，
+	// 而整机临时端口只有约 28k 个——泄漏会拖垮整台机器而不只是隧道。
+	UDPMaxSessions int `json:"udp_max_sessions,omitempty"`
 	// Masquerade 是同端口真证书网站（应对主动端口探测）。
 	//
 	// 不配时 inbound 只做隧道，端口由其它进程（nginx/caddy）负责。
 	// 配了就会****真 bind 内核 TCP 端口**：
 	// flowtls 的伪造包在 raw 表被 DROP，剩下的包才落到这个站点上。
 	Masquerade *FlowTLSMasqueradeOptions `json:"masquerade,omitempty"`
+	// MaxCwnd 是 QUIC 拥塞窗口上限（字节），默认 8MB。
+	//
+	// 对齐 Rust 版 `net.max_cwnd`：与 hysteria2 默认流窗口（8MB）一致，
+	// 按 1000Mbps × 70ms 的 BDP 留足余量。
+	// 小带宽跨境链路（实际 20~50Mbps）建议调到 1MB 左右，否则丢包会明显变多。
+	//
+	// 它同时是硬上限和自适应算子的上界：服务端会按**全部连接**的
+	// 汇总丢包率每 2 秒在此值之下浮动（>20% 缩 10%，<5% 涨 20%）。
+	MaxCwnd int64 `json:"max_cwnd,omitempty"`
+	// UpMbps 是**服务端自己的上行带宽**（Mbps），对应客户端的下行。
+	//
+	// 非 0 时启用 Brutal 拥塞控制（hy1 风格）：丢包不减窗，
+	// 按这个带宽硬发。跨境高丢包链路（随机丢包 20~50%）下，
+	// BBR 会把随机丢包当拥塞信号而反复降速，Brutal 直接无视丢包，
+	// 只靠 QUIC 重传兜底，吞吐能高数倍。
+	//
+	// **必须按真实出口带宽填**：填大了把链路打爆（丢包更多），
+	// 填小了跑不满。0（默认）表示用 BBR。
+	UpMbps int64 `json:"up_mbps,omitempty"`
+	// BrutalMultiplier 是 Brutal 的 cwnd 倍数（相对 BDP），默认 2.0（同 hy1）。
+	BrutalMultiplier float64 `json:"brutal_multiplier,omitempty"`
 }
 
 // FlowTLSMasqueradeOptions 是同端口伪装站点的配置。
@@ -103,4 +134,17 @@ type FlowTLSOutboundOptions struct {
 	DisableHandshake bool `json:"disable_handshake,omitempty"`
 	// Network 声明支持的承载网络，默认 TCP+UDP。
 	Network NetworkList `json:"network,omitempty"`
+	// MaxCwnd 是 QUIC 拥塞窗口上限（字节），默认 8MB。
+	//
+	// 对齐 Rust 版 `net.max_cwnd`。**客户端与服务端应保持一致**：
+	// 两端各算各的窗口，一边大一边小会让有效吞吐取小值。
+	MaxCwnd int64 `json:"max_cwnd,omitempty"`
+	// UpMbps 是**客户端自己的上行带宽**（Mbps）。
+	//
+	// 非 0 时启用 Brutal 拥塞控制（hy1 风格）：丢包不减窗，按这个带宽硬发。
+	// **必须按真实上行带宽填**，填大了会自己把链路打爆。
+	// 0（默认）表示用 BBR。
+	UpMbps int64 `json:"up_mbps,omitempty"`
+	// BrutalMultiplier 是 Brutal 的 cwnd 倍数（相对 BDP），默认 2.0（同 hy1）。
+	BrutalMultiplier float64 `json:"brutal_multiplier,omitempty"`
 }

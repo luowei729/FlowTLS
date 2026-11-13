@@ -15,11 +15,15 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	quicgo "github.com/sagernet/quic-go"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/pipe"
 
 	"github.com/luowei729/flowtls"
 )
@@ -37,22 +41,37 @@ const ALPN = "flowtls"
 func DefaultQUICConfig() *quicgo.Config {
 	return &quicgo.Config{
 		EnableDatagrams: true,
-		// 伪造 TCP 路径没有真实的 ICMP 反馈，PMTU 探测既探不准又像扫描
+		// 伪造 TCP 路径没有真实的 ICMP 反馈，PMTU 探测既探不准又像扫描。
+		//
+		// Rust 侧关掉 PMTUD 还有个更硬的理由（见 quic/config.rs 注释）：
+		// quinn 的 BlackHoleDetector 只要看到「连续 4 个可疑丢包突发」
+		// 就把 MTU 打回 min_mtu（默认 1200）。跨境链路 20~50% 丢包是常态，
+		// 这个启发式必然误判——实测 MTU 从 1340 塌到 1200 再没爬回来，
+		// 此后每包少装 140 字节有效载荷（-10.4%），包数增加 11.7%，
+		// 丢包概率随之上升，形成恶性循环。
+		//
+		// 我们的路径 MTU 是自己说了算的：外层封装固定、头部长度固定，
+		// 1332 载荷对应 1417 字节报文，稳定小于链路 1428。
 		DisablePathMTUDiscovery: true,
-		InitialPacketSize:       1340,
+		// InitialPacketSize 必须与 Rust 侧 initial_mtu 逐字节对齐：1332。
+		//
+		// 为什么不是 1340（早期 Go 版的值）：伪装改造给每个数据包加了
+		// TCP 时间戳选项，头部多 12 字节。若仍用 1340，总包会变成 1425，
+		// 逼近服务端通告 MSS 1400 对应的 1440 上限，没有余量。
+		//
+		// 算一下：1332 + 33（5 记录头 + 12 nonce + 16 tag）
+		//       + 20（IP）+ 32（TCP 含 12 字节 TS 选项）= 1417 < 1428 ✓
+		InitialPacketSize: 1332,
 		// MaxIdleTimeout 决定「隧道已死多久才被发现」。
 		//
+		// 取 30s 与 Rust 侧 max_idle_timeout 一致。
 		// 它只适用于「完全收不到包」的场景，而健康连接每 KeepAlivePeriod
 		// 就会收到一次 ACK，所以不会误触发。
-		// 取 15s 而不是 Rust 侧的 30s：服务端重启后，客户端会在旧的
-		// 死连接上瞬间开流（写入只是本地缓冲），请求实际卡在「等服务端
-		// 响应」上，直到这个超时。实测 30s 对用户来说不可接受，15s 是
-		// 「丢包链路不会误杀」与「故障恢复不过慢」的折中。
-		MaxIdleTimeout: 15 * time.Second,
-		// 保活周期 5s：既是心跳也是死亡探测器。
-		// 必须明显小于 MaxIdleTimeout（至少 2:1），否则一次丢包就可能
-		// 被误判为掉线。
-		KeepAlivePeriod: 5 * time.Second,
+		// 服务端重启后的快速恢复由 Probe + 上层重连负责，不靠缩短这个值。
+		MaxIdleTimeout: 30 * time.Second,
+		// 保活周期 10s：既是心跳也是死亡探测器，与 Rust 侧一致。
+		// 必须明显小于 MaxIdleTimeout（3:1），否则一次丢包就可能被误判为掉线。
+		KeepAlivePeriod: 10 * time.Second,
 		// HandshakeIdleTimeout 必须显式设置。
 		//
 		// 默认 5s 看似够用，但**它是「多久没收到任何包」而不是总时长**：
@@ -61,23 +80,32 @@ func DefaultQUICConfig() *quicgo.Config {
 		// 所以真正的超时兜底在 NewClient 里（见 dialWithTimeout）。
 		HandshakeIdleTimeout: 10 * time.Second,
 
-		// ---- 接收窗口：只调 stream，不动 connection ----
+		// ---- 接收窗口：与 Rust 侧逐项对齐 ----
 		//
-		// Rust 侧（src/quic/config.rs）是 stream 4MB / connection 16MB。
-		// 但**不要照抄 connection 值**：实测把
-		// MaxConnectionReceiveWindow 设成 16MB 后，下载到 16.7MB 就永久卡住
-		// （连接级窗口耗尽后没被回补，MAX_DATA 不再发出）。
-		// 保持 quic-go 默认的连接级窗口（它会自适应增长）反而正常。
+		// Rust: receive_window(16MB) / stream_receive_window(4MB)。
 		//
-		// stream 窗口需要显式调大：默认初始只有 512KB，
-		// 爬升太慢会触发 Rust 服务端的背压判定
-		// （`背压等待超过 30 秒，放弃该流`）。
+		// 早期 Go 版把连接级窗口留默认，是因为把 MaxConnectionReceiveWindow
+		// 设成 16MB 后下载到 16.7MB 就永久卡住（窗口耗尽后没被回补）。
+		// 现在显式同时设置 Initial 与 Max 两个值：quic-go 只有在
+		// Initial < Max 时才会增长并回补 MAX_DATA，只设 Max 不设 Initial
+		// 会退化成「一次给满 16MB 却不再更新」。
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		// 4MB 是 Rust 侧的安全值：受接收组装器乱序空洞数限制，
+		// 8MB 在高丢包链路上会触发 too many gaps 断连。
 		InitialStreamReceiveWindow: 4 * 1024 * 1024,
-		MaxStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:     4 * 1024 * 1024,
 
-		// Rust 侧单连接支持大量并发流（每条本地连接一条流）
-		MaxIncomingStreams:    -1, // 不给对端开流（客户端不需要）
-		MaxIncomingUniStreams: -1,
+		// DATAGRAM 单帧上限：Rust 侧 datagram_receive_buffer_size(1MB)。
+		// quic-go 用「单帧最大字节数」表达，1200 与 MTU 对齐（UDP 不分片）。
+		MaxDatagramFrameSize: 1200,
+
+		// 客户端不需要对端开流，但**不能设 -1**：
+		// Rust 侧是 max_concurrent_bidi_streams(1024)。
+		// 设 -1 会让 QUIC 传输参数里 bidi 流上限为 0，
+		// 万一将来需要服务端主动开流（如反向代理）就直接不可用。
+		MaxIncomingStreams:    1024,
+		MaxIncomingUniStreams: 1024,
 	}
 }
 
@@ -89,6 +117,30 @@ type ClientOptions struct {
 	QUIC *quicgo.Config
 	// DialTimeout 限制建连（含伪造 TCP 握手与 QUIC 握手）的总时长
 	DialTimeout time.Duration
+	// MaxCwnd 是 QUIC 拥塞窗口上限（字节），对应 Rust 配置的
+	// `net.max_cwnd`。0 表示用 DefaultMaxCwnd（8MB）。
+	//
+	// 它同时是 BBR 的硬上限和自适应算法的上界：
+	// 小带宽跨境链路（如 20~50Mbps）设 1MB 左右能显著降低丢包。
+	MaxCwnd uint64
+	// OnStats 是每 2 秒一次的路径统计回调，可为 nil。
+	//
+	// 对应 Rust 版的「QUIC 路径统计」日志。排障时第一眼看它：
+	// 丢包率、窗口上限、累计收发是否合理。
+	OnStats func(PathStats)
+	// BrutalBPS > 0 时启用 Brutal 拥塞控制（hy1 风格）：
+	// **丢包不减窗，按这个带宽硬发**。单位字节/秒。
+	//
+	// 适用场景：跨境高丢包链路（随机丢包 20~50%）。BBR 会把这类
+	// 随机丢包当成拥塞信号而降速，导致永远跑不满；Brutal 直接无视丢包，
+	// 只靠 QUIC 重传兜底。
+	//
+	// **必须填本机真实上行带宽**（不是下行！）。填大了会把链路打爆、
+	// 丢包更多；填小了跑不满。0 表示不用 Brutal，走 BBR。
+	BrutalBPS uint64
+	// BrutalMultiplier 是 cwnd 相对 BDP 的倍数，默认 2.0（同 hy1）。
+	// 仅在 BrutalBPS > 0 时生效。
+	BrutalMultiplier float64
 }
 
 // Client 是一条已建立的 flowtls + QUIC 通道。
@@ -99,6 +151,12 @@ type Client struct {
 	session   *flowtls.Session
 	transport *quicgo.Transport
 	conn      *quicgo.Conn
+
+	// winCtl 是 BBR + 自适应窗口上限控制器。
+	//
+	// 必须在建连前创建（它启动一个 2 秒周期的丢包率采样协程），
+	// 并在 Close 时关闭，否则每条重连都会泄漏一个协程。
+	winCtl *windowController
 
 	// udpNext 是 UDP session id 分配器。
 	//
@@ -118,21 +176,48 @@ type Client struct {
 	dispatcherOnce sync.Once
 }
 
-// udpSession 是一条本地 UDP 映射出来的会话。
+// udpSession 是一条「本地 UDP socket + 目标地址」映射出来的会话。
+//
+// 生命周期模型照搬 hysteria2 的 udpPacketConn：
+// ctx + cancel 管生命周期，readDeadline 管读超时，**不靠关闭通道**。
+//
+// 为什么不能用「Close 时 close(rx)」：分发协程是写方，
+// 关通道会让写方 panic。用 ctx 就没有这个可逆问题——
+// 发送方 select 时带上 <-ctx.Done() 就能安全退出。
+//
+// **一个目标一条会话**（对齐 Rust `proxy/socks5.rs` 的
+// `index: HashMap<(peer, target), u32>`）：服务端按 session id 建一个出站
+// socket，目标只在建会话时读一次；若同一 session 复用给不同目标，
+// 包会被发到第一个目标上——这类串流在代理场景下极难排查。
 type udpSession struct {
-	id     uint32
-	target netip.AddrPort
-	// rx 是下行投递通道。容量小是有意的：UDP 不重传，堆太多只是延迟。
-	rx chan []byte
-	// 目标地址帧（不含长度前缀），每个上行包都要带
+	id uint32
+	// from 是该会话的下行源地址，ReadFrom 用它回报给调用方。
+	from netip.AddrPort
+	// targetFrame 是目标地址帧（不含长度前缀），每个上行包都要带。
 	targetFrame []byte
+	// sink 是本会话所属 udpConn 的合并下行队列。
+	// 不设每会话独立队列：ReadFrom 只有一个消费者，
+	// 多队列就得在 ReadFrom 里做动态 select，Go 做不到。
+	sink chan udpPacket
+	// lastUsed 是最近一次收发包的 UnixNano，供空闲回收使用。
+	lastUsed atomic.Int64
+
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 }
 
-// ListenPacket 建立一条 UDP 会话，返回可直接当 net.PacketConn 使用的对象。
+// udpPacket 是合并下行队列里的一帧。
+type udpPacket struct {
+	from netip.AddrPort
+	data []byte
+}
+
+// ListenPacket 建立一条 UDP 中继，返回可直接当 net.PacketConn 使用的对象。
 //
 // 与 hysteria2 的差异：hy2 的 ListenPacket(ctx, destination) 是「一个会话一个
 // 固定目标」，本协议上行**每包都带目标地址**，所以这里的目标只是默认值——
-// 之后每次 WriteTo 都可以指定不同目标（多目标共享一个 session）。
+// 之后每次 WriteTo 都可以指定不同目标，**每个不同目标自动分配一条独立会话**
+// （对齐 Rust 的 `(peer, target) → session`）。
 //
 // 为什么这样设计：服务端因此可以完全无状态，客户端重连后第一个包就能自愈。
 func (c *Client) ListenPacket(ctx context.Context, target string, port uint16) (net.PacketConn, error) {
@@ -144,22 +229,111 @@ func (c *Client) ListenPacket(ctx context.Context, target string, port uint16) (
 	if err != nil {
 		return nil, err
 	}
-	id := c.udpNext.Add(1) - 1
-	s := &udpSession{
-		id:          id,
-		rx:          make(chan []byte, 64),
-		targetFrame: frame,
+	// 父 ctx 取 QUIC 连接：连接断了所有会话自动作废，不需要额外通知。
+	parentCtx, parentCancel := context.WithCancelCause(c.conn.Context())
+	u := &udpConn{
+		client:       c,
+		defaultFrame: frame,
+		sessions:     make(map[string]*udpSession),
+		rx:           make(chan udpPacket, 256),
+		ctx:          parentCtx,
+		cancel:       parentCancel,
 	}
 	if a, err := netip.ParseAddr(target); err == nil {
-		s.target = netip.AddrPortFrom(a, port)
+		u.defaultFrom = netip.AddrPortFrom(a, port)
 	}
-	c.udpRoutes.Store(id, s)
 
-	// 第一次用到 UDP 时才启动分发协程：纯 TCP 用户不付这个成本。
+	// 第一次用到 UDP 时才启动分发协程与回收协程：纯 TCP 用户不付这个成本。
 	c.dispatcherOnce.Do(func() { go c.dispatchDatagrams() })
+	go u.reapLoop()
 
-	return &udpConn{client: c, sess: s}, nil
+	return u, nil
 }
+
+// sessionFor 取得（必要时创建）某个目标对应的会话。
+//
+// key 用地址帧的字符串形式：地址帧本身就是该目标的规范编码
+// （IP 版本、地址、端口全在内），比拼字符串更不容易撞键。
+func (u *udpConn) sessionFor(frame []byte, from netip.AddrPort) *udpSession {
+	key := string(frame)
+
+	u.mu.Lock()
+	if s, ok := u.sessions[key]; ok {
+		s.lastUsed.Store(time.Now().UnixNano())
+		u.mu.Unlock()
+		return s
+	}
+	if u.closed.Load() {
+		u.mu.Unlock()
+		return nil
+	}
+	id := u.client.udpNext.Add(1) - 1
+	// 会话 ctx 挂在 udpConn 的 ctx 下：中继关闭时所有会话一起作废。
+	sessCtx, sessCancel := context.WithCancelCause(u.ctx)
+	s := &udpSession{
+		id:          id,
+		from:        from,
+		targetFrame: frame,
+		sink:        u.rx,
+		ctx:         sessCtx,
+		cancel:      sessCancel,
+	}
+	s.lastUsed.Store(time.Now().UnixNano())
+	u.sessions[key] = s
+	u.mu.Unlock()
+
+	u.client.udpRoutes.Store(id, s)
+	return s
+}
+
+// dropSession 注销一条会话（下发路由 + ctx）。
+func (u *udpConn) dropSession(key string) {
+	u.mu.Lock()
+	s, ok := u.sessions[key]
+	delete(u.sessions, key)
+	u.mu.Unlock()
+	if !ok {
+		return
+	}
+	u.client.udpRoutes.Delete(s.id)
+	s.cancel(net.ErrClosed)
+}
+
+// reapLoop 定期回收空闲会话。
+//
+// 对齐 Rust `proxy/socks5.rs` 的做法：每 30 秒扫一次，
+// 空闲超过 idle 的会话注销。**必须有**：一个 SOCKS5 UDP 中继可能
+// 先后访问成百上千个目标（DNS、QUIC、P2P），不回收会让
+// 客户端路由表无限增长，服务端也会为每个会话常驻一个 UDP socket。
+func (u *udpConn) reapLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		deadline := time.Now().Add(-udpSessionIdle).UnixNano()
+		var stale []string
+		u.mu.Lock()
+		for key, s := range u.sessions {
+			if s.lastUsed.Load() < deadline {
+				stale = append(stale, key)
+			}
+		}
+		u.mu.Unlock()
+		for _, key := range stale {
+			u.dropSession(key)
+		}
+	}
+}
+
+// udpSessionIdle 是客户端 UDP 会话的空闲回收时间。
+//
+// 下限取 60 秒而不是更短：DNS 这类低频会话若刚建就被回收，
+// 每次查询都要重新分配 session id，服务端也要反复建 socket。
+const udpSessionIdle = 60 * time.Second
 
 // dispatchDatagrams 把 conn 收到的 DATAGRAM 按 session 分发到各自通道。
 //
@@ -169,9 +343,10 @@ func (c *Client) dispatchDatagrams() {
 	for {
 		data, err := c.conn.ReceiveDatagram(c.conn.Context())
 		if err != nil {
-			// 连接关闭：通知所有会话退出
+			// 连接关闭：取消所有会话。
+			// 不 close 通道——写方可能在 select 里等，关通道会 panic。
 			c.udpRoutes.Range(func(_, v any) bool {
-				close(v.(*udpSession).rx)
+				v.(*udpSession).cancel(net.ErrClosed)
 				return true
 			})
 			return
@@ -189,53 +364,112 @@ func (c *Client) dispatchDatagrams() {
 		// 拷贝：data 由 quic-go 复用，下一轮会被覆盖
 		buf := make([]byte, len(payload))
 		copy(buf, payload)
+		s.lastUsed.Store(time.Now().UnixNano())
 		select {
-		case s.rx <- buf:
+		case s.sink <- udpPacket{from: s.from, data: buf}:
+		case <-s.ctx.Done():
+			// 会话已关：丢弃（UDP 语义）
 		default:
-			// 通道满：丢弃（UDP 不重传，绝不阻塞分发协程，
+			// 队列满：丢弃（UDP 不重传，绝不阻塞分发协程，
 			// 否则一条慢会话会拖死所有会话）
 		}
 	}
 }
 
-// udpConn 实现 net.PacketConn，对应一条 UDP 会话。
+// udpConn 实现 net.PacketConn，对应一个本地 UDP 中继。
+//
+// 内部按目标地址维护多条 udpSession（对齐 Rust 的
+// `(peer, target) → session` 反向索引），但对外仍是单一 PacketConn：
+// 下行各会话的包合并进 rx，ReadFrom 带回各自的目标地址。
 type udpConn struct {
 	client *Client
-	sess   *udpSession
+
+	// defaultFrame / defaultFrom 来自 ListenPacket 的初始目标，
+	// 供 addr 为 nil 的 WriteTo 使用。
+	defaultFrame []byte
+	defaultFrom  netip.AddrPort
+
+	mu       sync.Mutex
+	sessions map[string]*udpSession // key = 目标地址帧
+	rx       chan udpPacket
+
+	ctx          context.Context
+	cancel       context.CancelCauseFunc
+	readDeadline pipe.Deadline
+
 	closed atomic.Bool
 }
 
 var _ net.PacketConn = (*udpConn)(nil)
 
 func (u *udpConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	data, ok := <-u.sess.rx
-	if !ok {
+	select {
+	case pkt := <-u.rx:
+		n := copy(p, pkt.data)
+		return n, net.UDPAddrFromAddrPort(pkt.from), nil
+	case <-u.ctx.Done():
+		// 中继已关闭（本地 Close 或 QUIC 连接断开）。
+		// 必须返回错误：没有这个分支时 ReadFrom 会永久阻塞，
+		// 调用方的读协程泄漏，且 sing-box 无法释放该会话。
 		return 0, nil, net.ErrClosed
+	case <-u.readDeadline.Wait():
+		return 0, nil, os.ErrDeadlineExceeded
 	}
-	n := copy(p, data)
-	return n, net.UDPAddrFromAddrPort(u.sess.target), nil
+}
+
+// SetDeadline / SetReadDeadline 必须真正生效：上层靠它实现 UDP 空闲超时。
+func (u *udpConn) SetDeadline(t time.Time) error {
+	u.readDeadline.Set(t)
+	return nil
+}
+
+func (u *udpConn) SetReadDeadline(t time.Time) error {
+	u.readDeadline.Set(t)
+	return nil
+}
+
+func (u *udpConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (u *udpConn) LocalAddr() net.Addr {
+	if u.client.session != nil {
+		return u.client.session.LocalAddr()
+	}
+	return nil
 }
 
 // WriteTo 发送一个 UDP 数据报。
 //
-// addr 允许为 nil（沿用 ListenPacket 时给的目标），也允许指定不同目标——
-// 协议上行每包带地址，因此天然支持多目标共享一个 session。
+// addr 允许为 nil（沿用 ListenPacket 时给的目标），也允许指定不同目标：
+// **每个不同目标对应一条独立会话**——这是必须的，
+// 服务端按 session id 只建一次出站 socket，目标只在建会话时读一次。
+// 复用会话给不同目标会把包发到错误的主机。
 func (u *udpConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if u.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	frame := u.sess.targetFrame
+	frame := u.defaultFrame
+	from := u.defaultFrom
 	if addr != nil {
-		if ap, ok := addrPortOf(addr); ok {
-			var err error
-			frame, err = flowtls.EncodeAddressFrame(ap)
-			if err != nil {
-				return 0, err
-			}
+		ap, ok := addrPortOf(addr)
+		if !ok {
+			// **不能静默回退到默认目标。**
+			// 回退意味着把包发到错误的地方（比如把 DNS 包发给另一个 UDP 服务）。
+			// 这类串流在代理场景下极难排查，必须直接报错。
+			return 0, E.New("flowtls: unsupported UDP address type ", reflect.TypeOf(addr))
 		}
+		f, err := flowtls.EncodeAddressFrame(ap)
+		if err != nil {
+			return 0, err
+		}
+		frame = f
+		from = ap
+	}
+	s := u.sessionFor(frame, from)
+	if s == nil {
+		return 0, net.ErrClosed
 	}
 	// 每包带 session + 地址帧
-	pkt := flowtls.EncodeClientDatagram(nil, u.sess.id, frame, p)
+	pkt := flowtls.EncodeClientDatagram(nil, s.id, frame, p)
 	// SendDatagram 的语义：超出当前 MTU 会返回 DatagramTooLargeError。
 	// 按 UDP 语义直接丢弃，不做应用层分片（与 Rust 侧一致）。
 	if err := u.client.conn.SendDatagram(pkt); err != nil {
@@ -257,19 +491,21 @@ func (u *udpConn) Close() error {
 	if u.closed.Swap(true) {
 		return nil
 	}
-	u.client.udpRoutes.Delete(u.sess.id)
-	// 不关 rx：分发协程可能正在写入，关掉会 panic。
-	// 注销路由表后不会再有新数据进来，残留的由 GC 回收。
+	// 先注销所有会话的路由（后续下行包直接丢），再取消 ctx
+	// （唤醒阻塞中的 ReadFrom，并让 reapLoop 退出）。
+	u.mu.Lock()
+	sessions := make([]*udpSession, 0, len(u.sessions))
+	for _, s := range u.sessions {
+		sessions = append(sessions, s)
+	}
+	u.sessions = make(map[string]*udpSession)
+	u.mu.Unlock()
+	for _, s := range sessions {
+		u.client.udpRoutes.Delete(s.id)
+	}
+	u.cancel(net.ErrClosed)
 	return nil
 }
-
-func (u *udpConn) LocalAddr() net.Addr {
-	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
-}
-
-func (u *udpConn) SetDeadline(t time.Time) error      { return nil }
-func (u *udpConn) SetReadDeadline(t time.Time) error  { return nil }
-func (u *udpConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // addrPortOf 从 net.Addr 提取 netip.AddrPort。
 func addrPortOf(addr net.Addr) (netip.AddrPort, bool) {
@@ -343,13 +579,30 @@ func NewClient(ctx context.Context, opts ClientOptions) (*Client, error) {
 	// 高 RTT 链路上会直接触发握手超时。
 	session.StartReceiver()
 
+	// 建连前就把拥塞控制准备好：自适应循环要贯穿连接整个生命周期。
+	winCtl := newWindowControllerEx(opts.MaxCwnd, opts.OnStats,
+		opts.BrutalBPS, opts.BrutalMultiplier)
+
 	conn, err := dialWithTimeout(dialCtx, transport, session.RemoteAddr(), tlsConf, quicConf)
 	if err != nil {
+		winCtl.Close()
 		_ = session.Close()
 		_ = transport.Close()
 		return nil, fmt.Errorf("QUIC 握手失败: %w", err)
 	}
-	return &Client{session: session, transport: transport, conn: conn}, nil
+	// ---- 拥塞控制：原生 BBR + 自适应窗口上限 ----
+	//
+	// **这是跨境高丢包链路吞吐的关键**，不是可选优化。
+	//
+	// quic-go 默认用 Cubic（丢包即减半，把丢包当成拥塞信号）。
+	// 跨境链路 20~50% 丢包是常态但不代表拥塞，Cubic 会反复把窗口
+	// 砍到最小，实测吞吐只有 Rust 版的 1/5~1/10。
+	//
+	// `Attach` 做两件事：换上带窗口钳制的 BBR，并把这条连接
+	// 纳入丢包率采样（每 2 秒按实测丢包率升降窗口上限，同 Rust）。
+	winCtl.Attach(conn)
+
+	return &Client{session: session, transport: transport, conn: conn, winCtl: winCtl}, nil
 }
 
 // dialWithTimeout 在做一次「带真实超时」的 QUIC 握手。
@@ -404,6 +657,11 @@ func dialWithTimeout(
 // 这个坑在 P2 联调时真实踩到过。
 func (c *Client) Close() error {
 	var firstErr error
+	// 先停自适应循环：它每 2 秒会去读 conn 的统计，
+	// 连接关掉后再读没意义，而且会持续占一个协程。
+	if c.winCtl != nil {
+		c.winCtl.Close()
+	}
 	if c.conn != nil {
 		// CONNECTION_CLOSE 要能发出去，所以放在关 Session 之前
 		if err := c.conn.CloseWithError(0, ""); err != nil {
@@ -440,6 +698,9 @@ func (c *Client) IdleFor() time.Duration { return c.session.IdleFor() }
 //
 // 由适配层取走记日志：print 模式下这份文本就是运维需要手工执行的命令。
 func (c *Client) Rules() flowtls.RuleReport { return c.session.Rules() }
+
+// SendMode 返回传输层发送路径描述，供上层记建连日志（见 flowtls.Session.SendMode）。
+func (c *Client) SendMode() string { return c.session.SendMode() }
 
 // Probe 主动探测连接是否还活着。
 //

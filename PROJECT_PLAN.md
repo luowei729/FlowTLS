@@ -502,3 +502,174 @@ ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
    但服务端要支持 h3 需要 QUIC-over-UDP 的 443/8443 监听，
    而 UDP 8443 上跑的是我们的 DATAGRAM 通路，两者会打架。
    结论：**保持不支持**，并在文档里说明原因比硬加更诚实。
+
+## 2026-11-13 19:02（北京时间）更新：P6 完成 —— BBR 拥塞控制，吞吐 15 倍
+
+### 背景：用户的原始判断是对的
+
+用户说「是不是 没用bbr 你要完整的移植啊」。查证结果：
+
+- Rust 最终版用 quinn 的 BBR，外面包 `CappedBbr` 钳窗口上限；
+- **Go 侧一行拥塞控制代码都没有**，直接吃 quic-go 的 Cubic 默认值。
+
+这就是「功能全对但就是慢」的唯一根因。
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| BBR 拥塞控制（客户端 + 服务端） | ✅ |
+| `CappedBbr` 等价实现（窗口上限钳制） | ✅ |
+| 自适应窗口（每 2 秒按丢包率调整，逐行对齐 Rust） | ✅ |
+| `max_cwnd` 配置项（inbound / outbound / 示例 / 文档） | ✅ |
+| QUIC 路径统计日志（对齐 Rust「QUIC 路径统计」） | ✅ |
+| **修复 UDP 会话键错误**（`(socket, target)`，之前会串流到错误目标） | ✅ |
+
+### 实测（新加坡服务器，跨境链路）
+
+| 指标 | 之前 | 现在 |
+|---|---|---|
+| 下行 | 5.25 Mbps | **76~87 Mbps** |
+| 上行 | 10.85 Mbps | **87 Mbps** |
+| UDP 目标正确性 | 错（发 1.1.1.1 送到 8.8.8.8） | 正确，20/20 无丢包 |
+
+### 剩余待办（重新排序）
+
+1. **提交代码**：本轮 BBR + UDP 修复全部未提交（`capped_bbr.go` 是新文件）。
+2. **HTTP/3 伪装**（可选，优先级低，结论仍是「不做并说明原因」）。
+3. **ACK 频率 5ms**（已知差异，不做）：quic-go 只能解析 ACK Frequency 帧，
+   不能发送，`MaxAckDelay` 是内部常量；改它必须 fork quic-go，
+   违反「依赖版本与 sing-box 逐字节对齐」。实际影响小（每 2 包立刻回 ACK）。
+4. **`send_window` 无对应项**（已知差异，不做）：quinn 的 `TransportConfig`
+   独有概念，quic-go 用接收窗口反压，语义不等价但效果接近。
+   已确认 `InitialConnectionReceiveWindow=16MB` / `InitialStreamReceiveWindow=4MB`
+   与 Rust 的 `receive_window(16MB)` / `stream_receive_window(4MB)` 一致。
+5. **sendmmsg 批量发送**（性能项，非功能缺失）：
+   Rust `send_batch` 一次最多 32 包，实测能把内核态时间降 32 倍。
+   Go 侧 `SendBatch` 目前是循环 `Sendto`，而且**从未被调用**（全走 `Send`）。
+   当前 87Mbps 下 CPU 不是瓶颈，但 1 核 ARM 机器上跑满千兆会撞墙。
+6. 真链路矩阵 `docs/e2e_matrix.sh` 需要 root，本地无特权时跳过。
+
+## 2026-11-13 23:59（北京时间）更新：传输层性能修复，回环追平并超过 Rust
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| 批量发送队列 + sendmmsg（32 包/批，纯 ACK 与数据同队列保序） | ✅ |
+| 消除每包堆分配（Seal/OpenTo/ForEachRecord/deliverOwned） | ✅ |
+| **ARP 解析 `0x` 前缀 bug**（AF_PACKET 从未真正启用） | ✅ |
+| `Close` 重复 close 同一 fd | ✅ |
+| 双 fd 策略（本机地址走 RAW / 其余按环境） | ✅ |
+| 默认 IPPROTO_RAW，`FLOWTLS_AF_PACKET=1` 可选；QDISC_BYPASS 默认关 | ✅ |
+| 客户端 recvFD 绑定出口网卡 | ✅ |
+| 两端清理核对（服务器旧备份/旧源码/旧二进制，本地 iptables 残留） | ✅ |
+| Rust 服务端用 legacy-rust 分支重新构建并部署（md5 与源码产物一致） | ✅ |
+
+### 回环实测（同机 16 核，30MB × 3，同客户端对照）
+
+| 组合 | 修复前 | 修复后 |
+|---|---|---|
+| Go → Go | 31~50 MB/s | **90~97 MB/s** |
+| Go → Rust | 42 MB/s | 42 MB/s |
+
+**回环目标已达成**（用户核心诉求：Go 版带宽追上 Rust 版）。
+
+### 公网遗留（下一步唯一事项）
+
+同一时刻、同一链路、同一源端口：**Rust 客户端建连成功、Go 客户端握手超时**；
+SYN 字节逐字段一致、校验和自洽、客户端网卡可见，但服务器侧 rawcap 收不到 Go 的 SYN。
+已排除端口冲突/校验和/非阻塞/MSG_DONTWAIT/recvFD 绑定/ARP/QDISC_BYPASS（详见 DEVTIPS 86）。
+下一步：bpftrace 观察 NAT 表，或对两个客户端做全量 syscall 对比。
+
+## 2026-11-14 01:25（北京时间）更新：公网传输根因修复，Go↔Go 从不通到 5.9~7.2 MB/s
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| **拥塞控制器从未安装**：`Attach()` 补 BBR 分支 `SetCongestionControl(newCappedBbr(...))` | ✅ 服务端 254KB/s → 10.1MB/s |
+| **NAT 云主机源地址**：配置值不在本机网卡上时自动改用探测出口地址 | ✅ Go 服务端从「不通」到可用 |
+| `SendMode()` 全链路透传 + inbound/outbound 各一行启动日志（发送路径 + 生效源 IP） | ✅ |
+| **去掉 MSG_DONTWAIT**：RAW 发送改阻塞 flags=0（数据面已收敛到 flushLoop 单协程），不再静默丢 ACK | ✅ |
+| 延迟 ACK 条件补 `ackPend > 0`，与 Rust `client.rs:808` / `server.rs:501` 逐条对齐 | ✅ |
+| **接上 RecvBatch**：`recvLoop` 由逐包 recvfrom 改为一次 recvmmsg 32 包 | ✅ |
+| `flushLoop` 整批发送失败不再吞 err：计 `txSendErr`，`FLOWTLS_DEBUG_SEND=1` 打日志 | ✅ |
+| 服务端统计补 `rtt=` 字段（Rust 有、Go 没有，是本轮最大的排查障碍） | ✅ |
+| 补 `socket_stub.go` 的 `maxSendBatch`/`maxRecvBatch`/`RecvBatch`/`SendMode`（darwin/windows/android 交叉编译） | ✅ |
+| 两级 recvLoop（pump + 处理）实验 | ❌ 吞吐无提升（6.2 vs 6.1）却多一个丢帧风险点，**已回退** |
+| 服务器配置回归：删掉实验用的 `up_mbps`，`max_cwnd` 恢复 8388608 | ✅ |
+| 文档更正：`legacy-rust` 第 20/21 条「云 NAT 不可用 / 运营商封禁」标记为过时；本仓库 DEVTIPS 85/86 标注推翻 | ✅ |
+
+### 公网实测（本地 ↔ Oracle 新加坡 ARM，100MB，同一时刻对照）
+
+| 组合 | 本轮开始时 | 本轮结束 |
+|---|---|---|
+| Go 客户端 → Go 服务端 | 握手超时 / 49KB/s | **8.0~9.8 MB/s（64~78Mbps）** |
+| Rust 客户端 → Go 服务端 | 连不上 | **14.8~15.1 MB/s（118~121Mbps）** |
+| Go 客户端 → Rust 服务端 | 87Mbps（旧代码） | 未回归（下一步要测） |
+| 本机回环 Go↔Go 30MB | 90~97 MB/s | **80~108 MB/s**（修掉 bindRecv 回归后） |
+
+### 原记「Go 客户端方向仍比 Rust 慢 2.2 倍」——已撤回，见下方 01:55 部署段
+
+唯一剩下的硬线索：**服务端测 Go 客户端 RTT 215~228ms，测 Rust 客户端 78ms**
+（真实链路 89ms）。多出的 ~140ms 是 Go 客户端的 ACK 延迟，但已排除并试过：
+窗口大小、CPU、拥塞算法选择、内核接收队列（拆两级收包无效）、服务端源地址、iptables。
+
+**下一步第一动作（不要再从黑盒猜）**：给 `PathStats` 补 `Cwnd` 与 `BytesInFlight`。
+quic-go 的 `ConnectionStats` 不暴露这两个值，只能在 `cappedBbr` 里用 atomic 记录
+`GetCongestionWindow()` / `CanSend(bytesInFlight)` 最近一次的入参，再由 `windowController`
+按连接聚合输出。Rust 日志早就有 `cwnd=` `inflight=` `mtu=` `pending=` `rx_queue=`，
+字段不对齐就是本轮排查绕远路的直接原因（详见 DEVTIPS 88/89）。
+
+补完之后按这个顺序二分：
+1. 传输期间（不是结束后）同时抓两端 `cwnd`/`inflight` → 判断是窗口受限还是接收流控受限；
+2. 若是窗口受限：对比 cappedBbr 与 quinn BBR 在 89ms RTT 下的 startup→drain 判据；
+3. 若是流控受限：查 `AdvertisedWindow`/`rxBytes` 与 QUIC 流级 `MaxStreamReceiveWindow`。
+
+### 追加：本轮最后一次修复（回环回归）
+
+上一轮加的「客户端 recvFD 绑定出口网卡」用 dst 反推角色，而服务端探测 dst 是 `8.8.8.8`，
+于是服务端也被绑到物理网卡，**收不到 lo 上的包**，本机回环从 90~97 MB/s 变成全超时。
+改成显式参数 `newRawSocket(dst, local, bindRecv)`：Dial 传 true、Listener 传 false
+（DEVTIPS 90）。修完回环 80~108 MB/s，公网 Go↔Go 稳定后 8.0~9.8 MB/s（64~78Mbps）。
+
+## 2026-11-14 01:55（北京时间）更新：Go↔Go 部署到 127.0.0.1:1080，性能结论按重复测量修正
+
+### 部署现状（生产用这一套）
+
+| 角色 | 位置 | 说明 |
+|---|---|---|
+| 服务端 | 新加坡 203.0.113.10 `/opt/flowtls/sing-box`（arm64） | 配置 `server.json`，监听 `*:8443`，规则 `u32 "0x4&0xff00ffff=0x1e004000"` |
+| 客户端 | 本机 `dist/sing-box-1.14.4-rev.1-linux-amd64` | 配置 `/tmp/live/client-sg-1080.json`，入口 **`127.0.0.1:1080`**（mixed），用户 `admin` |
+| 入口参数 | `source_port 44333` / `ip_id_mark 30583` / `max_cwnd 8388608` / `iptables_mode auto` | `check -c` 不需要 root ✅ |
+
+启停与验收细节在 `DEPLOY_CREDENTIALS.md`（口令不入库，按该文件约定只记用户名）。
+
+### 实测（每格至少 5 轮，报区间）
+
+| 组合 | 吞吐 |
+|---|---|
+| Go↔Go 串行 100MB × 11 | **11.8~18.7 MB/s（94~150Mbps）** |
+| Go↔Go 4 并发 100MB | 合计 17.3 MB/s（138Mbps） |
+| Rust 客户端 → 同一 Go 服务端 | 14.8~15.1 MB/s |
+| 本机回环 Go↔Go 30MB | 80~108 MB/s |
+
+结论：**Go 版隧道带宽已追平 Rust**，本条目标题里的「达到 rust 版」诉求达成。
+
+### 本节撤回的旧结论（都因单次测量）
+
+| 旧结论 | 撤回原因 |
+|---|---|
+| Go 客户端比 Rust 慢 2.2 倍 | 11 轮重测后不存在；旧数字来自未重启到最终版的实例 |
+| 服务端测 Go 客户端 RTT 215~228ms、Rust 78ms → Go 的 ACK 慢 | 统计里 `rtt=` 是「循环中最后一条连接」的值，当时 `conns=2/3` 且日志不标对端，数字归属不明 |
+| 「跑久了会退化，之前低值是残留会话污染」 | 已证伪：连跑 15 轮后仍 15.3~18.7 MB/s，新实例也不更快 |
+
+### 下一步（仍未做的两件事，都在观测层）
+
+1. `PathStats` 补 **`Cwnd` / `BytesInFlight`**：quic-go 的 `ConnectionStats` 不暴露，
+   只能在 `cappedBbr.GetCongestionWindow()` / `CanSend()` 里用 atomic 记最近值再聚合。
+2. `PathStats` 补 **per-conn 归属**（对端地址、连接数与 rtt/sent 一一对应）：
+   现在多连接共存时 `rtt=` 归属不明，已经因此得出过错误结论。
+
+做完这两件事才有资格再谈「还剩多少差距」。测量纪律本身已固化进 DEVTIPS 91。

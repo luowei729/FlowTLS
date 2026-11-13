@@ -1,5 +1,319 @@
 # CHANGELOG
 
+## 2026-11-14 02:00 (北京时间)
+
+### 1080 入口按部署方要求改监听 0.0.0.0；修复批量收包引爆的 panic
+
+**1) 监听地址（用户明确要求）**
+
+`/tmp/live/client-sg-1080.json` 的 `listen` 由 `127.0.0.1` 改为 **`0.0.0.0`**，
+理由是要让局域网内其它设备也能用这个入口。我原先按项目既有安全策略选了回环，
+这次以部署方要求为准，并把代价写进配置注释与 `DEPLOY_CREDENTIALS.md`：
+**弱口令入口因此对整个局域网可达**，不需要时改回 `127.0.0.1`，
+要保留就用防火墙限网段，别把口令当唯一防线。
+
+验证（短命令，逐项）：
+
+| 用例 | 结果 |
+|---|---|
+| `sing-box check -c`（不用 root） | 通过 ✅ |
+| 监听 | `0.0.0.0:1080` ✅ |
+| `127.0.0.1:1080` 拉 10MB | `code=200` 8.1 MB/s（连接刚建立） |
+| **`10.0.0.1:1080`（局域网地址）** | `code=200` **18.5 MB/s** ✅ 0.0.0.0 确实可达 |
+| 出口 IP | `203.0.113.10` ✅ |
+| 8 连短连接 | 全部 `code=200` |
+| 10MB 抽查 | **18.9 MB/s（152Mbps）** |
+| 新日志 panic 计数 | `0` ✅ |
+
+**2) 修复一个我上一轮改动引爆的 panic（客户端崩进程）**
+
+```
+panic: send on closed channel   deliverOwned session.go:582 ← recvLoop
+```
+
+`Close()` 会 `close(s.rx)`，`deliverOwned()` 会 `s.rx <- owned`，两侧只有
+`sync.Once` 保证「rx 只关一次」——**Once 不能保证关完之后没人再 send**，
+而 Go 对已关闭通道发送是 panic。旧写法每轮处理 1 个包，窗口小到撞不上；
+上一轮改成一次 recvmmsg 收 32 包，**把窗口放大 32 倍，关闭时必然还在批内 → 必崩**。
+
+修法（`flowtls/session.go`）：
+
+- 新增 `rxMu sync.RWMutex` + `rxClosed bool`，`deliverOwned` 持读锁、
+  新增的 `shutdownRx()` 持写锁，把「发送」与「关闭」真正串行化；
+  `Close()` 与 `closeRx()` 都改走 `shutdownRx()`；
+- 三个投递分支仍全部非阻塞（`select` 带 `default`），持读锁不会卡住关闭方；
+- 批量循环里每包前检查 `closed`，关闭后立刻退出（少做无用功，
+  正确性由锁保证）；
+- 新增防回归测试 `TestDeliverConcurrentWithCloseNeverPanics`
+  （`flowtls/session_test.go`），并**按 DEVTIPS 91 的纪律验证它能证伪**：
+  临时去掉 `rxMu` → 立刻 `panic: send on closed channel` + `DATA RACE` + FAIL；
+  恢复后 `-race -count=20` 全通过。
+
+**3) 关于「命令卡住」**
+
+上一轮我发的验证命令是 `25 次 ftdial × timeout 20`（最长 500 秒）且中途不输出，
+看起来就是卡死。已改为**有界短命令、每步立刻报结果**。教训记进 DEVTIPS 91：
+压测要么分步、要么带进度输出，别让使用者无法判断是死了还是在跑。
+
+**4) 回答「Go 有没有丢包自动调窗口」**
+
+**有**，`flowtls/quic/capped_bbr.go` 的 `windowController.loop()` 与 Rust
+`server.rs:402-433` 逐条一致：2 秒周期、`loss>20% → ×0.9`、`loss<5% → ×1.2`、
+`safe_cap = 1024×1308/max(loss,0.01)×0.7`、`clamp(1.5MB, 8MB).min(cfg_cap)`、
+`cfg_cap = max_cwnd.max(1536KB)`。实测两边窗口轨迹形状相同
+（Go：8MB ← 9~10% 丢包时 5.42/4.75/4.12MB；Rust：8MB ← 7.72/6.43/5.36/2/1.5MB）。
+
+**但必须说清：这个自适应在 01:25 修复 `Attach()` 之前是空转的**——循环照样算、
+日志照样打 `win_cap=`，可因为 BBR 分支没调 `SetCongestionControl`，
+**没有任何人读那个值**。铁证是当时把 `max_cwnd` 压到 1MB，日志如实显示
+`win_cap=1.50MB` 而吞吐毫无变化。详见 DEVTIPS 88/89。
+
+文档：`DEVTIPS.md` 新增 92（channel close/send 必须互斥 + 批量会放大关闭竞态 +
+防回归测试要能证伪），`DEPLOY_CREDENTIALS.md` 更新监听地址与实测表。
+
+
+## 2026-11-14 01:55 (北京时间)
+
+### Go↔Go 部署到生产入口 127.0.0.1:1080，并按重复测量修正上一轮的性能结论
+
+**部署**（用户要求「go-go 部署到 1080 admin abcd1234」）
+
+- 客户端配置：`/tmp/live/client-sg-1080.json`（由 1081 测试实例迁移而来）
+- 入口：`127.0.0.1:1080`，`type: mixed`（SOCKS5 + HTTP 同端口），用户名 `admin`
+- 隧道：本地 Go 客户端 → 新加坡 Go 服务端（`203.0.113.10:8443`）
+- 参数：`source_port: 44333`、`ip_id_mark: 30583`、`sni: example.com`、
+  `iptables_mode: auto`、`max_cwnd: 8388608`；日志级别 `debug → info`
+
+两处刻意选择，都写进了配置注释：
+
+1. **只监听 `127.0.0.1`**：入口带弱口令，绑 `0.0.0.0` 等于把它开放到局域网
+   （项目既有安全策略：入口默认只监听回环，需要局域网时显式改）。
+   上一轮我起的 1081 实例是 `0.0.0.0`，属不合规范。
+2. **停掉 1081 实例**：Go 与 Rust 客户端都用 1080，不能同时跑；
+   留两个重复 Go 客户端只会让服务端 `conns>1` 并分掉带宽（见下面的教训）。
+
+**验收（同一组合至少 5 轮，报区间）**
+
+| 用例 | 结果 |
+|---|---|
+| 无凭据 / 错口令 | 均 `code=000` 被拒 ✅ 鉴权确实生效 |
+| 出口 IP | `203.0.113.10` ✅ 流量确实走隧道 |
+| 串行 100MB（11 轮） | **11.8~18.7 MB/s（94~150Mbps）** |
+| 连续 10MB × 5 | 14.1~17.4 MB/s，全部 `code=200` |
+| 4 并发 100MB | 每流 4.32 MB/s，合计 **17.3 MB/s（138Mbps）** |
+| 本机回环 Go↔Go 30MB | 80~108 MB/s |
+| `sing-box check`（不用 root） | 通过 ✅ AGENTS.md 硬要求 |
+
+对照 Rust 客户端在同一 Go 服务端上的 14.8~15.1 MB/s：**Go↔Go 已在同一量级**。
+
+**撤回上一轮写进文档的两个结论**（都因为只测了几轮就下结论）
+
+1. ~~「Go 客户端仍比 Rust 慢 2.2 倍（5.9~7.2 vs 14.8 MB/s）」~~ →
+   按 11 轮重测后不存在，那个数字来自尚未重启到最终版的实例。
+2. ~~「服务端测 Go 客户端 RTT 228ms、Rust 78ms，说明 Go 的 ACK 晚了一个数量级」~~ →
+   这个数字**属于谁根本无法确定**：服务端统计的 `rtt=` 取的是循环里
+   **最后一条连接**的采样值，而当时日志常是 `conns=2/3`（Go 与 Rust 同时在跑），
+   且不标对端地址。这个观测缺陷本身已记入 DEVTIPS 88 末尾，
+   `PathStats` 需要带 per-conn 归属（与缺 `cwnd`/`inflight` 并列两处硬伤）。
+
+顺带：为验证「是不是残留会话状态污染了测量」专门跑了重复实验——1080 连跑 15 轮后
+仍是 15.3~18.7 MB/s，重启新实例也没更快，**该归因同样被证伪**。测量规矩写成
+DEVTIPS 91（吞吐至少 5 轮报区间、A/B 同一时刻交替、改动前后同机同目标同轮数、
+归因前先做能证伪它的实验、测吞吐时服务端只留一个客户端）。
+
+文档：`DEPLOY_CREDENTIALS.md` 重写为 Go↔Go 部署现状（含服务端 local_ip 过时结论的更正、
+Go 版更新/启停命令、u32 规则判读、验收表），`DEVTIPS.md` 更正 88 并新增 91，
+`PROJECT_PLAN.md` 补部署与测量规矩。本仓库不记录口令（该文件自身约定）。
+
+
+## 2026-11-14 01:25 (北京时间)
+
+### 公网传输根因修复：拥塞控制器从未安装 + NAT 源地址陷阱 + 静默丢 ACK
+
+**背景**：用户指出上一轮的「回环 97MB/s 已追平 Rust」并没有解决公网问题
+（「上面的工作没有解决问题，你完整阅读 go 和 rust 版本的代码」），
+并提示去读 `legacy-rust` 分支里的 md 记录。逐个控制变量实测后，真正的根因有四个，
+**全部是「代码写了但没接线」或「本地环境掩盖」**：
+
+| # | 缺陷 | 位置 | 实测影响 |
+|---|---|---|---|
+| 1 | **拥塞控制器从未安装**：`Attach()` 只在 Brutal 分支调 `SetCongestionControl`，BBR 分支什么都不做 | `quic/capped_bbr.go` | `cappedBbr`/`w.cap` 全是死代码，自适应窗口对真实发送零影响，日志 `cc=bbr` 是谎报。**服务端 254KB/s → 10.1MB/s** |
+| 2 | **NAT 云主机的 `local_ip` 陷阱**：网卡只有 `10.0.0.10`，包里填公网 `203.0.113.10` 会被网关反欺骗丢弃 | `socket_linux.go` | 服务端抓包能看到 SYN-ACK 发出、客户端一个包都收不到。改成「配置值不在本机网卡上就自动用探测到的出口地址」 |
+| 3 | **MSG_DONTWAIT + EAGAIN 静默丢弃**：发送队列一满，ACK 在本地被丢掉且无任何日志 | `socket_linux.go sendFlags` | 服务端测得 RTT 从 78ms 虚高到 215~228ms，BBR 带宽估计崩一半。改为阻塞 `flags=0`（数据面已全部收敛到 flushLoop 单协程，阻塞等于天然背压，与 Rust 一致） |
+| 4 | **收包侧从未批量**：`RecvBatch`(recvmmsg) 写完并有单测，但 `recvLoop` 仍逐包 `recvfrom` | `session.go` | 7700pps 时收包 syscall 成本与发送侧不对等 |
+
+顺带修好交叉编译缺口：`maxSendBatch`/`maxRecvBatch`/`RecvBatch`/`SendMode` 在
+`socket_stub.go` 里缺失，`GOOS=darwin/windows go build ./...` 会直接失败
+（AGENTS.md 要求必须能交叉编译）。其中 `maxSendBatch` 上一轮就已缺失，当时没跑交叉编译所以没发现。
+
+新增可观测性（都是这次排查中缺失的东西）：
+
+- `rawSocket.SendMode()` → `Listener/Session/Server` 透传，服务端与客户端各打一行启动日志，
+  明确「实际走 ipproto_raw 还是 af_packet、源 IP 到底是谁」；
+- 服务端 `QUIC 路径统计` 补上 `rtt=` 字段（原来只有 sent/lost/win_cap，
+  无法区分「链路慢」和「对端 ACK 不及时」，只能反复改代码二分）；
+- `flushLoop` 整批发送失败不再静默：计 `txSendErr`，开关 `FLOWTLS_DEBUG_SEND=1` 下记日志。
+
+**公网实测（本地 ↔ Oracle 新加坡 ARM，100MB）**
+
+| 组合 | 修复前 | 修复后 |
+|---|---|---|
+| Go 客户端 → Go 服务端 | 握手超时 / 49KB/s | **8.0~9.8 MB/s（64~78Mbps）** |
+| Rust 客户端 → Go 服务端 | 连不上（源地址被丢） | **14.8~15.1 MB/s（118~121Mbps）** |
+| Rust 客户端 → Rust 服务端 | 10.9 MB/s | 未回归 |
+| 本机回环 Go↔Go 30MB | 90~97 MB/s | **80~108 MB/s** |
+
+> **注意：本条上方表格里的 Go↔Go 吞吐已被 01:55 条目更正。**
+> 那行数字来自只测了几轮的旧实例，重复测量后实际是 11.8~18.7 MB/s（与 Rust 同量级）。
+> 「Go 客户端慢 2.2 倍」与「RTT 215~228ms」两个结论均已撤回，原因见 DEVTIPS 88/91。
+
+### 追加：又修了一个自己引入的回归（`bindRecv`）
+
+回环复测时发现本机 Go↔Go **全部 handshake timeout**：上一轮加的
+「客户端 recvFD 绑定出口网卡」用 `dst` 反推角色，而服务端为了探测出口网卡/
+网关 MAC 传的 dst 是 `8.8.8.8`（不满足当时假设的 `dst=0.0.0.0`），
+于是**服务端也被绑到物理网卡，收不到 lo 上的包**（违反 DEVTIPS 63）。
+
+改为调用方显式声明：`newRawSocket(dst, local, bindRecv)`，
+`Dial` 传 true、`Listener` 传 false。修完回环从 0 回到 **80~108 MB/s**。
+详见 DEVTIPS 90。教训：新引入的「优化开关」必须同时跑回环和公网两条链路。
+
+**撤销的改动**：把 `recvLoop` 拆成「pump 只 syscall + 处理侧解密」的两级结构后，
+吞吐没提升（6.2 vs 6.1 MB/s），却新增一个「处理侧跟不上就丢帧」的风险点，
+所以**已回退**，只保留单协程 + `RecvBatch`。
+
+**仍然存在的差距（未解决，下一步入口）**：Go 客户端方向比 Rust 慢 2.2 倍。
+已排除：拥塞控制未安装、窗口过大（压到 1.5MB 无效）、CPU 占用（2.1%）、
+内核接收队列积压（两级拆分无效）、服务端源地址、iptables 规则、wire format。
+未排除且缺工具：**Go 的 `PathStats` 没有 `Cwnd` / `BytesInFlight`**
+（Rust 的日志有 `cwnd=` / `inflight=` / `mtu=` / `pending=`），
+拿不到这两个值就无法在「拥塞窗口」和「接收流控」之间继续二分。
+
+**推翻了上一轮写进 DEVTIPS 的三个结论**：85（tcpdump 漏包）、86（同机进程伪 SYN
+一个通一个不通）、以及「公网不通是被 NAT/运营商 DPI 拦」。实际是服务端发包源地址
+配错与拥塞控制器未安装——服务器抓包早已证明 Go 的 SYN 到达并换回了 SYN-ACK。
+已在 DEVTIPS 83~86 上标注更正。
+
+**另：`legacy-rust:DEVTIPS.md` 第 20 条「云厂商 NAT 后面的机器不能用 FakeTCP」
+是过时结论**（第 21 条「运营商动态封禁」当时也被误用）。实测 NAT 云主机完全可用，
+条件是包里填内网地址、让网关做 1:1 SNAT。已在 DEVTIPS 87 记录正确做法。
+
+## 2026-11-13 23:59 (北京时间)
+
+### 传输层性能修复：批量发送 + 零分配 + ARP 解析 bug（回环 31 → 97 MB/s）
+
+**背景**：用户反馈「Go 版传输有问题，带宽要追平 Rust 版」。本地回环对照（同机、同客户端、30MB×3）：
+
+| 组合 | 修复前 | 修复后 |
+|---|---|---|
+| Go 客户端 → Go 服务端 | 31~50 MB/s（波动） | **90~97 MB/s** |
+| Go 客户端 → Rust 服务端 | 42 MB/s | 42 MB/s（未变） |
+
+**改动**
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 发送队列 + sendmmsg 批量 | `session.go` `flushLoop` | 持锁构造（保证 seq 顺序）→ 入队 → 单协程批量 `sendmmsg`（32 包/批），纯 ACK 与数据共用同一队列 |
+| 消除每包堆分配 | `codec.go` `Seal`/`OpenTo`/`ForEachRecord` | `make` 改 grow；解密直接用池缓冲；记录解析零分配 |
+| `deliverOwned` | `session.go` | 解密后的池缓冲直接投递，省一次拷贝 |
+| **ARP 解析 0x 前缀 bug** | `socket.go` `parseHexUint32` | `/proc/net/arp` 的 Flags 列是 `0x2`，旧解析遇 `x` 报错 → `resolveNeighborMAC` **永远失败** → AF_PACKET 发送 fd 从未创建，**所有部署一直在静默退化到 IPPROTO_RAW** |
+| `Close` 重复 close 同一 fd | `socket.go` | 默认 RAW 下 `sendFD == rawFD`，旧写法先置 -1 再比较导致二次 close，失败重连后网络状态错乱 |
+| 双 fd 策略 | `socket.go` `sendTarget` | 本机地址目标走 RAW（回环走 lo），其余按环境选 AF_PACKET/RAW |
+| 发送后默认值 | `socket.go` | 默认 IPPROTO_RAW（兼容 NAT 云主机），`FLOWTLS_AF_PACKET=1` 可选启用；`PACKET_QDISC_BYPASS` 默认关闭（e1000 虚拟网卡上会静默丢包），`FLOWTLS_QDISC_BYPASS=1` 开启 |
+| 客户端 recvFD 绑定出口网卡 | `socket.go` | 不绑定时会收到 lo/docker 全部流量，实测可把 SYN-ACK 挤丢 |
+
+**关键教训（详见 DEVTIPS 83~86）**
+
+- `parseHexUint32("0x2")` 遇到 `x` 返错，这个 bug 让 **AF_PACKET 路径从未被真正使用**，回环测试全绿掩盖了它；
+- `PACKET_QDISC_BYPASS` 在 e1000/QEMU 虚拟网卡上 sendto 返回成功但包不上线（tcpdump 0 个）；
+- Oracle NAT 只放行经过内核 conntrack 的包，AF_PACKET 旁路的 SYN-ACK 被网关静默丢弃；
+- tcpdump 的 BPF 在本机虚拟环境下会漏包，排查握手要改用 **Python AF_PACKET 裸抓**。
+
+**公网遗留问题（未闭环）**：同一时刻、同一链路、同一源端口下，**Rust 客户端能建连、Go 客户端握手超时**；两者 SYN 字节逐字段一致（含校验和自洽），Go 的 SYN 在客户端网卡可见，服务器侧收不到。已排除：端口冲突、校验和、非阻塞 fd、MSG_DONTWAIT、recvFD 绑定、ARP、QDISC_BYPASS。待下一轮继续。
+
+---
+
+## 2026-11-13 19:02 (北京时间)
+
+### P6 完成：BBR 拥塞控制 + 自适应窗口（吞吐 15 倍提升）
+
+**根因**
+
+quic-go 默认拥塞控制是 Cubic：把丢包一律当成拥塞信号，丢包即窗口减半。
+跨境链路 20~50% 丢包是物理常态、与拥塞无关，Cubic 因此反复把窗口砍到最小。
+实测吞吐只有 Rust 版的 1/5~1/10，用户主观感受就是「通道能用但速度低太多」。
+
+Rust 版用的是 quinn 的 BBR，外面再包一层 `CappedBbr` 钳窗口上限。
+Go 侧这两件事**都没有**——`flowtls/quic` 里一行拥塞控制代码都没有，
+等于直接吃 quic-go 的 Cubic 默认值。
+
+**实现**
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| BBR 本体 | `flowtls/quic/capped_bbr.go` | 用 `sing-quic/congestion_meta2`（与 hysteria2/tuic 同一个实现） |
+| 窗口钳制 | 同上 `cappedBbr` | 嵌入 `CongestionControlEx`，只在 `GetCongestionWindow`/`CanSend` 截断 |
+| 自适应窗口 | 同上 `windowController.loop` | 每 2 秒按实测丢包率调整，逻辑逐行对应 Rust |
+| 注入点 | `quic/client.go` `quic/server.go` | `winCtl.Attach(conn)`，服务端所有连接共享一份上限 |
+
+Rust 的 `CappedBbr` 是包一层 `Controller`，在 `window()` 里截断。
+Go 没法照抄（`congestion.CongestionControl` 只有 getter，没有 setter），
+但**语义可以完全等价**：嵌入 `CongestionControlEx` 后重写
+`GetCongestionWindow`/`CanSend`，其余方法全部原样委托。
+
+**为什么不重装控制器**：`Conn.SetCongestionControl` 会把
+`firstPacketNumber` 推到当前包号，新实例拿不到此前的发送/确认历史，
+带宽估计与 pacing 从头再来。每 2 秒重装一次等于让 BBR 永远停在 startup。
+只改共享原子值、让 `GetCongestionWindow` 每次重新 load，才能既实时生效
+又保留 BBR 内部状态——这正是 Rust 用 `Arc<AtomicU64>` 的理由。
+
+**统一 `max_cwnd` 配置**（对齐 Rust `net.max_cwnd`）
+
+| Rust | sing-box JSON | 默认 |
+|---|---|---|
+| `net.max_cwnd` | `max_cwnd` | `8388608`（8MB） |
+
+同时按 Rust 公式推导连接窗口：`send_window = max_cwnd × 2`，钳 [2MB, 16MB]。
+Go 侧 `InitialConnectionReceiveWindow` 仍保持 16MB（等于 Rust 的
+`receive_window(16MB)`），流窗口 4MB（等于 `stream_receive_window(4MB)`）。
+
+**修复：UDP 会话键用错（串流到错误目标）**
+
+Rust `proxy/socks5.rs` 的反向索引是 `(peer, target) → session`。
+Go 侧是「一个本地 socket 一个 session」，`WriteTo` 换目标时仍复用同一
+session id，而服务端**只在建会话时读一次目标**——于是发往 1.1.1.1 的包
+被送到 8.8.8.8。
+
+`docs/test_udp.py` 的第 3 项正好暴露了它：
+发送目标是 `1.1.1.1`，回程地址帧却是 `8.8.8.8`。
+（DNS 事务 ID 断言能过，因为 8.8.8.8 确实回答了那个查询——所以这个
+缺陷很难靠「能不能通」发现。）
+
+修法：`udpConn` 内部按目标地址帧维护 `map[string]*udpSession`，
+每个新目标自动分配 session id；下行合并进单一 `rx` 队列，
+`ReadFrom` 带回各自的目标地址；每 30 秒回收空闲 60 秒以上的会话
+（对齐 Rust 的 30 秒扫描 + `timeout_secs.max(10)`）。
+
+**实测（203.0.113.10，新加坡，跨境链路）**
+
+| 指标 | 修复前 | 修复后 | 提升 |
+|---|---|---|---|
+| 下行（单流 100MB） | 5.25 Mbps | **76~87 Mbps** | ~15x |
+| 上行（20MB POST） | 10.85 Mbps | **87 Mbps** | ~8x |
+| 4 并发下行 | —— | 4 × 2.5MB/s = 80 Mbps | 带宽公平共享 |
+| UDP DNS | 目标串流错误 | 目标正确，20/20 无丢包 | 修复 |
+
+**已知差异（刻意不跟）**
+
+Rust `transport_config` 里还有 `ack_frequency_config(max_ack_delay(5ms))`。
+quic-go 只能**解析** ACK Frequency 帧，不能发送，且
+`MaxAckDelay` 是 `internal/protocol` 里的常量（25ms），
+改它必须 fork quic-go——违反「依赖版本与 sing-box 逐字节对齐」的约束。
+
+实际影响很小：quic-go 每收到 2 个 ack-eliciting 包就立刻回 ACK
+（`packetsBeforeAck = 2`），25ms 只是「凑不满 2 个包」时的兜底。
+批量传输下 ACK 实际间隔远小于 5ms。记为已知差异，不改。
+
 ## 2026-11-13 14:45 (北京时间)
 
 ### P5-3 完成：CI 落地 + 伪装站反向代理模式

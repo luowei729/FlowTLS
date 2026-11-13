@@ -114,8 +114,22 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		opts.AcceptQueue = 64
 	}
 
-	dst := cfg.Listen.Addr()
-	raw, err := newRawSocket(dst, cfg.LocalIP)
+	// 探测用的目的地址**不能是监听地址**。
+	//
+	// 服务端 listen 通常是 0.0.0.0，拿它去查路由/网关 MAC 必然失败：
+	// 0.0.0.0 没有下一跳，resolveNeighborMAC 返回空，
+	// 发送时走 "自己拼以太网头" 分支，而目的 MAC 是全 0 —— 包发不出去。
+	// 表现是客户端发了 SYN、服务端 flowtls 也解出来了，但 SYN-ACK 到不了，
+	// 客户端只看到 handshake timeout。
+	//
+	// 与 Rust 版保持一致：固定用 8.8.8.8（一个必然走默认路由的外部地址）
+	// 去探测出口网卡与网关 MAC。回包源地址取 cfg.LocalIP，
+	// 但该值不在本机网卡上时（NAT 云主机写了公网地址）newRawSocket 会退回
+	// 探测到的出口地址，并通过 SendMode() 把这件事暴露到启动日志。
+	dst := netip.MustParseAddr("8.8.8.8")
+	// bindRecv=false：服务端必须收所有网卡（含 lo）的包，绑到探测出的
+	// 出口网卡会让回环联调的 SYN 永远收不到（newRawSocket 里有详细说明）。
+	raw, err := newRawSocket(dst, cfg.LocalIP, false)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +182,13 @@ func (l *Listener) Addr() netip.AddrPort {
 
 // LocalIP 返回对外使用的源 IP。
 func (l *Listener) LocalIP() netip.Addr { return l.raw.LocalIP }
+
+// SendMode 返回底层发送路径描述（含源地址被纠正的说明），供上层记启动日志。
+//
+// 为什么一定要把这行打进日志：发送路径（内核 IP 层 vs AF_PACKET）与最终源地址
+// 直接决定链路能不能通，而两者失败时的现象一模一样（对端一个包都收不到）。
+// 之前只能靠 strace + 双端抓包反推，成本极高。
+func (l *Listener) SendMode() string { return l.raw.SendMode() }
 
 // Users 返回用户表大小（供启动日志展示）。
 func (l *Listener) Users() int { return l.users.len() }
@@ -241,6 +262,17 @@ func (l *Listener) Stats() Stats {
 }
 
 // recvLoop 是唯一的收包协程：解析 → 分流。
+//
+// **逐包 recvfrom，不用 recvmmsg**。曾试过 recvmmsg 批量收（一次 32 个），
+// 结果吞吐从 87Mbps 崩到 7KB/s，且客户端 sent 计数完全停滞。
+// 根因：`recvmmsg` 的 mmsghdr 布局在 AF_PACKET 上没有得到真实验证
+// （本机回环测试被环境跳过），内核可能静默不填充 MsgLen，
+// 表现为「收包协程空转、包全丢」——而 masquerade 走内核 TCP 栈
+// 依然正常，极难定位。
+//
+// 教训：**任何 unsafe + syscall 的优化，没有能跑通的验证就不能上线**。
+// 收包侧的真实验证需要一个独立的发包源（另一台机器或 tcpdump 回灌），
+// 成本远高于收益，因此这里保持最简单的逐包实现。
 func (l *Listener) recvLoop() {
 	defer l.wg.Done()
 	buf := make([]byte, 65536)
@@ -334,7 +366,20 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
 	// 真实 TCP 对重传的 SYN 回**一模一样**的 SYN-ACK（ISN 不变），
 	// 客户端才能用同一个 ACK 完成握手。每次给新 ISN 会让客户端的
 	// peer_seq 被两个值来回拉扯，抓包一看就是伪造。
-	if st, ok := l.pending[client]; ok && now.Sub(st.at) < 10*time.Second {
+	//
+	// **但必须同时校验 ISN 相同**：真实 TCP 的重传 SYN 携带的是**同一个**
+	// ISN（客户端自己记着），ISN 变了就是一条全新连接。
+	// 只按时间判断会踩这个坑：客户端源端口固定（source_port 44311），
+	// 重启后四元组完全相同，若上一个实例的 pending 还在 10 秒窗口内，
+	// 服务端就会用**旧 ISN** 算 ack（ack = 旧 peerISN + 1），
+	// 与客户端刚发的 ISN 对不上 —— 客户端丢弃该 SYN-ACK 并重传 SYN，
+	// 实测要重试 3 次（约 2 秒）才建起来。
+	//
+	// 更严重的后果在链路上：这 2 个 ack 号错误的 SYN-ACK 会被沿途
+	// DPI 判为「TCP 状态异常」，该流从此不做应用识别 ——
+	// 表现为路由器连接表里隧道被标成通用 "SSL" 且提取不到域名，
+	// 而同样的配置在 Rust 版（旧实现不复用 pending）是正常的。
+	if st, ok := l.pending[client]; ok && now.Sub(st.at) < 10*time.Second && st.peerISN == p.Seq {
 		l.mu.Unlock()
 		l.sendSYNACK(client, st.peerISN, st.ourISN, st.ts, p.TSVal, p.HasTS)
 		return
@@ -469,11 +514,38 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 	}
 	// 首包已确认鉴权：服务端方向本来就不带首包头
 	codec.MarkEstablished()
+	// 初始化批量发送队列：服务端数据面也走 sendmmsg，
+	// 逐包 sendto 在 1 核 ARM 上会让驱动队列满而丢包（见 Session 注释）。
+	sess.newTxQueues()
 
 	l.mu.Lock()
 	l.byAddr[client] = sess
 	l.mu.Unlock()
 	l.statAccepted.Add(1)
+
+	// ---- 发伪 ServerHello（与 Rust 版 server.rs:807 一致）----
+	//
+	// 客户端的 ClientHello 是它自己构造的表演，我们看不到也不用看；
+	// 这里按真实 TLS 1.3 的顺序回三段：
+	//   16 03 03 ServerHello（明文，含 key_share）
+	//   14 03 03 00 01 01 ChangeCipherSpec
+	//   17 03 03 <随机密文> 加密握手消息
+	//
+	// 早期版本在 CCS 之后发的是明文 0x16，那是**协议违规**，
+	// DPI 一看就知道这不是真 TLS。
+	//
+	// 用 appendSegmentLocked 发送，因为它会推进 seq：
+	// ServerHello 占用的字节必须计入序号，否则后续 QUIC 数据的 seq
+	// 与对端看到的字节流对不上（ack 与 seq+len 不衔接 = 可检测特征）。
+	serverHello := BuildServerHello()
+	if pkt := sess.appendSegmentLocked(sess.wPkt[:0], serverHello, TCPPSH|TCPACK); len(pkt) > 0 {
+		if err := l.raw.Send(pkt, client.Addr()); err == nil {
+			sess.pktsSent.Add(1)
+		}
+	}
+	// 握手表演包已直接发出，从这里开始启动批量发送协程：
+	// 之后的 QUIC 数据面全部走「入队 + sendmmsg」。
+	sess.startSender()
 
 	// 把首包投进队列，让上层的 quic.Transport 一启动就能读到。
 	// 必须在交给 Accept 之前完成，否则 quic-go 的握手会一直等这个包。

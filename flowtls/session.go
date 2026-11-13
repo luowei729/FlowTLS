@@ -3,8 +3,10 @@ package flowtls
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,20 +70,61 @@ type Session struct {
 	readDeadline atomic.Uint64
 	// once 保护「关闭动作」（sendFIN + close(closeCh)）
 	once sync.Once
-	// rxOnce 单独保护 close(rx)：Close 与接收协程退出都会走到这里，
-	// 共用 once 会导致「先到者执行，后者再也无法关 rx」，
-	// 让另一方永久阻塞在读通道上。
-	rxOnce sync.Once
+	// rxMu / rxClosed 把「向 rx 发送」与「关闭 rx」互斥起来。
+	//
+	// 为什么不是 rxOnce 就够了：Close 与接收协程退出都会关 rx，
+	// sync.Once 只保证「只关一次」，**不能保证「关完之后没人再 send」**。
+	// Go 对已关闭通道发送是直接 panic（`send on closed channel`），
+	// 而不是返回错误，所以只要有一个投递方在 close 之后走到 send，
+	// 整个进程就挂了。旧写法靠「单包接收 + 两侧都先看 closed」把窗口撑得很小，
+	// 看起来没事；收包改成一批 32 包后窗口放大 32 倍，实测必然踩中（DEVTIPS 92）。
+	rxMu     sync.RWMutex
+	rxClosed bool
 
 	// 收发缓冲复用。受 mu 保护。
 	wRecord []byte
-	wPkt    []byte
+	// wPkt 是握手阶段的单包缓冲（SYN / ClientHello / ServerHello）。
+	//
+	// 握手包必须**立即**发出，不能进批量队列（队列会延迟到凑满一批），
+	// 所以身份包保留一条独立的一次性缓冲。稳态数据面不再用它。
+	wPkt []byte
+
+	// ---- 批量发送队列 ----
+	//
+	// 为什么需要队列：实测新加坡 1 核 ARM 服务端在 100Mbps 量级时，
+	// 每包一次 sendto 的 syscall 开销（单包约 40~50µs）让 CPU 饱和，
+	// AF_PACKET 驱动队列满后大量丢包（QUIC 侧 lost>10%，吞吐崩到 0.7Mbps）。
+	// Rust 版用 sendmmsg 一次 32 包，同样链路 lost 只有 0.57%。
+	//
+	// 顺序保证：入队发生在持有 s.mu 的临界区内（与 seq 推进同一把锁），
+	// 因此队列顺序 == TCP 序号顺序；纯 ACK 与数据包共用同一队列，
+	// 不会出现「ACK 的 seq 超过尚未发出的数据包」这种抓包可见的异常。
+	txCh   chan []byte
+	txWake chan struct{}
+	txStop chan struct{}
+	txWG   sync.WaitGroup
+	// txDropped 统计队列满丢弃的报文数（UDP 语义，QUIC 会重传）。
+	txDropped atomic.Uint64
+	// txSendErr 统计 flushLoop 批量发送整批失败的次数。
+	//
+	// 为什么单独计：发送失败会把整批报文一起丢，而在「阻塞 fd」语义下它
+	// 本不应该发生；一旦非零，说明链路/驱动在丢包，是吞吐下降的第一线索。
+	txSendErr atomic.Uint64
 
 	// 统计（供上层日志用）
 	pktsSent atomic.Uint64
 	pktsRecv atomic.Uint64
 	// rxDropped 统计因队列满而丢弃的包数（应为 0；非 0 说明背压链路断了）
 	rxDropped atomic.Uint64
+	// rxBytes 是 rx 队列里**未读的总字节数**。
+	//
+	// 为什么要单独记字节数：`AdvertisedWindow` 的参数是字节，
+	// 之前直接传 `len(s.rx)`（包数）——16384 个包实际是 21.8MB，
+	// 但被当成 16384 字节，于是通告窗口永远接近满值（16MB）。
+	// 后果：对端无限制地发 → rx 填满 → deliver 阻塞 → 收包协程停摆。
+	//
+	// deliver 时加、ReadFrom 时减，用原子操作是因为两者在不同协程。
+	rxBytes atomic.Int64
 	// lastSeenAt 是最后一次收到**任何属于本会话的包**的时刻（UnixNano）。
 	//
 	// 必须是「任何包」而不是「解密出数据的包」：QUIC 保活 PING 只换回
@@ -123,6 +166,7 @@ func (s *Session) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, nil, net.ErrClosed
 		}
 		n := copy(p, data)
+		s.rxBytes.Add(-int64(len(data)))
 		// 归还缓冲到池（data 是 deliver 从池里取的切片）。
 		// 这里只归还底层数组，不改长度：池里的元素仍可容纳同样大小的数据。
 		putBack := data[:cap(data)]
@@ -147,6 +191,7 @@ func (s *Session) ReadFrom(p []byte) (int, net.Addr, error) {
 					return 0, nil, net.ErrClosed
 				}
 				n := copy(p, data)
+				s.rxBytes.Add(-int64(len(data)))
 				putBack := data[:cap(data)]
 				bufPool.Put(&putBack)
 				return n, s.peerUDPAddr(), nil
@@ -164,6 +209,7 @@ func (s *Session) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, nil, net.ErrClosed
 		}
 		n := copy(p, data)
+		s.rxBytes.Add(-int64(len(data)))
 		putBack := data[:cap(data)]
 		bufPool.Put(&putBack)
 		return n, s.peerUDPAddr(), nil
@@ -173,21 +219,140 @@ func (s *Session) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // WriteTo 发送一个 QUIC 数据报。
+//
+// 报文在持锁的临界区内构造并**入队**，由 flushLoop 用 sendmmsg 批量发出。
+// 不能在这里直接 sendto：1 核 ARM 上每包一次 syscall 会在 100Mbps 量级饱和，
+// 驱动队列满后大量丢包（实测服务端 QUIC lost>10%，吞吐 0.7Mbps）。
+//
+// 早前「攒批把吞吐打到 7KB/s」的教训与本实现不冲突，根因有两条：
+//   - 当时用 `time.AfterFunc(200µs)` 兜底，Linux 定时器实际精度约 1ms，
+//     而本实现用 channel 唤醒，没有定时器延迟；
+//   - 当时纯 ACK 不进队列，seq 已推进的 ACK 先于数据包发出，对端判乱序。
+//     本实现所有发包路径共用同一队列，顺序 == 序号顺序。
 func (s *Session) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if s.closed.Load() {
 		return 0, net.ErrClosed
 	}
 	s.mu.Lock()
-	// 记录复用：稳态下零分配
+	// 记录复用：稳态下除入队拷贝外零分配
 	s.wRecord = s.codec.Seal(s.wRecord[:0], p)
-	s.wPkt = s.appendSegmentLocked(s.wPkt[:0], s.wRecord, TCPPSH|TCPACK)
-	err := s.raw.Send(s.wPkt, s.peer.Addr())
+	pkt := s.appendSegmentLocked(s.wPkt[:0], s.wRecord, TCPPSH|TCPACK)
+	s.enqueueLocked(pkt)
 	s.mu.Unlock()
-	if err != nil {
-		return 0, err
-	}
-	s.pktsSent.Add(1)
 	return len(p), nil
+}
+
+// enqueueLocked 把一个已构造好的报文放进发送队列（调用方必须持有 s.mu）。
+//
+// 必须持锁调用：入队顺序就是 TCP 序号顺序，这是纯 ACK 与数据包
+// 共用队列后仍然「抓包看不出异常」的前提。
+//
+// 报文要拷贝：pkt 指向 s.wPkt 这条复用缓冲，下一包会覆盖它。
+// 队列满时按 UDP 语义丢弃——这是最坏情况的兜底，quic-go 会重传。
+func (s *Session) enqueueLocked(pkt []byte) {
+	buf := txPool.Get().(*[]byte)
+	if cap(*buf) < len(pkt) {
+		*buf = make([]byte, len(pkt))
+	} else {
+		*buf = (*buf)[:len(pkt)]
+	}
+	copy(*buf, pkt)
+	select {
+	case s.txCh <- *buf:
+		// 非阻塞唤醒 flush 协程：已有唤醒信号时不必重复发
+		select {
+		case s.txWake <- struct{}{}:
+		default:
+		}
+	default:
+		// 队列满：归还缓冲并丢弃
+		txPool.Put(buf)
+		s.txDropped.Add(1)
+	}
+}
+
+// startSender 启动批量发送协程。
+//
+// 客户端在 StartReceiver 时启动（握手已完成）；服务端在会话建立时启动。
+// 握手阶段的 SYN / SYN-ACK / ClientHello 仍走直接 Send，
+// 因为它们必须在状态机推进前立刻上线。
+func (s *Session) startSender() {
+	s.txWG.Add(1)
+	go s.flushLoop()
+}
+
+// txPool 复用发送队列里的报文缓冲。
+//
+// 尺寸与 MTU 对齐：1417 字节是最大报文（1332 载荷 + 33 记录封装 + 52 IP/TCP 头）。
+var txPool = sync.Pool{New: func() any {
+	b := make([]byte, 0, 1536)
+	return &b
+}}
+
+// flushLoop 是唯一的发送协程：从队列取包，凑一批用 sendmmsg 发出。
+//
+// 批量大小的上限 32 与 Rust 版一致。每次被唤醒后**尽量排空**队列：
+// quic-go 的 sendQueue 在一轮 Run 里会连续调用多次 WriteTo（受 pacing 限制），
+// 这些包都能在同一个 sendmmsg 里发出。
+func (s *Session) flushLoop() {
+	defer s.txWG.Done()
+	batch := make([][]byte, 0, maxSendBatch)
+	for {
+		select {
+		case <-s.txStop:
+			return
+		case <-s.txWake:
+		}
+		for {
+			batch = batch[:0]
+			for len(batch) < maxSendBatch {
+				select {
+				case pkt := <-s.txCh:
+					batch = append(batch, pkt)
+				default:
+					goto send
+				}
+			}
+		send:
+			if len(batch) == 0 {
+				break
+			}
+			sent, err := s.raw.SendBatch(batch, s.peer.Addr())
+			if err != nil {
+				// 整批发送失败：计数并（开关下）记日志。以前这里是完全静默的，
+				// 导致「吞吐不知为何上不去」时无从查起。
+				s.txSendErr.Add(1)
+				if os.Getenv("FLOWTLS_DEBUG_SEND") == "1" {
+					log.Printf("flowtls: 批量发送失败 %d 包: %v", len(batch), err)
+				}
+			} else {
+				s.pktsSent.Add(uint64(sent))
+			}
+			// 归还缓冲。SendBatch 返回后内核已拷贝走报文内容。
+			for _, pkt := range batch {
+				p := pkt[:cap(pkt)]
+				txPool.Put(&p)
+			}
+			// 没凑满一批说明队列已空，回去等唤醒
+			if len(batch) < maxSendBatch {
+				break
+			}
+		}
+	}
+}
+
+// stopSender 停止批量发送协程并丢弃队列中未发出的报文。
+//
+// FIN 由 Close 直接发送（绕过队列），所以这里不需要等待队列排空：
+// 残留报文按 UDP 语义丢弃，对端 QUIC 会自行超时重连。
+func (s *Session) stopSender() {
+	select {
+	case <-s.txStop:
+		return // 已经停过
+	default:
+		close(s.txStop)
+	}
+	s.txWG.Wait()
 }
 
 // appendSegmentLocked 把 TLS 记录封装成一个 TCP 段（含 IP 头）。
@@ -202,7 +367,13 @@ func (s *Session) appendSegmentLocked(dst, payload []byte, flags uint8) []byte {
 		Ack:     s.peerSeq,
 		Flags:   flags,
 		IPID:    s.ipid,
-		Window:  AdvertisedWindow(len(s.rx)),
+		// Window 是通告给对端的接收窗口（未缩放的原始值）。
+		//
+		// **必须传未读字节数，不能传 len(s.rx)**：后者是包数，
+		// 16384 个包实际是 21.8MB，当成字节数后窗口永远接近满值（16MB），
+		// 对端就会无限制地发，直到 rx 填满。实测后果是两台服务器吞吐
+		// 同时崩到 63KB/s（详见 deliver 里 default 分支的注释）。
+		Window:  AdvertisedWindow(int(s.rxBytes.Load())),
 		TSVal:   s.clock.TSVal(),
 		TSecr:   s.clock.PeerTS,
 		Payload: payload,
@@ -218,6 +389,10 @@ func (s *Session) appendSegmentLocked(dst, payload []byte, flags uint8) []byte {
 //
 // 真实 TCP 是双向确认的，下载方向必须有反向纯 ACK，否则一眼就是伪造。
 // 纯 ACK 占包量的两成以上，必须走复用缓冲。
+//
+// **必须立即发送**：ACK 延迟会直接抬高对端的 RTT 估计。
+// 实测把它放进 200µs 攒批队列（Linux 定时器实际约 1ms）后，
+// RTT 从 76ms 虚高到 420ms，BBR 带宽估计崩塌，吞吐降到 7KB/s。
 func (s *Session) sendPureACK() {
 	if s.closed.Load() {
 		return
@@ -226,13 +401,10 @@ func (s *Session) sendPureACK() {
 	s.ackPend = 0
 	s.lastAck = time.Now()
 	pkt := s.appendSegmentLocked(s.wPkt[:0], nil, TCPACK)
-	// 纯 ACK 不占序号：appendSegmentLocked 已按 seqLen 判断
-	err := s.raw.Send(pkt, s.peer.Addr())
+	// 纯 ACK 不占序号：appendSegmentLocked 已按 seqLen 判断。
+	// 与数据包共用队列，保证 seq 顺序与发出顺序一致。
+	s.enqueueLocked(pkt)
 	s.mu.Unlock()
-	if err != nil {
-		return
-	}
-	s.pktsSent.Add(1)
 }
 
 // sendFIN 发 FIN 拆除连接，让拆除过程像真实 TCP。
@@ -257,12 +429,15 @@ func (s *Session) sendFIN() {
 // （反过来写时现象是：程序功能正常但进程永不退出，只能被 timeout 杀掉。）
 func (s *Session) Close() error {
 	s.once.Do(func() {
-		s.closed.Store(true)
 		s.sendFIN()
+		s.closed.Store(true)
+		// 停批量发送协程：之后不再有新的入队，残留报文按 UDP 语义丢弃
+		s.stopSender()
 		close(s.closeCh)
 		// 关 rx 让上层仍阻塞在 ReadFrom 的调用同样被唤醒：
 		// closeCh 只影响 select，而有数据分支可能先选中 rx。
-		s.rxOnce.Do(func() { close(s.rx) })
+		// 必须走 shutdownRx（与投递互斥），否则正在处理的那批包会向已关闭的通道发送而 panic。
+		s.shutdownRx()
 		// 只在自己拥有 socket 时才关闭。
 		//
 		// 客户端必须关：recvLoop 阻塞在 raw.Recv 上，只标 closed 不会唤醒它
@@ -296,6 +471,18 @@ func (s *Session) RemoteAddr() net.Addr {
 // 上层（sing-box outbound / 联调工具）用它把规则文本记进日志：
 // print 模式下这份文本就是运维需要手工安装的命令。
 func (s *Session) Rules() RuleReport { return s.rules }
+
+// SendMode 返回底层发送路径描述（见 Listener.SendMode）。
+//
+// 客户端用自己的 raw socket，服务端共用 Listener 的，两边语义一致：
+// 这条信息只用于启动日志，帮运维一眼看出「实际走内核还是 AF_PACKET、
+// 源地址到底用了谁」。
+func (s *Session) SendMode() string {
+	if s.raw == nil {
+		return "none"
+	}
+	return s.raw.SendMode()
+}
 
 // SetDeadline 实现 net.PacketConn。quic-go 用它做握手与 idle 超时。
 func (s *Session) SetDeadline(t time.Time) error {
@@ -391,11 +578,56 @@ func (s *Session) deliver(payload []byte) {
 		*buf = (*buf)[:len(payload)]
 	}
 	copy(*buf, payload)
+	s.deliverOwned(*buf)
+}
+
+// deliverOwned 同 deliver，但接管 owned 缓冲的所有权（不再拷贝）。
+//
+// 调用方必须保证 owned 来自 bufPool（ReadFrom 会用 data[:cap(data)] 归还），
+// 否则池里会混入不同容量的缓冲，后续取用时会隐性扩容。
+func (s *Session) deliverOwned(owned []byte) {
+	// **必须持读锁**：shutdownRx() 拿写锁 close(s.rx)。
+	// 不互斥就是「关完后仍然 send」的竞态，Go 会直接 panic。
+	// 下面三个分支全部非阻塞（select 带 default），
+	// 所以持读锁期间不会把写侧（关通道的人）卡住。
+	s.rxMu.RLock()
+	if s.rxClosed {
+		s.rxMu.RUnlock()
+		// 会话已结束：归还缓冲后退出
+		putBack := owned[:cap(owned)]
+		bufPool.Put(&putBack)
+		return
+	}
 	select {
-	case s.rx <- *buf:
+	case s.rx <- owned:
+		s.rxMu.RUnlock()
+		// 记账：AdvertisedWindow 要用真实未读字节数（见 rxBytes 的注释）
+		s.rxBytes.Add(int64(len(owned)))
 	case <-s.closeCh:
+		s.rxMu.RUnlock()
 		// 会话已关闭：归还缓冲后退出，不阻塞
-		bufPool.Put(buf)
+		putBack := owned[:cap(owned)]
+		bufPool.Put(&putBack)
+	default:
+		s.rxMu.RUnlock()
+		// **队列满：丢弃这个包，绝不能阻塞。**
+		//
+		// 没有这个分支会造成全局死锁：服务端的 handleIncoming 是由
+		// **唯一的** recvLoop 调用的（listener.go 里所有会话共享一个收包
+		// 协程）。只要有一个会话的 rx 满了，deliver 就永久阻塞，
+		// 整个 recvLoop 停摆 —— 所有会话同时收不到包、发不出 ACK，
+		// 服务端随即判定大面积丢包、BBR 降速到几乎为零。
+		//
+		// 实测症状（两台服务器都复现）：
+		//   - RTT 正常（78ms），但吞吐只有 63KB/s；
+		//   - 服务端 sent 计数停滞、lost 占比 9.5%；
+		//   - 客户端 sent 计数也停滞（它的 recvLoop 同样卡住）。
+		//
+		// 丢弃是正确的语义：这是 UDP，QUIC 会重传。
+		// 计数用于诊断——非 0 说明上层读得太慢，rxQueueDepth 需要调大。
+		putBack := owned[:cap(owned)]
+		bufPool.Put(&putBack)
+		s.rxDropped.Add(1)
 	}
 }
 
@@ -408,13 +640,24 @@ var bufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-// closeRx 标记会话结束并唤醒阻塞的读取方（接收协程退出时调用）。
+// shutdownRx 关闭 rx，唤醒仍阻塞在 ReadFrom 的调用方。幂等。
 //
-// 与 Close 共用 rxOnce，保证 rx 只被关一次。
+// 与 deliverOwned 里的发送用同一把锁串行化：只要两者互斥，
+// 「已关闭通道再 send」在语法上就不可能成立，不再依赖时序巧合。
+func (s *Session) shutdownRx() {
+	s.rxMu.Lock()
+	if !s.rxClosed {
+		s.rxClosed = true
+		close(s.rx)
+	}
+	s.rxMu.Unlock()
+}
+
+// closeRx 标记会话结束并唤醒阻塞的读取方（接收协程退出时调用）。
 func (s *Session) closeRx() {
 	s.closed.Store(true)
 	s.once.Do(func() { close(s.closeCh) })
-	s.rxOnce.Do(func() { close(s.rx) })
+	s.shutdownRx()
 }
 
 // ---- 客户端 ----
@@ -435,7 +678,9 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	if cfg.Password == "" {
 		return nil, errors.New("flowtls: password 不能为空")
 	}
-	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{})
+	// bindRecv=true：客户端只跟一个对端，把接收 fd 绑到出口网卡，
+	// 避开 lo / docker 上的无关流量把 AF_PACKET 接收队列淹没（见 newRawSocket）。
+	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +726,8 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		lastAck:    time.Now(),
 		rules:      rules,
 	}
+	// 初始化批量发送队列（flushLoop 在 StartReceiver 里启动）
+	s.newTxQueues()
 	// SYN 占 1 个序号
 	isn := uint32(time.Now().UnixNano())
 	s.seq = isn
@@ -501,6 +748,22 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		s.clock.Observe(synAck.tsval, synAck.hasTS)
 		ack := s.appendSegmentLocked(s.wPkt[:0], nil, TCPACK)
 		if err := raw.Send(ack, s.peer.Addr()); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		s.pktsSent.Add(1)
+
+		// ---- 发伪 ClientHello（与 Rust 版 client.rs:773 一致）----
+		//
+		// 顺序必须是「SYN → SYN-ACK → ACK → ClientHello → 数据」：
+		// 严格 NAT 只放行握手完成后的包，把 ClientHello 提前会导致它被丢弃。
+		//
+		// 没有这一步，线上字节流就是「TCP 握手完立刻 17 03 03」——
+		// 真实 TLS 永远先有 16 03 01/03 的 ClientHello，
+		// 按「第一个应用层字节」分类的 DPI 一眼就能判定这不是 HTTPS。
+		hello := BuildClientHello(cfg.SNI)
+		helloPkt := s.appendSegmentLocked(s.wPkt[:0], hello, TCPPSH|TCPACK)
+		if err := raw.Send(helloPkt, s.peer.Addr()); err != nil {
 			_ = raw.Close()
 			return nil, err
 		}
@@ -564,7 +827,21 @@ func (s *Session) exchangeSyn(timeout time.Duration) (synAckInfo, error) {
 			}
 			p, ok := ParseFrame(buf[:n])
 			if !ok {
+				// 排障开关：打印无法解析的帧（前 32 字节），
+				// 用于判断「收包格式不对（如无以太头）」还是「解析逻辑不匹配」。
+				if os.Getenv("FLOWTLS_DEBUG_HANDSHAKE") == "1" {
+					head := buf[:n]
+					if len(head) > 32 {
+						head = head[:32]
+					}
+					log.Printf("flowtls handshake: 收到无法解析的帧 len=%d head=%x", n, head)
+				}
 				continue
+			}
+			if os.Getenv("FLOWTLS_DEBUG_HANDSHAKE") == "1" {
+				log.Printf("flowtls handshake: recv %v:%d -> :%d flags=0x%02x seq=%d ack=%d (expect peer=%v:%d dstPort=%d ack=%d)",
+					p.Src, p.SrcPort, p.DstPort, p.Flags, p.Seq, p.Ack,
+					s.peer.Addr(), s.remotePort, s.localPort, isn+1)
 			}
 			// 只认「服务端 → 我们」的 SYN-ACK
 			if p.Src != s.peer.Addr() || p.SrcPort != s.remotePort ||
@@ -587,37 +864,88 @@ func (s *Session) exchangeSyn(timeout time.Duration) (synAckInfo, error) {
 	return synAckInfo{}, ErrHandshakeTimeout
 }
 
+// newTxQueues 初始化批量发送队列。
+//
+// 所有 Session 创建路径（客户端 Dial、服务端 Listener）都必须调用，
+// 否则 enqueueLocked 会往 nil channel 发送（select 的 default 分支会兜住，
+// 但报文会被全部丢弃）。
+func (s *Session) newTxQueues() {
+	s.txCh = make(chan []byte, txQueueDepth)
+	s.txWake = make(chan struct{}, 1)
+	s.txStop = make(chan struct{})
+}
+
+// txQueueDepth 是发送队列深度（单位：包）。
+//
+// 4096 × 1417B ≈ 5.8MB，覆盖连接级 BDP 的突发；
+// 队列存在只为吸收「构造速度 > sendmmsg 速度」的瞬时差额，
+// 持续过载时满即丢（UDP 语义）。
+const txQueueDepth = 4096
+
 // StartReceiver 启动常驻接收协程。
 //
 // 必须在握手完成后调用：握手阶段由 exchangeSyn 独占 raw socket。
 // 单独暴露而不是在 Dial 里自动启动，是为了让调用方能在启动前完成
 // quic.Transport 的装配，避免第一条包比 Transport 就绪还早到达。
+//
+// 同时启动批量发送协程：数据面从这一刻开始，握手包已经发完。
 func (s *Session) StartReceiver() {
+	s.startSender()
 	go s.recvLoop()
 }
 
 func (s *Session) recvLoop() {
 	defer s.closeRx()
-	buf := make([]byte, 65536)
+	// **批量收包**：一次 recvmmsg 最多拿 maxRecvBatch 个报文。
+	//
+	// 为什么批量：公网下行 10MB/s 是 ~7700pps，逐包 recvfrom 就是每包一次
+	// syscall（实测约 40µs）+ 一次协程调度。发送侧已经用 sendmmsg 把 syscall
+	// 降了 32 倍，收包侧不对等就会让内核接收队列积压，而队列长度直接变成
+	// 我们的 ACK 延迟、也就是对端算出来的 RTT。
+	//
+	// 曾经试过再拆一级（pump 只 syscall + 处理侧解密），实测吞吐无提升
+	// （6.2 vs 6.1 MB/s）却多了一个「处理侧跟不上就丢帧」的风险点，
+	// 所以回到单协程 + 批量。剩余差距见 DEVTIPS 88。
+	//
+	// 每个包必须用独立缓冲：同一批里多个包的密文要各自成立，
+	// 而 ParseFrame 的切片直接指向它们。
+	// 密文缓冲不会泄漏到下一轮：解密后的明文写进 bufPool 的另一块缓冲
+	// （OpenTo 的目标），交给 quic-go 的是明文，所以下一轮覆写 bufs 安全。
+	bufs := make([][]byte, maxRecvBatch)
+	for i := range bufs {
+		bufs[i] = make([]byte, 2048)
+	}
+	lens := make([]int, maxRecvBatch)
 	for {
 		if s.closed.Load() {
 			return
 		}
-		n, err := s.raw.Recv(buf)
+		n, err := s.raw.RecvBatch(bufs, lens)
 		if err != nil {
 			if s.closed.Load() {
 				return
 			}
+			// recvmmsg 在 fd 被关闭/打断时返回错误：退避一下避免空转刷 CPU。
+			time.Sleep(time.Millisecond)
 			continue
 		}
-		p, ok := ParseFrame(buf[:n])
-		if !ok {
-			continue
+		// 逐个处理本轮收到的包。顺序保持内核给定顺序，
+		// 与 handleIncoming 里的序号/时间戳推进语义一致。
+		for i := 0; i < n; i++ {
+			// 会话已关闭：剩下的一批直接丢掉（上面的循环窗口已缩小，
+			// 真正的安全保证是 deliverOwned 里的 rxMu：这里只是少做无用功）。
+			if s.closed.Load() {
+				return
+			}
+			p, ok := ParseFrame(bufs[i][:lens[i]])
+			if !ok {
+				continue
+			}
+			if !s.matchPeer(p) {
+				continue
+			}
+			s.handleIncoming(p)
 		}
-		if !s.matchPeer(p) {
-			continue
-		}
-		s.handleIncoming(p)
 	}
 }
 
@@ -649,7 +977,14 @@ func (s *Session) handleIncoming(p ParsedPacket) {
 	if len(p.Payload) > 0 {
 		s.ackPend++
 	}
-	needACK := s.ackPend >= 2 || time.Since(s.lastAck) >= 40*time.Millisecond
+	// 延迟确认：累计 2 段立即确认，或已有积压且超 40ms 兜底。
+	//
+	// **第二个分支必须有 `ackPend > 0` 前提**，与 Rust 逐条对齐
+	// （client.rs:808 / server.rs:501）。少了它，纯 ACK（无载荷）包也会
+	// 每 40ms 触发一次额外 ACK：那些包对对端毫无意义，却会抢发送锁、
+	// 挤满内核队列，把真正该及时发出的 ACK 拖慢。
+	needACK := s.ackPend >= 2 ||
+		(s.ackPend > 0 && time.Since(s.lastAck) >= 40*time.Millisecond)
 	s.mu.Unlock()
 
 	if len(p.Payload) == 0 {
@@ -660,19 +995,27 @@ func (s *Session) handleIncoming(p ParsedPacket) {
 	}
 	s.pktsRecv.Add(1)
 	// 解开每条 ApplicationData 记录。0x16 是表演握手，直接跳过。
-	for _, rec := range ParseRecords(p.Payload) {
+	//
+	// 用 ForEachRecord + OpenTo(池缓冲)：热路径零堆分配。
+	// 实测 9000pps 量级下，旧写法（ParseRecords 切片 + AEAD 新分配）
+	// 每秒产生 >20MB 垃圾，GC 停顿会直接拖慢收包。
+	ForEachRecord(p.Payload, func(rec TlsRecord) bool {
 		if rec.Type != RecAppData {
-			continue
+			return true
 		}
-		plain, ok := s.codec.Open(rec.Payload)
+		buf := bufPool.Get().(*[]byte)
+		plain, ok := s.codec.OpenTo(*buf, rec.Payload)
 		if !ok {
-			continue
+			bufPool.Put(buf)
+			return true
 		}
 		// 能解开对端的包，说明对端已经用我们的 authID 找对密钥并鉴权通过。
 		// 由此开始发送不再携带首包头（省 17 字节/包）。
 		s.codec.MarkEstablished()
-		s.deliver(plain)
-	}
+		// 明文已在池缓冲里，所有权转移给 deliverOwned，避免再拷贝一次。
+		s.deliverOwned(plain)
+		return true
+	})
 	// 延迟确认：累计 2 段立即确认，或超 40ms 兜底
 	if needACK {
 		s.sendPureACK()

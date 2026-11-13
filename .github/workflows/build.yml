@@ -1,0 +1,339 @@
+name: Build
+
+# 结构照抄上游 sing-box 的 .github/workflows/build.yml，只保留 FlowTLS 需要的部分。
+#
+# 上游的做法有三点值得抄，也是这份文件的骨架：
+#
+#   1. **版本号单独一个 job 算**（calculate_version），其它 job 通过 needs 引用。
+#      版本号只有一个来源，不会出现「Release 标题是 A、二进制里是 B」。
+#   2. **tags / ldflags 从 release/ 目录读，不写在 yaml 里**。
+#      上游已经维护了 DEFAULT_BUILD_TAGS_OTHERS / _WINDOWS / LDFLAGS 三个文件，
+#      在 yaml 里再抄一遍必然漂移（我们之前就抄漏了 windows 的两个 tag）。
+#   3. **产物统一 Archive 成 tar.gz / zip 再上传**，里面放 LICENSE。
+#      直接传裸二进制下载后没有许可证，也不方便分发。
+#
+# 与上游的差异：
+#   - 不做 deb / rpm / apk / pacman 打包（FlowTLS 只发二进制）
+#   - 不做 glibc / musl 两种 variant（CGO_ENABLED=0 已经静态，
+#     musl 变体对我们没有收益）
+#   - 不做 Android / Apple 库（sing-box 本体不依赖，属 FlowTLS 以外的事）
+
+on:
+  push:
+    branches: [main, legacy-rust]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/**"
+      - "!.github/workflows/build.yml"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本名（留空则用 VERSION 文件）"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # tag 构建不取消：发布被打断比多花几分钟更糟。
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # 必须与 sing-box/go.mod 的 go directive 完全一致，
+  # 否则 sagernet/sing 的 pseudoversion 会对不上（AGENTS.md 第 9 条）。
+  GO_VERSION: "1.25.5"
+
+jobs:
+  # ------------------------------------------------------------ 版本号（唯一来源）
+  calculate_version:
+    name: 计算版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: outputs
+        run: |
+          # 手动触发可以覆盖，日常构建一律以 VERSION 文件为准。
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version=$(cat VERSION)
+          fi
+          # 版本号必须能过 semver：1.14.4-rev.1 是合法的 prerelease。
+          # 拼错的版本号会让第三方客户端解析失败，必须在构建前拦住。
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "版本号不是合法 semver：$version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_ENV"
+
+  # ------------------------------------------------------------------ 单测与门禁
+  test:
+    name: 单测与门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # 缓存显式接管，原因见「缓存」注释。
+          cache: false
+
+      - name: 恢复 Go 缓存
+        id: gocache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      # tags / ldflags 与发行版构建用完全相同的来源，
+      # 否则单测跑的是「另一套编译配置」，测过了不代表发出去的对。
+      - name: 设置构建标签
+        run: |
+          echo "BUILD_TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_OTHERS),with_flowtls" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat sing-box/release/LDFLAGS)" >> "$GITHUB_ENV"
+
+      - name: go vet
+        working-directory: flowtls
+        run: go vet ./...
+
+      # wire format v2 的绝对字节基线。
+      # Rust 参考实现已冻结在 legacy-rust 分支，但黄金向量在仓库里，
+      # 所以这道门禁不需要 Rust 工具链。
+      - name: 冻结向量门禁
+        run: bash docs/interop_check.sh
+
+      - name: flowtls 单测（含竞态检测）
+        working-directory: flowtls
+        run: go test -race ./...
+
+      - name: sing-box 适配层单测
+        working-directory: sing-box
+        run: go test -race ./protocol/flowtls/...
+
+      - name: gofmt 检查
+        run: |
+          out=$(gofmt -l flowtls sing-box/protocol/flowtls sing-box/option/flowtls.go)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："
+            echo "$out"
+            exit 1
+          fi
+
+      - name: 保存 Go 缓存
+        # 只在这里保存：matrix 里十几个 job 同时存同一个 key 会互相覆盖。
+        if: steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+
+  # ------------------------------------------------------------------ 发行版构建
+  build:
+    name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.gomips && format('/{0}', matrix.gomips) }}
+    needs: calculate_version
+    runs-on: ubuntu-latest
+    strategy:
+      # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
+      fail-fast: false
+      matrix:
+        # 平台清单对着上游 sing-box 的发行矩阵裁掉不需要的：
+        # 保留主流架构，去掉 s390x / ppc64le / riscv64 / loong64
+        # （上游有，但 FlowTLS 没有这类部署场景，多一个平台就多一份维护）。
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm, goarm: "7" }
+          - { goos: linux, goarch: "386", go386: sse2 }
+          - { goos: linux, goarch: mipsle, gomips: softfloat }
+          - { goos: linux, goarch: mips64le, gomips: hardfloat }
+
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: "386" }
+          - { goos: windows, goarch: arm64 }
+
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+
+          - { goos: freebsd, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: 恢复 Go 缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      # **照抄上游的关键一步**：tags / ldflags 从 release/ 目录读，
+      # 不在 yaml 里重新抄一遍。windows 有独立的 tag 列表
+      # （多 with_naive_outbound 与 with_purego），抄错就等于发了个残缺版。
+      - name: 设置构建标签
+        run: |
+          set -xeuo pipefail
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_WINDOWS)
+          else
+            TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_OTHERS)
+          fi
+          echo "BUILD_TAGS=${TAGS},with_flowtls" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat sing-box/release/LDFLAGS)" >> "$GITHUB_ENV"
+
+      - name: 构建
+        working-directory: sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GO386: ${{ matrix.go386 }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
+        run: |
+          set -xeuo pipefail
+          mkdir -p ../dist
+          go build -v -trimpath -o ../dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      # 版本断言必须在打包之前：一个版本号里没有 rev 的二进制
+      # 会被误认为是官方版，这比构建失败严重得多。
+      #
+      # 只有 linux/amd64 那一格能真的执行（runner 本身是这个架构），
+      # 其余产物的版本号正确性由「同一个 ldflags 变量」保证——
+      # 它们在 yaml 里只有一处定义，不存在某一格写错的可能。
+      #
+      # 注意不能用 `... | grep -q`：grep 命中即退出会让写端收到 EPIPE，
+      # 配合 pipefail 会把成功判成失败（DEVTIPS 第 73 条）。
+      - name: 断言版本号与 tag
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -xeuo pipefail
+          out=$(./dist/sing-box version)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -F 'with_flowtls' > /dev/null \
+            || { echo "FAIL: 缺少 with_flowtls tag"; exit 1; }
+          printf '%s\n' "$out" | grep -F '${{ needs.calculate_version.outputs.version }}' > /dev/null \
+            || { echo "FAIL: 版本号不符"; exit 1; }
+
+      # 产物命名照抄上游：sing-box-<version>-<os>-<arch>[v7][-softfloat]
+      - name: 设置产物名
+        run: |
+          set -xeuo pipefail
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
+          elif [ -n "${{ matrix.go386 }}" ] && [ "${{ matrix.go386 }}" != "sse2" ]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
+          elif [ -n "${{ matrix.gomips }}" ] && [ "${{ matrix.gomips }}" != "hardfloat" ]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
+          fi
+          echo "DIR_NAME=${DIR_NAME}" >> "$GITHUB_ENV"
+
+      # Archive 照抄上游：打成一个目录再压 tar.gz / zip，里面放 LICENSE。
+      # **LICENSE 缺失必须让构建失败**：sing-box 是 GPLv3，
+      # 分发不带许可证不合规。所以这里不用 `|| true` 兜底。
+      - name: 打包
+        run: |
+          set -xeuo pipefail
+          cd dist
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}/"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp sing-box "${DIR_NAME}/sing-box.exe"
+            zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
+          else
+            cp sing-box "${DIR_NAME}/sing-box"
+            tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          fi
+          rm -r "${DIR_NAME}" sing-box
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.gomips && format('-{0}', matrix.gomips) }}
+          # 用多行 block scalar 而不是压成一行：upload-artifact 的 path
+          # 每行一个 glob，这里是两个。别写成 "a b"——那会被当成一个路径。
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------- 发布
+  release:
+    name: 发布 Release
+    needs: [calculate_version, build]
+    # 只在 tag 上跑：push 到 main 只产出 artifact，不建 Release。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          set -xeuo pipefail
+          cd artifacts
+          ls -lh
+          # sha256 是发布物的最低要求：用户下载后要能自己验证完整性。
+          sha256sum * > sha256sum.txt
+          cat sha256sum.txt
+
+      - name: 生成 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/sha256sum.txt
+          draft: false
+          prerelease: false
+          body: |
+            `sing-box ${{ needs.calculate_version.outputs.version }}` — FlowTLS rev 发行版。
+
+            与官方版的唯一区别是版本号后缀 `-rev.N` 与内置的 `with_flowtls` 协议；
+            二进制名保持 `sing-box`，配置格式与上游完全兼容。
+
+            校验完整性：
+
+            ```
+            sha256sum -c sha256sum.txt
+            ```

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -25,6 +26,23 @@ type ServerOptions struct {
 	TLS *tls.Config
 	// QUIC 为 nil 时使用 DefaultServerQUICConfig()
 	QUIC *quicgo.Config
+	// MaxCwnd 是 QUIC 拥塞窗口上限（字节），对应 Rust 配置的
+	// `net.max_cwnd`。0 表示用 DefaultMaxCwnd（8MB）。
+	//
+	// 服务端与客户端不同：这里是**所有连接共享一份上限**，
+	// 自适应按全部连接的汇总丢包率调整（与 Rust `server.rs` 一致）。
+	MaxCwnd uint64
+	// OnStats 是每 2 秒一次的路径统计回调，可为 nil。
+	OnStats func(PathStats)
+	// BrutalBPS > 0 时启用 Brutal 拥塞控制（hy1 风格）：
+	// **丢包不减窗，按这个带宽硬发**。单位字节/秒。
+	//
+	// **服务端这里填的是服务端自己的上行带宽**（= 客户端的下行）。
+	// 跨境高丢包链路上，服务端下行（即客户端下载）往往是体验瓶颈，
+	// 所以这个值要按服务器真实出口带宽填。0 表示走 BBR。
+	BrutalBPS uint64
+	// BrutalMultiplier 是 cwnd 相对 BDP 的倍数，默认 2.0（同 hy1）。
+	BrutalMultiplier float64
 }
 
 // DefaultServerQUICConfig 是服务端默认参数。
@@ -36,15 +54,29 @@ type ServerOptions struct {
 //     关掉能少一类攻击面。
 func DefaultServerQUICConfig() *quicgo.Config {
 	return &quicgo.Config{
-		EnableDatagrams:            true,
-		DisablePathMTUDiscovery:    true,
-		InitialPacketSize:          1340,
-		MaxIdleTimeout:             60 * time.Second,
-		KeepAlivePeriod:            0, // 服务端不发保活，由客户端负责
-		MaxIncomingStreams:         4096,
-		MaxIncomingUniStreams:      -1,
-		InitialStreamReceiveWindow: 4 * 1024 * 1024,
-		MaxStreamReceiveWindow:     8 * 1024 * 1024,
+		EnableDatagrams: true,
+		// 与客户端、与 Rust 侧（quic/config.rs 的 mtu_discovery_config(None)）
+		// 全部对齐，理由见 DefaultQUICConfig 的注释。
+		DisablePathMTUDiscovery: true,
+		// 1332 而不是 1340：外层 TCP 头多了 12 字节时间戳选项，
+		// 1332 + 33 + 20 + 32 = 1417 < 链路 1428。
+		InitialPacketSize: 1332,
+		// 30s / 10s：与 Rust 侧 max_idle_timeout / keep_alive_interval 一致。
+		MaxIdleTimeout:  30 * time.Second,
+		KeepAlivePeriod: 10 * time.Second,
+		// 服务端要给每个客户端开大量流（每条本地连接一条流），
+		// 1024 与 Rust 侧 max_concurrent_bidi_streams 一致。
+		MaxIncomingStreams: 1024,
+		// 本协议不用单向流，但保持与 Rust 侧同值（Rust 也是 1024）。
+		// 设 -1 会在传输参数里通告 0，虽不影响功能，但让两端参数不一致。
+		MaxIncomingUniStreams: 1024,
+		// 窗口与客户端/Rust 侧对齐：连接 16MB、流 4MB。
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         4 * 1024 * 1024,
+		// DATAGRAM 单帧上限与 MTU 对齐（UDP 不分片）
+		MaxDatagramFrameSize: 1200,
 	}
 }
 
@@ -77,6 +109,9 @@ type Server struct {
 
 	mu    sync.Mutex
 	conns map[*quicgo.Conn]struct{}
+
+	// winCtl 是 BBR + 自适应窗口上限控制器，所有连接共享。
+	winCtl *windowController
 }
 
 // NewServer 启动服务端。
@@ -103,6 +138,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 		conns:    make(map[*quicgo.Conn]struct{}),
+		winCtl:   newWindowControllerEx(opts.MaxCwnd, opts.OnStats, opts.BrutalBPS, opts.BrutalMultiplier),
 	}
 	s.wg.Add(1)
 	go s.acceptLoop(quicConf)
@@ -132,12 +168,25 @@ func (s *Server) ListenerStats() flowtls.Stats { return s.listener.Stats() }
 // 由适配层取走记日志：print 模式下这份文本就是运维需要手工执行的命令。
 func (s *Server) ListenerRules() flowtls.RuleReport { return s.listener.Rules() }
 
+// SendMode 返回底层发送路径描述（含源地址被纠正的说明）。
+//
+// 为什么透传这一行：NAT 云主机上包里的源地址决定了链路通不通，
+// 而配错时的现象（服务端发得出、对端收不到）与拥塞/丢包问题看起来一模一样。
+// 适配层把它写进启动日志，运维一眼就能确认实际发送路径与生效的源地址。
+func (s *Server) SendMode() string { return s.listener.SendMode() }
+
+// LocalIP 返回回包实际使用的源 IP（可能与配置值不同，见 SendMode）。
+func (s *Server) LocalIP() netip.Addr { return s.listener.LocalIP() }
+
 // Close 停止服务并关闭所有连接。
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.cancel()
 		err = s.listener.Close()
+		// 停自适应循环：它会持续遍历连接读统计，
+		// 服务端退出后不该继续跑。
+		s.winCtl.Close()
 	})
 	s.wg.Wait()
 
@@ -202,6 +251,10 @@ func (s *Server) serveSession(sess *flowtls.Session, quicConf *quicgo.Config) {
 		_ = transport.Close()
 		return
 	}
+	// 服务端也要 BBR + 窗口上限，理由与客户端一致（见 quic/client.go）。
+	// 两端都用 BBR 才能避免「一端 BBR 猛发、另一端 Cubic 丢包减半」的错配。
+	// 服务端所有连接共享同一个窗口上限（同 Rust 的 Arc<AtomicU64>）。
+	s.winCtl.Attach(conn)
 
 	s.mu.Lock()
 	s.conns[conn] = struct{}{}
@@ -220,6 +273,10 @@ func (s *Server) serveSession(sess *flowtls.Session, quicConf *quicgo.Config) {
 	case <-s.ctx.Done():
 		_ = conn.CloseWithError(0, "server closed")
 	}
+
+	// 先从统计里摘掉，再回收 socket：否则自适应循环会去读
+	// 已经销毁的连接，并且把死连接的丢包率算进窗口调整。
+	s.winCtl.Detach(conn)
 
 	s.mu.Lock()
 	delete(s.conns, conn)
