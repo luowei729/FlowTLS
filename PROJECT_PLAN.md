@@ -1,6 +1,48 @@
 # PROJECT_PLAN
 
-## 当前状态（2026-11-13 00:15 北京时间）
+## 当前状态（2026-11-13 10:41 北京时间）
+
+### 新增方向：sing-box 协议库 + rev 发行版（P0 已完成）
+
+用户决策：把 FlowTLS 做成「与 hysteria2 / anytls 平级的独立协议库」，
+并在本仓单独发行一个带 flowtls 的 sing-box 构建。
+
+**已落地（P0）**：
+
+| 项 | 内容 |
+|---|---|
+| 上游基线 | `git subtree` 引入 sing-box **v1.14.4** 到 `sing-box/` |
+| 版本号 | `1.14.4-rev.1`（合法 semver，二进制名保持 `sing-box`） |
+| 上游补丁 | **2 文件 7 行**（`constant/proxy.go` +3、`include/registry.go` +4） |
+| 独立模块 | `flowtls/`（不 import sing-box，仅 doc/config/errors 骨架） |
+| 适配层 | `sing-box/protocol/flowtls/`（P0 只做参数校验） |
+| 构建 | `make build` → `dist/sing-box-1.14.4-rev.1-linux-amd64`（78MB） |
+| 设计文档 | `docs/SINGBOX_INTEGRATION.md` |
+
+验收通过：`version` 显示 `1.14.4-rev.1` + `with_flowtls`；
+`check` 对 flowtls 配置给出明确「未实现」；不带 tag 的构建给出「未编入」；
+常规 mixed 配置 `check` 仍 PASS；`check` 不需要 root。
+
+**后续里程碑**：
+
+| 阶段 | 内容 | 估时 |
+|---|---|---|
+| P1 | `flowtls/` 主包：packet/socket/codec/session/listener + 单测 | 8~10 天 |
+| P2 | `quic/` 子包 + outbound 适配，TCP 打通 Rust 服务端 | 5~7 天 |
+| P3 | UDP（udpnat2 + session 映射），dig 通 | 5~7 天 |
+| P4 | inbound 适配 + 与 Rust 客户端互通 | 5~7 天 |
+| P5 | 打包脚本、CI 互通矩阵、配置迁移文档 | 5 天 |
+
+P2 是分水岭：Go 客户端跑通 Rust 服务端的 `curl` + `dig`，才能证明线路兼容。
+
+**待决策**：① wire format 是否加版本位（建议 P2 之前定）；
+② 是否支持多用户（影响 `session.go` 密钥结构）；③ `REV` 是否自动递增。
+
+**注**：Rust 版继续作为生产可用版本与互通基准，Go 重写期间两者并行。
+
+---
+
+## 上一阶段状态（2026-11-13 00:15 北京时间）
 
 v0.2.0：在 v0.1.0 基础上完成稳定性与自适应优化，已通过跨境实测（100M 端口 79/64 Mbps）。
 

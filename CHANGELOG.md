@@ -1,5 +1,90 @@
 # CHANGELOG
 
+## 2026-11-13 10:41 (北京时间)
+
+### P0：引入 sing-box v1.14.4，产出 `1.14.4-rev.1` 发行二进制
+
+用户决策链：先把 FlowTLS 做成「与 hy2/anytls 平级的独立协议库」，
+再在本仓单独发行一个带 flowtls 的 sing-box 构建（rev 版）。
+
+**名称与版本号**：二进制名**保持 `sing-box` 不改**，只用版本号区分官方版。
+版本号定为 `1.14.4-rev.1` 而不是 `1.14.4rev`——后者不是合法 semver，
+面板/客户端做 `semver.Parse` 会直接报错，前者可被正常识别。
+
+**引入方式**：`git subtree add --prefix sing-box ... v1.14.4 --squash`。
+选 subtree 不选 submodule：补丁要留在自己仓库里、`git log` 可审计、
+一个 clone 就能构建。不用 `go mod vendor`（会到 1GB+）。
+
+**上游补丁总敳：2 个文件、7 行**
+
+```
+sing-box/constant/proxy.go    +3   ProxyDisplayName 增加 FlowTLS 分支
+sing-box/include/registry.go  +4   inbound/outbound 各插一行注册调用
+```
+
+刻意把 `TypeFlowTLS` 与全部错误常量放进**新文件** `constant/flowtls.go`，
+而不是塞进 `proxy.go`/`err.go`——新文件在 `git subtree pull` 时永不冲突。
+（第一版曾是 4 文件 28 行，重构后压到 2 文件 7 行。）
+
+**版本号注入不改上游源码**：
+
+```
+-X github.com/sagernet/sing-box/constant.Version=1.14.4-rev.1
+```
+
+上游 `release/LDFLAGS` 只含 `godebugDefault` 和 `checklinkname`，
+不含 Version，所以追加不会覆盖任何东西。
+
+**build tag 双文件**（照抄 `include/quic.go` / `quic_stub.go`）：
+未开 `with_flowtls` 时注册 stub 返回 `ErrFlowTLSNotIncluded`，
+而不是干脆不注册——否则用户看到 `unknown inbound type`，
+分不清是「没开 tag」还是「type 拼错了」。
+
+**新增文件**：
+
+| 文件 | 作用 |
+|---|---|
+| `flowtls/` | 独立 Go module（不 import sing-box），只有 doc/config/errors 骨架 |
+| `sing-box/protocol/flowtls/` | 适配层，P0 只做参数校验 |
+| `sing-box/option/flowtls.go` | 配置结构，内嵌 ListenOptions/DialerOptions/ServerOptions |
+| `sing-box/constant/flowtls.go` | 类型常量 + 3 个错误 |
+| `sing-box/include/flowtls.go` | `//go:build with_flowtls` |
+| `sing-box/include/flowtls_stub.go` | `//go:build !with_flowtls` |
+| `Makefile` + `VERSION` | 构建/发行/验收/上游同步 |
+| `docs/SINGBOX_INTEGRATION.md` | 设计文档 |
+
+**依赖版本对齐**：`flowtls` 依赖的 `sagernet/sing` 必须与
+`sing-box/go.mod` **完全一致**（`v0.9.7-0.20261023115459-5dc452e537bf`），
+否则 `M.Socksaddr` 等类型会对不上。第一次误用了 testing 分支的版本，已改正。
+
+**验收结果**：
+
+```
+$ ./dist/sing-box-1.14.4-rev.1-linux-amd64 version
+sing-box version 1.14.4-rev.1
+Tags: with_gvisor,with_quic,...,with_flowtls
+CGO: disabled
+
+$ ./dist/sing-box-1.14.4-rev.1-linux-amd64 version --name
+1.14.4-rev.1
+
+$ ... check -c flowtls-inbound.json
+FATAL initialize inbound[0]: flowtls is registered but the transport layer is not implemented yet
+
+$ 不带 with_flowtls 构建
+FATAL initialize inbound[0]: flowtls is not included in this build, rebuild with -tags with_flowtls
+
+$ ... check -c 常规mixed配置
+check PASS
+```
+
+`check` 不需要 root（硬要求），因为它只走构造函数、不开 raw socket。
+
+**环境**：本机原本没有 Go，已安装官方 `go1.25.5.linux-amd64` 到 `/usr/local/go`。
+
+**未做**：GPLv3 §5(a) 的修改声明（NOTICE）——用户明确表示仓库后续会私有化，
+分发义务目前不触发；若将来对外发二进制需补上。
+
 ## 2026-11-13 00:15 (北京时间)
 
 ### 版本收敛：两端统一到最新版，清理全部旧版本残留

@@ -102,6 +102,9 @@ func ProxyDisplayName(proxyType string) string {
 		return "Hysteria2"
 	case TypeAnyTLS:
 		return "AnyTLS"
+	// Modified by FlowTLS (2026-11-13): 让日志/describe 显示为 FlowTLS 而不是 Unknown。
+	case TypeFlowTLS:
+		return "FlowTLS"
 	case TypeOpenConnect:
 		return "OpenConnect"
 	case TypeOpenVPNClient:

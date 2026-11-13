@@ -1234,7 +1234,118 @@ ssh root@server 'cat /opt/flowtls/server.yaml' | diff - deploy/server-giga.yaml
 第 5 步这次就抓到了 `max_cwnd` 2MB vs 8MB 的漂移——
 **「本地回退了配置但忘了同步服务器」是最容易犯的错**。
 
-## 54. 常用调试命令
+## 54. sing-box 集成：为什么补丁必须压到「新建文件」
+
+集成方案是 `git subtree` 引入上游 + 少量补丁。`git subtree pull` 的冲突面
+**完全等于「改动了上游多少个已有文件」**，所以纪律是：
+
+1. 新功能、新常量、新错误 → **全部新建文件**（新文件永不冲突）；
+2. 确实得改已有文件时，只做最小的插入，位置选上游极少变动的地方；
+3. 绝不改 `route/`、`common/`、`adapter/` 这类核心目录。
+
+第一版把 `TypeFlowTLS` 和 3 个错误分别塞进 `constant/proxy.go`、
+`constant/err.go`，得到「4 个文件 28 行」。重构后：
+
+| 做法 | 上游改动 |
+|---|---|
+| 常量/错误内联进已有文件 | 4 文件 28 行 |
+| 常量/错误搬到 `constant/flowtls.go` | **2 文件 7 行** |
+
+剩下必须改的两处：
+
+- `include/registry.go`：inbound/outbound 各插一行注册调用（插在
+  `registerStubForRemoved*` 之前，这块上游很稳定）；
+- `constant/proxy.go`：`ProxyDisplayName` 加一个 `case`（不加就显示 Unknown，
+  只影响日志可读性，属于可接受损失）。
+
+## 55. 未编入的可选协议要注册 stub，不能「干脆不注册」
+
+`include/quic_stub.go` 的做法值得照抄：未开 `with_quic` 时依然注册，
+只是构造函数直接返回 `ErrQUICNotIncluded`。
+
+如果改成完全不注册，用户配置里写 `type: hysteria2` 会得到
+`unknown inbound type`，他分不清是：
+
+- 「这个构建没开 tag」
+- 「type 字符串拼错了」
+
+注册 stub 后错误信息直接告诉你 `rebuild with -tags with_flowtls`，
+差一个字的成本，排查时间差一个量级。
+
+## 56. `sing-box check` 会跑完整构造流程，构造函数里不能申请权限
+
+`check` 不是纯静态分析，它执行的是：
+
+```go
+box.New(...)  →  各 inbound/outbound 的 NewXxx(...)  →  instance.Close()
+```
+
+所以只要在 `NewInbound` / `NewOutbound` 里做了任一有副作用的动作：
+
+- 开 raw socket / AF_PACKET
+- 写 iptables
+- bind 端口
+
+`check` 就会失败，而且是在**普通用户**下失败——用户会以为配置写错了。
+
+正确切分：
+
+| 阶段 | 允许做的事 |
+|---|---|
+| `NewXxx()` | 参数校验、结构体组装、纯内存初始化 |
+| `Start(StartStateInitialize)` | 创建 client 对象（anytls 就把 `anytls.NewClient` 放这里） |
+| `Start(StartStateStart)` | bind 端口、开 raw socket、装防火墙规则 |
+
+这条对 flowtls 是硬约束：它的 inbound 不 bind 内核端口，全部靠 AF_PACKET。
+
+## 57. `sagernet/sing` 版本必须与 sing-box 逐字一致
+
+独立协议 module（如 `flowtls/`）不 import sing-box，但会 import
+`sagernet/sing`。这个依赖的版本**不能用 `go mod tidy` 自己选**。
+
+原因：协议适配层要和 sing-box 互相传递 `M.Socksaddr`、`N.PacketConn`、
+`buf.Buffer` 等类型。同一个包的两个不同 commit，在 Go 的模块图里是
+**两个不同的包路径实例**，类型不兼容，报错是这种：
+
+```
+cannot use xxx (variable of type metadata.Socksaddr)
+  as metadata.Socksaddr value in argument
+```
+
+看起来完全废话，实际是版本不一致。正确做法：
+
+```bash
+# 1. 先看 sing-box 锁的是哪个版本
+grep "sagernet/sing " sing-box/go.mod
+
+# 2. 把协议 module 钉到同一版本（注意：这是 pseudoversion，
+#    随手抄 testing 分支的值会错）
+cd flowtls
+go get github.com/sagernet/sing@v0.9.7-0.20261023115459-5dc452e537bf
+```
+
+我在 P0 就踩了一次：先抄了 `testing` 分支 go.mod 的
+`v0.9.7-0.20261110095940-...`，而 `v1.14.4` 锁的是
+`v0.9.7-0.20261023115459-...`。
+
+## 58. 版本号用 `1.14.4-rev.1`，不要用 `1.14.4rev`
+
+`1.14.4rev` 看着更简洁，但它**不是合法 semver**：
+`rev` 既不是 `-prerelease` 也不是 `+build`，严格解析器直接报错。
+
+三方面板、订阅转换、GUI 的「检查更新」大量用 `semver.Parse` 处理
+`sing-box version --name` 的输出，非法的版本号会让这些工具报错或判定异常。
+
+| 写法 | 合法 | 与 1.14.4 排序 | 备注 |
+|---|---|---|---|
+| `1.14.4rev` | ❌ | 无法比较 | 部分工具报错 |
+| **`1.14.4-rev.1`** | ✅ | 低于 1.14.4 | **推荐**，不会被误判成比官方新 |
+| `1.14.4+rev.1` | ✅ | 等于 1.14.4 | 很多工具会丢弃 metadata |
+| `1.14.5-rev.1` | ✅ | 高于 1.14.4 | 易被误认为官方有新版本 |
+
+第二个区分标志是 `Tags:` 里带 `with_flowtls`——官方构建永远不会有这个 tag。
+
+## 59. 常用调试命令
 
 ```bash
 # 看线上外观：应只有 TCP 8443 + 17 03 03

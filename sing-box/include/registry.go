@@ -72,6 +72,8 @@ func InboundRegistry() *inbound.Registry {
 
 	registerQUICInbounds(registry)
 	registerCloudflaredInbound(registry)
+	// Modified by FlowTLS: 注册 flowtls 入站（2026-11-13）。
+	registerFlowTLSInbounds(registry)
 	registerStubForRemovedInbounds(registry)
 
 	return registry
@@ -102,6 +104,8 @@ func OutboundRegistry() *outbound.Registry {
 	anytls.RegisterOutbound(registry)
 
 	registerQUICOutbounds(registry)
+	// Modified by FlowTLS: 注册 flowtls 出站（2026-11-13）。
+	registerFlowTLSOutbounds(registry)
 	registerStubForRemovedOutbounds(registry)
 
 	return registry
