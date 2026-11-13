@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -128,9 +130,14 @@ func newMasquerade(ctx context.Context, addr net.Addr, opts MasqueradeOptions) (
 		// 与真实站点一致的超时，避免「没有超时」成为特征
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		// 不打印任何东西：这个站点的日志对我们没用，
-		// 而默认 logger 会把每条请求写进 sing-box 日志，噪声很大。
-		ErrorLog: nil,
+		// 必须显式给一个丢弃型 logger。
+		//
+		// ErrorLog 为 nil 不等于「不打印」——Go 的语义是「用标准 logger」，
+		// 也就是全部写到 stderr。对这个站点来说那是灾难：
+		// 主动探测者会故意发畸形 TLS，每次握手失败都会打一行
+		// "http: TLS handshake error from <IP>: ..."，
+		// 把 sing-box 自己的日志冲掉，还会把探测者的 IP 留在盘上。
+		ErrorLog: log.New(io.Discard, "", 0),
 	}
 	// TLS 握手在 listener 层完成，http.Server 只处理明文 HTTP。
 	m.listener = tls.NewListener(ln, tlsConf)

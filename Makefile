@@ -66,9 +66,14 @@ check: build
 	@./$(BIN) check -c $(CONFIG)
 
 # 单测（含竞态检测）。Rust 参考实现已冻结，主分支只跑 Go。
+#
+# 两部分：flowtls 模块本身的传输层/规则层，以及 sing-box 侧适配层。
+# 适配层原来一个测试都没有，直到 masquerade 的配置校验被放到 Start 里
+# 导致 check 静默通过——那件事之后补上了（见 DEVTIPS 第 76 条）。
 .PHONY: test
 test:
 	cd flowtls && go test -race ./...
+	cd $(UPSTREAM_DIR) && go test -race ./protocol/flowtls/...
 
 # 冻结向量门禁：验证 wire format 没有漂移，不需要 root、不需要 Rust
 .PHONY: interop

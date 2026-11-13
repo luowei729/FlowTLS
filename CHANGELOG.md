@@ -42,6 +42,7 @@
 |---|---|---|
 | `check` 抓不到 masquerade 配置错误 | 互斥/URL 校验只写在 `newMasquerade`（Start 阶段），而 check 只走构造函数 | 拆成 `validateMasqueradeOptions`（纯字符串，构造函数调）+ `newMasquerade`（读文件/bind，Start 调） |
 | 文档脚本在非 root 环境跑不起来 | 写死 `GOPATH=/root/go`、`PATH=/usr/local/go/bin` | 改成探测式：go 不在 PATH 才补 /usr/local/go，GOPATH 未设则取 `go env GOPATH` |
+| 伪装站把探测日志写到 stderr | `http.Server.ErrorLog = nil` 的语义是「用标准 logger」而不是「不记录」，注释与代码恰好相反 | 改用 `log.New(io.Discard, "", 0)`；实测探测垃圾不再产生任何日志行 |
 | 反代回源第三方站点返回 403 | `rewrite_host` 默认 false，沿用客户端 Host，对方不认 | 文档 + 示例明确：第三方回源必须设 `true`；实测改后与直连逐字节相同 |
 
 **实测**
@@ -54,6 +55,8 @@
 | 反代 `rewrite_host: false` | 403（预期，已写入文档） |
 | 启动日志 | `(proxy → https://example.com (rewrite_host))` |
 | 脚本可移植性 | `env -i PATH=/usr/bin:/bin` 下也能跑通门禁 |
+| 适配层单测 | 新增 `masquerade_test.go`（4 个测试 / 10 个断言），sing-box 侧首次有测试 |
+| ErrorLog 修复 | 连发 3 次畸形 TLS，日志行数 9 → 9（无增长） |
 | 全量回归 | verify / test / 门禁 / gofmt / 示例 check / 交叉编译 全绿 |
 | 真链路矩阵 | 4 通过 / 0 失败 / 3 跳过，无 iptables 残留 |
 

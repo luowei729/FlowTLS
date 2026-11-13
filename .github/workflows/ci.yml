@@ -91,6 +91,10 @@ jobs:
       - name: 单测（含竞态检测）
         run: make test
 
+      - name: 适配层单测（sing-box 侧）
+        working-directory: sing-box
+        run: go test -race ./protocol/flowtls/...
+
       - name: gofmt 检查
         run: |
           out=$(gofmt -l flowtls sing-box/protocol/flowtls sing-box/option/flowtls.go)

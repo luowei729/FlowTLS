@@ -1944,3 +1944,39 @@ HTTP/2 403        # 403 Forbidden（来自 example.com，不是我们）
 响应头里唯一还能看出差别的只有**头的顺序**（Go 的 http 包按 key 排序输出，
 nginx/CDN 按自己的顺序）。这属于任何 Go 写的 HTTPS 服务都有的特征，
 不针对本项目，先不处理。
+
+## 78. `http.Server.ErrorLog = nil` 不是「不写日志」
+
+直觉上 `nil` 像是「关掉」，实际语义相反：
+
+```go
+// net/http 文档：If nil, logging is done via the log package's standard logger.
+srv := &http.Server{ErrorLog: nil}   // ← 全部写到 stderr
+```
+
+最初的注释写着「不打印任何东西」，代码也是 `ErrorLog: nil`，
+注释和代码恰好相反。后果在伪装站上尤其严重：
+
+- 主动探测者会**故意**发畸形 TLS，每次握手失败 `Serve` 都会打一行
+  `http: TLS handshake error from <对方IP>: ...`；
+- 这些行会冲掉 sing-box 自己的日志；
+- 还会把探测者的 IP 落到磁盘上——伪装站最不该做的就是记录访客。
+
+正确写法：
+
+```go
+ErrorLog: log.New(io.Discard, "", 0)
+```
+
+验证方式（DEVTIPS 里所有「日志噪声」问题都能这么查）：
+
+```bash
+before=$(wc -l < server.log)
+for i in 1 2 3; do printf 'GARBAGE\r\n\r\n' | timeout 3 openssl s_client -connect <IP>:8443 -quiet; done
+sleep 2
+echo "$before → $(wc -l < server.log)"   # 行数必须不变
+```
+
+教训：Go 里「零值 = 关闭」并不普遍成立。`ErrorLog`、`http.Client.Timeout`、
+`tls.Config.MinVersion` 的零值都是**更宽松**而不是更严格，
+对安全敏感的组件要逐个查文档确认语义，别靠直觉。
