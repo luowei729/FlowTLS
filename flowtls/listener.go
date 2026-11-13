@@ -322,7 +322,25 @@ func (l *Listener) handlePacket(p ParsedPacket) {
 	//
 	// 真正的重传 SYN 走 handleSYN 内部的 pending 复用分支，
 	// 仍然回一模一样的 SYN-ACK，不会打乱客户端状态。
+	//
+	// **必须按 wscale 校验是否为伪 SYN**，这是分流唯一可靠的特征。
+	//
+	// 少了这一条，任何真实浏览器的 SYN 都会拿到一个 flowtls 的 SYN-ACK，
+	// 与内核（masquerade 网站）的 SYN-ACK 抢同一个四元组：
+	//   - 实测双端抓包可见两个不同 ISN 的 SYN-ACK 并存；
+	//   - 客户端取到内核那个 ISN 时，后续伪数据包的 ack 全部对不上；
+	//   - 表现为「偶发约 3×RTT 的握手延迟、连接状态抖动」。
+	//
+	// 不用 IP ID 判断的原因见 packet.go 的 WScale 注释：掩码匹配有 1/16
+	// 误命中率，且部分链路会改写 IP ID。
+	//
+	// 数据包不需要判断：靠四元组查表，只有已鉴权会话才存在表项。
 	if p.Flags&TCPSYN != 0 && p.Flags&TCPACK == 0 && len(p.Payload) == 0 {
+		if p.WScale != int(WScale) {
+			// 不是我们的伪 SYN：交给内核（伪装网站）。服务端绝不能在
+			// 这里回任何东西，否则真实 TLS 客户端会看到两个 SYN-ACK。
+			return
+		}
 		if l.sessionFor(client) != nil {
 			l.dropSession(client)
 		}

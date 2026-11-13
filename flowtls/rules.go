@@ -105,40 +105,78 @@ func (r Rule) Uninstall() string {
 //	0x4&0xff00ffff  → 只保留 IP ID 高字节，Flags/Frag 全 16 位
 //	=0x<HH>004000   → 高字节等于标记，且 Flags/Frag 必须是 0x4000
 //
-// 掩掉 IP ID 低字节是因为它随每个包递增（见 NextIPID）。
-// Flags/Frag 必须是 0x4000 = 只有 DF 置位：真实 Linux 发出的报文就是这样，
-// 加上这一条能让规则的匹配范围更窄，误伤其他流量的可能性更低。
-//
-// **右值必须带 0x 前缀**：内核解析器用 simple_strtoul(..., base=0)，
+// **右值必须带 0x` 前缀**：内核解析器用 simple_strtoul(..., base=0)，
 // 不带前缀会把 "f1004000" 按十进制解析失败并返回 0，规则永不命中——
 // 现象是「内核照旧回 RST 把连接打断」，而 iptables -C 还报告规则存在，
 // 从日志完全看不出异常。这是 Rust 版踩过的坑，单测钉住了它。
+//
+// **注意这条规则的可靠性有限**，只作为辅助特征保留（见 U32WScaleExpr）。
 func U32IPIDExpr(magic uint16) string {
 	return fmt.Sprintf("0x4&0xff00ffff=0x%04x4000", magic&0xFF00)
 }
 
-// ServerRules 返回服务端需要的规则。
+// U32WScaleExpr 生成按 TCP 窗口缩放因子匹配的 u32 表达式（分流主特征）。
 //
-// 只有一条：把发往监听端口的伪包在内核 TCP 栈之前 DROP。
+// SYN 的选项布局固定为（见 SynOptions，共 20 字节）：
 //
-// 标记来自配置而不是写死常量——写死意味着 DPI 只要加一条「IP ID 高字节
-// 等于某值」的通用规则就能命中所有部署；从配置派生后每个部署特征不同，
-// 检测方必须逐条链路采集。
+//	偏移 40: 02 04 05 b4       MSS 1460
+//	偏移 44: 04 02             SACK permitted
+//	偏移 46: 08 0a ts ts ts ts ecr ecr ecr ecr  时间戳
+//	偏移 56: 01                NOP
+//	偏移 57: 03 03 0c          wscale=12
 //
-// 匹配范围刻意很窄（高字节 = 256 个值）：这些包被 DROP 后对外表现为
-// 「完全无响应」。范围放宽会让端口探测的行为前后不一致，反而更容易暴露。
+// 因此「偏移 56 起的 4 字节 == 0x0103030c」即命中 wscale=12 的 SYN。
+//
+// 为什么它比 IP ID 可靠：TCP 选项是端到端字段，运营商 NAT / 云网关
+// **不会改写**（实测同一路径上 MSS 会被 clamp 成 1400，但 wscale 原样保留）。
+// 这一点已用双端抓包确认。
+//
+// 前提是 IHL=5（无 IP 选项），本实现构造的报文始终如此，真实客户端也一致。
+func U32WScaleExpr() string {
+	return fmt.Sprintf("0x%02x&0xffffffff=0x010303%02x", 56, WScale)
+}
+
+// ServerRules 返回服务端需要的规则：把发往监听端口的伪包在内核 TCP 栈之前 DROP。
+//
+// **两条规则按 wscale 匹配**（主，顺序即优先级）：
+//  1. 纯 SYN：偏移 56 的 4 字节 = NOP + wscale(12)，见 U32WScaleExpr；
+//  2. 带载荷的数据包：没有 wscale 选项，靠 IP ID 高字节匹配（辅助）。
+//
+// 为什么把 wscale 放在前面：同端口可能开着伪装网站（内核 listener），
+// 一旦内核收到伪 SYN 就会回自己的 SYN-ACK，与 flowtls 的 SYN-ACK 抢同一个
+// 四元组。实测客户端会同时收到两个不同 ISN 的 SYN-ACK，表现为
+// 「偶发 3×RTT 握手延迟 + 连接状态抖动」。IP ID 规则在这条链路上不可靠
+// （见 U32IPIDExpr 注释），必须有一条不依赖它的规则兜住 SYN。
+//
+// 数据包（带载荷）用 IP ID 匹配仍然可靠：那是**反方向**流量，
+// 由本机发出、不经过运营商 NAT，IP ID 完整保留。
 func ServerRules(port, magic uint16) []Rule {
-	return []Rule{{
-		Table: "raw",
-		Chain: "PREROUTING",
-		Spec: []string{
-			"-p", "tcp",
-			"--dport", strconv.Itoa(int(port)),
-			"-m", "u32",
-			"--u32", U32IPIDExpr(magic),
-			"-j", "DROP",
+	portStr := strconv.Itoa(int(port))
+	return []Rule{
+		{
+			Table: "raw",
+			Chain: "PREROUTING",
+			Spec: []string{
+				"-p", "tcp",
+				"--dport", portStr,
+				"--tcp-flags", "SYN,ACK", "SYN",
+				"-m", "u32",
+				"--u32", U32WScaleExpr(),
+				"-j", "DROP",
+			},
 		},
-	}}
+		{
+			Table: "raw",
+			Chain: "PREROUTING",
+			Spec: []string{
+				"-p", "tcp",
+				"--dport", portStr,
+				"-m", "u32",
+				"--u32", U32IPIDExpr(magic),
+				"-j", "DROP",
+			},
+		},
+	}
 }
 
 // ClientRules 返回客户端需要的两条规则。

@@ -373,8 +373,10 @@ func TestSynOptionsLayout(t *testing.T) {
 	if !bytes.Equal(o[17:20], []byte{0x03, 0x03, WScale}) {
 		t.Fatal("wscale 错误")
 	}
-	if WScale != 9 {
-		t.Fatalf("wscale 必须是真实 Linux 的 9，得到 %d", WScale)
+	// WScale 是服务端分流的唯一可靠特征，改动会让伪 SYN 与真实 SYN
+	// 无法区分（实测会导致双 SYN-ACK 竞争）。详见 packet.go 的注释。
+	if WScale != 12 {
+		t.Fatalf("wscale 必须是分流标记 12，得到 %d", WScale)
 	}
 }
 

@@ -38,11 +38,28 @@ const (
 	IPIDLowMask uint16 = 0x00FF
 )
 
-// WScale 是交换端口的 TCP 窗口缩放因子。
+// WScale 是伪 SYN / SYN-ACK 携带的 TCP 窗口缩放因子，也是**服务端分流的主特征**。
 //
-// 真实 Linux 实测值是 9；早先版本用 12（256MB 窗口）是明显异常值，
-// 任何 DPI 都能一眼判定。改回 9 后分流改由 IP ID 高字节承担。
-const WScale uint8 = 9
+// 为什么必须是 12（而不是看起来更真实的 9）：
+//
+//	服务端要区分「伪 SYN」和「伪装网站的真实 SYN」。IP ID 高字节曾被当作
+//	分流标记，但实测不可靠：同一条链路上，内核对伪 SYN 照样回了 SYN-ACK
+//	（抓包可见内核的 10.0.0.10→客户端 SYN-ACK 与 flowtls 的并存），
+//	于是客户端同时收到两个不同 ISN 的 SYN-ACK —— 表现为
+//	「偶发 ~3×RTT 的握手延迟、连接状态莫名抖动」。
+//
+//	IP ID 不可靠的原因有三条：
+//	  1. 部分运营商 NAT 会把它改写（早期结论）；
+//	  2. 掩码匹配 `& 0x1E00 == 0x1E00` 本身就有 1/16 的误命中率，
+//	     伪装网站每 16 个访客就有 1 个会收到伪造的 SYN-ACK；
+//	  3. u32 规则依赖 DF 位，而某些路径会清掉它。
+//
+//	TCP 选项则不会被 NAT 改写。真实 Linux 的 wscale 是 7~10（常见 9），
+//	12 在真实栈上极小概率出现，因此可以稳定地区分两类流量。
+//	代价是「wscale=12 略不常见」，属于可接受的外观损失——功能正确性优先。
+//
+// 数据包不需要 wscale（只在 SYN/SYN-ACK 里），所以稳态流量外观不受影响。
+const WScale uint8 = 12
 
 const (
 	// TSOptLen 是数据段自动追加的时间戳选项长度：nop,nop,kind=8,len=10,val,ecr
@@ -280,16 +297,20 @@ func (c *TcpClock) Observe(tsval uint32, ok bool) {
 // AdvertisedWindow 按「已收下但还没被上层消费的字节数」计算通告窗口（未缩放）。
 //
 // 恒为 65535 是明显伪造特征：真实 TCP 的窗口随接收缓冲占用持续变化。
-// 这里按 16MB 接收缓冲计算，与 QUIC 的 receive_window 对齐：
-// 空载时是 16MB>>9 = 32768（真实 Linux 在 16MB rmem 下的取值），
-// 有积压时平滑下降。
+// 这里按 16MB 接收缓冲计算，与 QUIC 的 receive_window 对齐。
+//
+// **移位必须用 9 而不是 WScale**：WScale 现在是分流特征（12），
+// 若用它移位，通告窗口 = 16MB>>12 = 4096，会被误读成「接收缓冲只有 2MB」，
+// 而且窗口缩得太小会让对端提前刹车。真实 Linux 在 16MB rmem 下
+// 通告的是 32768（即 >>9），这里按真实值算。
 func AdvertisedWindow(unread int) uint16 {
 	const rcvTotal = 16 * 1024 * 1024
+	const advShift = 9
 	free := rcvTotal - unread
 	if free < 0 {
 		free = 0
 	}
-	w := uint16(free >> WScale)
+	w := uint16(free >> advShift)
 	if w == 0 {
 		w = 1 // 不能声明零窗口把对端卡死
 	}

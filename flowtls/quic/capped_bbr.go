@@ -42,10 +42,12 @@ type txStatsProvider interface {
 type connEntry struct {
 	conn *quicgo.Conn
 	tx   txStatsProvider
-	// cwnd / inflight 由 cappedBbr 在每次读写时记录（quic-go 的
-	// ConnectionStats 不暴露这两个值）。
-	cwnd     *atomic.Uint64
-	inflight *atomic.Uint64
+	// cc 是 BBR 模式下装好的控制器（Brutal 模式为 nil）。
+	//
+	// 保留引用是为了**主动采样**：quic-go 只在需要发数据时才调
+	// CanSend/GetCongestionWindow，空闲连接的 lastCwnd 会一直停在旧值。
+	// 统计循环直接调一次 GetCongestionWindow()，读到的就是当前真实窗口。
+	cc *cappedBbr
 }
 
 // PathStats 是一次采样周期内的 QUIC 路径统计。
@@ -293,9 +295,9 @@ func (w *windowController) Attach(conn *quicgo.Conn, tx txStatsProvider) {
 		// （重建会把 BBR 的带宽估计与 pacing 历史清零，见 cappedBbr 注释）。
 		cc := newCappedBbr(conn.InitialPacketSize(), &w.cap)
 		conn.SetCongestionControl(cc)
-		// 把控制器的窗口/在途记录暴露给统计循环（只读原子值）。
-		entry.cwnd = &cc.lastCwnd
-		entry.inflight = &cc.lastInFlight
+		// 保存引用：统计循环要主动读窗口（quic-go 的 ConnectionStats
+		// 不暴露 cwnd/inflight，只能在控制器里记录）。
+		entry.cc = cc
 	}
 
 	// **两种模式都要登记**：统计日志（RTT/丢包/批大小）是排障的唯一依据，
@@ -466,11 +468,12 @@ func (w *windowController) loop() {
 					Conns:       len(entries),
 					CC:          cc,
 				}
-				if e.cwnd != nil {
-					ps.Cwnd = e.cwnd.Load()
-				}
-				if e.inflight != nil {
-					ps.InFlight = e.inflight.Load()
+				if e.cc != nil {
+					// 主动读一次：GetCongestionWindow 会把当前值写进 lastCwnd。
+					// quic-go 只在有数据要发时才会调它，空闲连接会一直停在旧值。
+					_ = e.cc.GetCongestionWindow()
+					ps.Cwnd = e.cc.lastCwnd.Load()
+					ps.InFlight = e.cc.lastInFlight.Load()
 				}
 				if e.tx != nil {
 					ts := e.tx.TxStats()

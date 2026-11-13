@@ -2597,3 +2597,180 @@ rxClosed bool
 3. 防回归测试要**能证伪**才算有效：临时去掉 `rxMu` 后 `TestDeliverConcurrentWithCloseNeverPanics`
    立刻 `panic: send on closed channel` + `DATA RACE` + FAIL，恢复后通过。
    只写一个「跑过去就算」的并发测试等于没写（参见 DEVTIPS 91 的测量纪律）。
+
+## 93. 服务端分流不能靠 IP ID：1/16 误命中 + 会被改写，必须用 wscale
+
+这是「RTT 偶发 3×链路值、连接状态抖动」的真根因，也是**移植时丢判断**的典型。
+
+### 现象
+
+- 伪 TCP 握手时快时慢：抓包 80ms 与 214ms（≈3×73ms）交替出现；
+- 客户端 QUIC `min_rtt` 常驻 213ms，而同时刻 `ping` 是 72ms；
+- 用**普通 curl** 访问 `http://server:8443/` 时，抓包能看到**两个** SYN-ACK：
+
+```
+203.0.113.10.8443 > 10.0.0.1.49326: Flags [S.], seq 437198242   ← 内核
+203.0.113.10.8443 > 10.0.0.1.49326: Flags [S.], seq 4040626910  ← flowtls
+```
+
+### 根因（两层）
+
+**第一层：Go 版丢了 IP ID 判断。**
+Rust `server.rs:659` 是：
+
+```rust
+if (ip_id & mark) == mark && flags & TCP_SYN != 0 && payload.is_empty()
+```
+
+Go 版 `listener.go handlePacket` 只判断 `SYN && !ACK && 无载荷`，
+于是**任何** SYN（包括真实浏览器的）都会拿到一个 flowtls 的 SYN-ACK。
+
+**第二层：即使补上 IP ID 判断也不可靠。**
+
+- `ip_id & 0x1E00 == 0x1E00` 有 **1/16 误命中率** —— 伪装站每 16 个访客
+  就有 1 个会收到伪造的 SYN-ACK；
+- 部分运营商 NAT 会改写 IP ID（DEVTIPS 早前已经记录过）；
+- u32 规则还依赖 DF 位，某些路径会清掉它。
+
+### 为什么丢判断的后果这么大
+
+服务端开着 `masquerade`（同端口真证书网站）时，内核里有一个 8443 的 listener。
+伪 SYN 一旦没被 iptables 拦住，内核会**创建 request_sock 并回自己的 SYN-ACK**。
+于是客户端收到两个不同 ISN 的 SYN-ACK：
+
+- 取到 flowtls 那个 → 一切正常（80ms）；
+- 取到内核那个 → 后续伪数据包的 ack 全部对不上，服务端内核还会因为
+  「收到不属于自己 socket 的段」回 RST，与 flowtls 的流互相打断（214ms 抖动）。
+
+### 正确做法：按 TCP 选项（wscale）分流
+
+TCP 选项是**端到端字段**，运营商 NAT / 云网关不改写。
+实测同一条路径上 MSS 会被 clamp（1460 → 1400），但 wscale 原样保留：
+
+```
+服务端收到：mss 1400,sackOK,TS val …,nop,wscale 9     ← 真实 curl（被 clamp）
+服务端收到：mss 1400,sackOK,TS val …,nop,wscale 12    ← 伪 SYN（未被改写）
+```
+
+三处必须一致：
+
+| 位置 | 内容 |
+|---|---|
+| `packet.go` | `const WScale uint8 = 12` |
+| `listener.go` | `if p.WScale != int(WScale) { return }`（交给内核） |
+| `rules.go` | `U32WScaleExpr()`：`--tcp-flags SYN,ACK SYN` + `0x38&0xffffffff=0x0103030c` |
+
+u32 偏移推导（IP 20 + TCP 20 = 40）：偏移 56 起四字节 = `NOP + kind3 + len3 + 12`。
+
+### 验收方法（必须两端抓包）
+
+```bash
+# 客户端
+tcpdump -i <iface> -nn -s0 -c6 'tcp port 44313 and tcp[tcpflags] & (tcp-syn|tcp-ack) != 0' -v
+# 期望：一次伪连接只看到 1 个 SYN-ACK，选项里 wscale 12
+curl -s -o /dev/null http://<server>:8443/     # 普通访问应只看到内核的 1 个
+```
+
+### 教训
+
+1. **移植时「少一个 if」比「多一个抽象」危险得多**。这行判断在 Rust 里只有
+   一个条件表达式，Go 版却整个丢了，而且功能看起来正常（能连上、能跑满带宽），
+   只在同端口有内核 listener 时表现为「偶发慢」。
+2. 任何「按包内容分流」的特征都必须满足：**不被中间设备改写、误命中率可接受**。
+   IP ID 三条都不满足；TCP 选项满足前两条。
+3. 分流规则要**同时**落在 iptables 和应用层判断上。只改一处时另一种流量会漏进来
+   （只改 iptables → 应用层仍会给真实 SYN 回包；只改应用层 → 内核仍会回 SYN-ACK）。
+
+---
+
+## 94. quic-go 在打包时记录发送时刻：发送队列过深会被算成 RTT
+
+这是「Go 版 RTT 虚高、吞吐抖动」的第二个真根因，与拥塞算法无关。
+
+### 机制
+
+`quic-go` 的发送链路是：
+
+```
+appendOneShortHeaderPacket → registerPackedShortHeaderPacket(now, …)   ← 记录发送时刻
+    → sendQueue.Send(buf)  → 协程 → conn.Write(buf) → Session.WriteTo
+```
+
+也就是说 **`SentPacket(now)` 发生在 `WriteTo` 之前**。如果 `WriteTo` 只是把包
+塞进一个深队列就返回，而 flushLoop 落后，包在本地排队几百毫秒；
+这段排队时间在收到 ACK 时被算成**网络 RTT**，进而：
+
+- BBR 的带宽估计被 RTT 污染，cwnd/pacing 忽高忽低；
+- PTO 与丢包判定基于被污染的 RTT，队列里的包可能被提前判丢并重传，
+  重传又加剧积压 —— 正反馈。
+
+### 实测证据
+
+- 链路 ICMP RTT 72.7ms；
+- v1（队列 4096）客户端抓包 outer ACK p50 = **213ms**；
+- 服务端日志 `rtt=166ms ~ 1.02s` 抖动，`tx_q=32/32`、`tx_wait=1.6s`；
+- 队列降到 32 并阻塞生产者后：`min_rtt=79.6~81.2ms`，`tx_wait` 只剩毫秒级。
+
+### 正确做法
+
+1. **队列深度必须小**（32，与 Rust `PacketBatch` 一致）。最坏本地排队 =
+   一批报文的上线时间（100Mbps 下约 3.5ms），远小于一个 RTT。
+2. **队列满时必须阻塞生产者**，把背压传回 quic-go 的 pacing；
+   「满了就丢」在伪造 TCP 上等于永久丢包（下层没有重传）。
+3. **纯 ACK 必须走独立队列/协程**。下载方向数据队列经常满，
+   ACK 若排在几千个数据包后面，对端测到的 RTT 会凭空多出数百毫秒。
+   Rust 的 `send_pure_ack` 就是直接发送，从不进数据队列。
+4. `SendBatch` 返回 `sent < len(batch)`（驱动队列满）时**必须重试剩余报文**，
+   不能 break 后静默丢弃。
+
+### 教训
+
+1. **异步化之前先想清楚「谁在计时」**。把同步 sendto 改成「入队 + 独立协程」
+   能省 syscall，但如果上层已经记了发送时刻，队列延迟就变成了假的网络延迟。
+2. 队列深度不是越大越好。深队列只吸收「生产速度 > 消费速度」的瞬时差额，
+   持续过载时排队等于把延迟藏进内存。
+3. 判断「RTT 高」的真伪只需两个字段：`min_rtt` 与 `tx_q/tx_wait`。
+   `min_rtt` 接近链路值而 `latest_rtt` 高 → 本地排队或对端 ACK 慢；
+   两者都高 → 链路问题。这就是本轮给 `PathStats` 补 `MinRTT`/`Cwnd`/`tx_*` 的原因。
+
+---
+
+## 95. 删抽象比加抽象难：四层包装里任何一层误判都会「每请求重建连接」
+
+`outbound.go` 的 v1 有四个互相叠加的机制，全部为了同一个目的
+（「QUIC 连接已死但 quic-go 没检测到」）：
+
+| 机制 | 位置 | 副作用 |
+|---|---|---|
+| `getClient` 探活 | 取通道 | 正常 |
+| `dialing chan` | 并发建连去重 | 正常但增加状态 |
+| `attemptCtx` 首次 8s 超时 | 开流 | 正常 |
+| `suspectConn` 包装返回的 net.Conn | 捕获读错误 | **对本端 Close 引发的读错误也会误判** → 标记通道失效 → 每个请求重建一次 QUIC 连接（实测每请求多 0.4s、服务端鉴权次数翻倍） |
+
+**精简后的结构（唯一入口 `channel()`）：**
+
+```go
+for {
+    c := o.client
+    if c != nil {
+        if c.Done() 已关闭        { drop; continue }
+        if 空闲>5s && !Probe成功  { drop; continue }
+        return c
+    }
+    if o.dialing != nil { 等它; continue }
+    // 建连（只此一处，并发请求共享同一次握手）
+}
+```
+
+开流失败由调用方 `drop(c)` 后重试一次，**不再包装返回的 net.Conn**：
+正常关闭一条流时 Read 必然返回错误，那与通道健康无关，
+包装层无法可靠区分「本端关闭」与「链路故障」。
+
+### 教训
+
+1. 修 bug 时优先**删掉误判的层**，而不是再加一层来判断「这次错误是不是真的」。
+2. 每层包装都要能回答：它捕获的信息是否**只有它能看到**？
+   `suspectConn` 看到的只是 `stream.Read` 的错误，而 `channel()` 已经能用
+   `c.Done()` + `Probe` 判断连接死活 —— 信息重复且更不可靠。
+3. 精简的量化指标不是行数，而是**从「请求进来」到「发出第一字节」经过的函数数**。
+   v1 是 6 层，v2 是 3 层（DialContext → channel → DialConn）。

@@ -71,19 +71,54 @@ Rust 与 Go 两端同步升级，不做双版本共存。
 
 ## 2. 伪包识别（重要）
 
-早期版本用 `IP ID == 0xF107` 识别自己的包，实测在部分运营商网络下**完全失效**：
-NAT 会把 IP ID 改写为 `0x0000`，导致：
+### 2.1 历史教训：IP ID 不可靠
 
-- 服务端 `ip_id == magic` 判断不成立，raw 层不认 SYN；
-- `iptables -m u32` 按 IP ID 的规则也不命中，内核会去处理伪包（回 SYN-ACK/RST）。
+早期版本用 `IP ID == 0xF107` 识别自己的包，实测有三类问题：
 
-现在改用 **TCP 窗口缩放因子 `wscale = 12`** 作为识别特征：
+1. 部分运营商 NAT 会把 IP ID 改写为 `0x0000`；
+2. 掩码匹配 `& 0x1E00 == 0x1E00` 本身有 **1/16 误命中率**：
+   真实浏览器的随机 IP ID 每 16 个就有 1 个命中，服务端会给它回一个
+   伪 SYN-ACK，与内核（伪装站）的 SYN-ACK 抢同一四元组；
+3. u32 规则依赖 DF 位，某些路径会清掉它。
 
-- 客户端 SYN 固定携带 `MSS 1460 + SACK permitted + WS 12`；
-- NAT 不改写 TCP 选项，因此该特征稳定；
-- 正常浏览器/curl 的 wscale 是 8~9，不会误伤。
+**实测后果**（2026-11-14，双端抓包）：客户端同时收到两个不同 ISN 的
+SYN-ACK（内核 `10.0.0.10` 与 flowtls `203.0.113.10` 各一个）。
+客户端取到内核那个后，后续所有伪数据包的 ack 全错，表现为
+**偶发约 3×RTT 的握手延迟（73ms → 214ms）与连接状态抖动**。
 
-`parse_frame` 会解析 TCP 选项并返回 `wscale`，服务端据此判断是否为伪包。
+### 2.2 现行方案：wscale = 12
+
+伪 SYN / SYN-ACK 的 TCP 选项固定为：
+
+```
+MSS 1460 | SACK permitted | TS | NOP | wscale 12
+```
+
+- **TCP 选项是端到端字段，NAT / 云网关不改写**（实测同一路径上 MSS 会被
+  clamp 成 1400，wscale 原样保留）；
+- 真实 Linux 的 wscale 是 7~10（常见 9），12 在真实栈上极小概率出现；
+- 只在 SYN / SYN-ACK 里携带，稳态数据包外观不受影响。
+
+服务端两处判断，缺一不可：
+
+| 位置 | 判断 |
+|---|---|
+| `listener.go handlePacket` | `p.WScale == 12` 才当作伪 SYN，否则**交给内核**（伪装站） |
+| `rules.go ServerRules` | raw PREROUTING 按 `--tcp-flags SYN,ACK SYN` + u32 偏移 56 = `0x0103030c` DROP |
+
+u32 的偏移推导（IP 头 20 + TCP 基础头 20 = 40）：
+
+```
+偏移 40: 02 04 05 b4   MSS 1460
+偏移 44: 04 02         SACK permitted
+偏移 46: 08 0a ...     时间戳
+偏移 56: 01 03 03 0c   NOP + wscale=12   ← 匹配这四个字节
+```
+
+IP ID 规则保留为**辅助**：数据包（带载荷）不经过运营商 NAT 的改写路径时
+它仍然有效，属于双保险。
+
+数据包不参与识别：它们靠四元组查表，只有已鉴权会话才存在表项。
 
 ## 3. 握手时序（标准三次握手）
 
@@ -124,21 +159,25 @@ NAT 会把 IP ID 改写为 `0x0000`，导致：
 | 伪数据包 | raw socket 验签 → QUIC；内核侧会回 RST，客户端 iptables 将其丢弃 |
 | 其它垃圾包 | 内核 TCP 处理，网站返回正常响应或 RST |
 
-服务端 iptables 规则（按 TCP 选项匹配 WS=12）：
+服务端 iptables 规则（两条，顺序即优先级）：
 
 ```bash
-# IP 头 20 + TCP 头 26（MSS 4 + SACK 2 之后）= 偏移 46
+# 1. 伪 SYN：按 wscale 匹配（偏移 56 = NOP + kind3 + len3 + 12）
 iptables -t raw -A PREROUTING -p tcp --dport 8443 \
-  -m u32 --u32 "46&0xFFFFFFFF=0x03030C01" -j DROP
+  --tcp-flags SYN,ACK SYN -m u32 --u32 "0x38&0xffffffff=0x0103030c" -j DROP
+# 2. 伪数据包：按 IP ID 高字节匹配（辅助，反方向流量不经 NAT 改写）
+iptables -t raw -A PREROUTING -p tcp --dport 8443 \
+  -m u32 --u32 "0x4&0xff00ffff=0x1e004000" -j DROP
 ```
 
-客户端规则（不再依赖会被改写的 IP ID）：
+客户端规则（IP ID 只在反方向使用，可靠）：
 
 ```bash
 # 1. 阻止内核对服务端 SYN-ACK 自动回 RST
 iptables -A OUTPUT -p tcp --sport 44300 --tcp-flags RST RST -j DROP
 # 2. 服务端发来的包交给 raw 层，内核不要处理
-iptables -A INPUT -p tcp --sport 8443 --dport 44300 -j DROP
+iptables -A INPUT -p tcp --sport 8443 \
+  -m u32 --u32 "0x4&0xff00ffff=0x1e004000" -j DROP
 ```
 
 ## 6. 流协议

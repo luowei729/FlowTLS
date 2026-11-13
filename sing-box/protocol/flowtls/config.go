@@ -1,6 +1,24 @@
 package flowtls
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// splitLines 把多行文本拆成非空行。
+//
+// 规则报告（print 模式）是多行文本，必须逐行交给 logger，
+// 否则除第一行外都会丢掉时间戳与级别前缀。
+func splitLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
 
 // maxCwndOf 把配置里的 int64 窗口上限归一成 uint64。
 //

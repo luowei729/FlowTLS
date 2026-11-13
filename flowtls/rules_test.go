@@ -23,14 +23,52 @@ func TestU32ExprHasHexPrefix(t *testing.T) {
 
 // 标记必须来自配置，不能写死：
 // 写死意味着 DPI 只要一条通用规则就能命中所有部署。
+//
+// 注意规则现在有两条（wscale 主特征 + IP ID 辅助），magic 只影响后者，
+// 所以这里比较整组规则而不是第一条。
 func TestRulesFollowMagic(t *testing.T) {
-	a := ServerRules(8443, 0xF107)[0].String()
-	b := ServerRules(8443, 0x1E07)[0].String()
+	a := serverRuleStrings(8443, 0xF107)
+	b := serverRuleStrings(8443, 0x1E07)
 	if a == b {
 		t.Fatal("不同 magic 必须生成不同规则")
 	}
 	if !strings.Contains(b, "0x1e004000") {
 		t.Fatalf("标记高字节应来自 magic，实际：%s", b)
+	}
+}
+
+// serverRuleStrings 把整组服务端规则拼成一个便于比较的字符串。
+func serverRuleStrings(port, magic uint16) string {
+	var b strings.Builder
+	for _, r := range ServerRules(port, magic) {
+		b.WriteString(r.String())
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// wscale 规则必须真实存在且位置正确（偏移 56 的 NOP+wscale）。
+//
+// 这条是分流的核心：IP ID 匹配有 1/16 误命中率，且会被部分链路改写，
+// 只有 TCP 选项是端到端稳定字段。
+func TestServerRuleUsesWScale(t *testing.T) {
+	rules := ServerRules(8443, 0xF107)
+	var found bool
+	for _, r := range rules {
+		joined := strings.Join(r.Spec, " ")
+		if strings.Contains(joined, U32WScaleExpr()) {
+			found = true
+			if !strings.Contains(joined, "--tcp-flags SYN,ACK SYN") {
+				t.Fatalf("wscale 规则必须只匹配纯 SYN：%s", joined)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("服务端必须有按 wscale 匹配的规则，实际：%v", rules)
+	}
+	// 偏移 56 起 4 字节 = NOP + kind3 + len3 + value12
+	if got, want := U32WScaleExpr(), "0x38&0xffffffff=0x0103030c"; got != want {
+		t.Fatalf("wscale 表达式不符：got %q want %q", got, want)
 	}
 }
 
@@ -48,10 +86,16 @@ func TestU32IgnoresIPIDLowByte(t *testing.T) {
 // 服务端规则的关键要素：raw 表、PREROUTING、目标端口、u32、DROP。
 func TestServerRuleShape(t *testing.T) {
 	rules := ServerRules(8443, 0xF107)
-	if len(rules) != 1 {
-		t.Fatalf("服务端只需 1 条规则，得到 %d", len(rules))
+	if len(rules) != 2 {
+		t.Fatalf("服务端需要 2 条规则（wscale + IP ID），得到 %d", len(rules))
 	}
-	r := rules[0]
+	for _, r := range rules {
+		assertServerRuleShape(t, r)
+	}
+}
+
+func assertServerRuleShape(t *testing.T, r Rule) {
+	t.Helper()
 	if r.Table != "raw" {
 		t.Fatalf("服务端规则必须在 raw 表，实际 %q", r.Table)
 	}

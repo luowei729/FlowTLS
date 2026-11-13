@@ -1,5 +1,75 @@
 # CHANGELOG
 
+## 2026-11-14 03:10 (北京时间)
+
+### 高 RTT / 连接不稳定的三个真根因定位与修复；Go v1 归档、v2 精简移植启动
+
+用户判定「Go 版越写越复杂、排查越来越难」，要求重新制定计划、归档 Go 代码、
+精简高效地移植 Rust。本轮先定位并修掉三个真根因（都是移植时丢了 Rust 的关键语义，
+不是调参问题），再开始精简。
+
+**1) 服务端分流丢了判断：任何 SYN 都回 SYN-ACK**
+
+`listener.go handlePacket` 只判断 `SYN && !ACK && 无载荷`，没有校验这是不是伪包。
+Rust `server.rs:659` 是 `(ip_id & mark) == mark && SYN && payload.is_empty()`。
+
+后果（双端抓包确认）：同一四元组上同时发出**两个** SYN-ACK ——
+内核（masquerade 网站，源 `10.0.0.10`、MSS 8960）和 flowtls（源公网、MSS 1460）。
+客户端取到内核那个 ISN 后，后续所有伪数据包的 ack 全错。
+
+**2) IP ID 不能作为分流主特征（1/16 误命中 + 会被改写）**
+
+改为 **wscale=12**：
+
+| 位置 | 判断 |
+|---|---|
+| `packet.go` | `WScale = 12`（客户端 SYN 与服务端 SYN-ACK 一致） |
+| `listener.go` | `p.WScale == int(WScale)` 才当伪 SYN，否则交给内核 |
+| `rules.go` | 新增 `U32WScaleExpr()`：`--tcp-flags SYN,ACK SYN` + u32 偏移 56 = `0x0103030c` |
+
+TCP 选项是端到端字段，NAT / 云网关不改写（实测同路径上 MSS 被 clamp 成 1400，
+wscale 原样保留）。IP ID 规则保留为辅助（反方向流量可靠）。
+
+**3) 发送队列过深且满即丢：本地排队被 quic-go 计入 RTT**
+
+quic-go 在**打包时**就调 `sentPacketHandler.SentPacket(now, …)` 记录发送时刻，
+然后才交给 `Session.WriteTo`。v1 的 `WriteTo` 只把包放进 4096 深队列就返回，
+flushLoop 落后时本地排队时间被当成网络 RTT，污染 BBR 带宽估计与 PTO。
+
+修法：
+
+- `txQueueDepth` 4096 → **32**（与 Rust `PacketBatch` 一致），队列满时**阻塞**生产者；
+- 纯 ACK 走独立队列 + 独立发送协程，不排在数据洪峰之后（Rust `send_pure_ack`
+  同样是直接发送，从不排数据队列）；
+- `sendBatch` 对未发出的剩余报文重试，不再静默丢弃；
+- `PathStats` 增加 per-conn 归属（`peer=`）、`MinRTT`、`Cwnd`/`InFlight`、
+  发送队列统计（`tx_q`/`tx_wait`/`tx_drop`/`tx_err`）。
+
+**修复后实测（新加坡 ARM，Go↔Go，均为多轮区间）**
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 伪 TCP 握手（抓包） | 214ms | **80.8ms** |
+| QUIC min_rtt（客户端） | 213ms | **79.6~81.2ms** |
+| QUIC min_rtt（服务端） | 213ms | **80.3ms** |
+| 单流 100MB ×3 | 3.4~17.7 MB/s（抖动大） | **15.0~18.3 MB/s** |
+| 4 并发 10MB | — | 各 4.4 MB/s，**合计 17.6 MB/s（141Mbps）** |
+| 204（IP 直连，稳态） | 0.6~1.8s | **0.162~0.180s（= 2×RTT，理论下限）** |
+| 普通 curl 访问 8443 | 收到 2 个 SYN-ACK | 只收到内核 1 个 ✅ |
+| UDP DNS 6 项 | — | 全部 PASS |
+
+**4) Go v1 归档 + v2 精简移植启动**
+
+- tag `go-v1-archive-20261114` + 分支 `legacy-go`（可回滚）；
+- `docs/PROJECT_PLAN-v1.md` 保存 v1 计划原文；
+- 新的 `PROJECT_PLAN.md` 把「精简移植」定为主线，含具体删除清单与验收门禁；
+- `outbound.go` 已完成精简：**537 → 406 行**，删掉 `suspectConn` / `attemptCtx` /
+  `invalidate` / `dialing` 四层包装，统一为单一 `channel()` 入口
+  （4 层里任何一层误判都会导致「每个请求重建一次连接」）。
+
+文档：`AGENTS.md` 与 `docs/DESIGN.md` 的分流特征改为 wscale=12 并写明推导，
+`PROJECT_PLAN.md` 重写，v1 计划归档到 `docs/PROJECT_PLAN-v1.md`。
+
 ## 2026-11-14 02:00 (北京时间)
 
 ### 1080 入口按部署方要求改监听 0.0.0.0；修复批量收包引爆的 panic
