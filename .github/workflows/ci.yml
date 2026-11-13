@@ -1,26 +1,36 @@
 name: CI
 
-# 分三层，按「能不能在没有特权的情况下跑」划分：
+# 构建全部在 Actions 里完成，本地只需要 `make build` 产出本机可用的二进制。
+# 多架构走 matrix，一个平台一个 job，互不阻塞。
 #
-#   verify / test  —— 普通 runner 就能跑，是每次 push 的必过关卡；
-#   cross          —— 交叉编译，验证 rules_stub.go 与 socket_stub.go 没漏；
-#   e2e            —— 需要 CAP_NET_RAW，只能自托管，靠标签 opt-in。
+# 分层原则：按「能不能在没有特权的情况下跑」划分
 #
-# 为什么不把 e2e 放进去硬跑：
-#   GitHub 托管 runner 拿不到 raw socket，跑了必然失败；
-#   而把失败设成「允许」又等于没有门禁。分成独立 job + 标签最诚实。
+#   verify / test  —— 普通 runner，几十秒到几分钟，是每次 push 的必过关卡
+#   build (matrix) —— 多架构发行版，产物直接上传供下载
+#   release        —— 打 tag 时把 matrix 的产物汇总成一个 Release
+#   e2e            —— 需要 CAP_NET_RAW，只能自托管，靠标签 opt-in
+#
+# 缓存为什么不用 setup-go 自带的（cache: false）
+#
+#   setup-go 的缓存 key 只含 go.sum hash + OS，**不含 GOARCH**。
+#   matrix 里十个平台会命中同一个 key，而 GitHub 的 cache 同一个 key
+#   只能保存一次——后保存的静默失败，最后谁的缓存留下是随机的。
+#   所以这里显式接管：module 缓存跨平台共享，build 缓存也共享，
+#   但只由 verify job 负责保存（其余 job 只 restore）。
 
 on:
   push:
     branches: [main, legacy-rust]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 concurrency:
   # 同一分支的旧运行直接取消：CI 关心的是最新提交。
+  # tag 构建不取消：发布流程被打断比多花几分钟更糟。
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -28,25 +38,41 @@ permissions:
 env:
   # 版本必须与 sing-box 的 go.mod 完全一致，
   # 否则 sagernet/sing 的 pseudoversion 会对不上（见 AGENTS.md 第 9 条）。
-  #
-  # 刻意**不设 GOPATH**：setup-go 的缓存按默认 GOPATH 工作，
-  # 覆盖它会让缓存失效。docs/ 下的脚本自己探测 GOPATH，
-  # 所以在本地（/root/go）和 CI（~/go）都能跑。
   GO_VERSION: "1.25.5"
 
 jobs:
+  # ---------------------------------------------------------------- 快速关卡
   verify:
     name: 构建与版本校验
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            flowtls/go.sum
-            sing-box/go.sum
+          cache: false
+
+      - name: 恢复 Go 缓存
+        id: gocache
+        uses: actions/cache/restore@v4
+        with:
+          # module 缓存与架构无关，所有 job 共享同一份。
+          # 这是编译时间的大头：sing-box 有 40+ 个直接依赖。
+          # build 缓存（go-build）也放进来：不同 GOOS/GOARCH 的条目在
+          # 同一目录下按平台分子目录，交叉恢复的收益很大。
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
+
+      - name: 读取版本号
+        id: version
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: make build
         run: make build
@@ -60,23 +86,52 @@ jobs:
       # raw socket 只在 Start(StartStateStart) 里申请，构造函数绝不碰特权资源。
       - name: 配置示例可通过 check（非 root）
         run: |
+          bin=./dist/sing-box-$(cat VERSION)-linux-amd64
           for f in deploy.example/*.json; do
             echo "checking $f"
-            ./dist/sing-box-$(cat VERSION)-linux-amd64 check -c "$f"
+            "$bin" check -c "$f"
           done
 
+      - name: 上传 linux/amd64 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ steps.version.outputs.value }}-linux-amd64
+          path: dist/sing-box-*-linux-amd64
+          if-no-files-found: error
+          retention-days: 14
+
+      # 只在这里保存：matrix 的十个 job 同时保存同一个 key 必然互相覆盖。
+      - name: 保存 Go 缓存
+        if: steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+
+  # ------------------------------------------------------------------ 单测关卡
   test:
     name: 单测与冻结向量门禁
     runs-on: ubuntu-latest
+    needs: verify
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            flowtls/go.sum
-            sing-box/go.sum
+          cache: false
+
+      - name: 恢复 Go 缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
 
       - name: go vet
         working-directory: flowtls
@@ -91,10 +146,6 @@ jobs:
       - name: 单测（含竞态检测）
         run: make test
 
-      - name: 适配层单测（sing-box 侧）
-        working-directory: sing-box
-        run: go test -race ./protocol/flowtls/...
-
       - name: gofmt 检查
         run: |
           out=$(gofmt -l flowtls sing-box/protocol/flowtls sing-box/option/flowtls.go)
@@ -104,39 +155,130 @@ jobs:
             exit 1
           fi
 
-  cross:
-    name: 交叉编译
+  # ------------------------------------------------------------ 多架构发行版
+  build:
+    name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
     runs-on: ubuntu-latest
+    strategy:
+      # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
+      fail-fast: false
+      matrix:
+        # linux/amd64 不在这里：verify job 已经产出并上传过了。
+        #
+        # **为什么在 ubuntu-latest 上编译所有平台而不是用对应系统的 runner**
+        #
+        #   1. CGO_ENABLED=0，产出与在目标系统上编译的二进制逐字节等价；
+        #   2. macOS runner 单价约是 Linux 的 10 倍、Windows 约 2 倍，排队也慢；
+        #   3. Go 的交叉编译是官方支持的一等能力，不是 hack。
+        #
+        # 代价是没法在 CI 里「运行」非本机架构的二进制——
+        # 那属于冒烟测试，需要 QEMU（linux/arm64）或真实机器，不在本 workflow 范围。
+        include:
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm }
+          - { goos: linux, goarch: "386" }
+          - { goos: linux, goarch: mipsle }
+          - { goos: linux, goarch: mips64le }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: freebsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            flowtls/go.sum
-            sing-box/go.sum
+          cache: false
 
-      # rules_stub.go / socket_stub.go 的存在意义就是这条能过。
-      # 一旦有人在 linux-only 文件里用了没打 tag 的符号，这里立刻红。
-      - name: flowtls（windows / darwin / arm64）
-        working-directory: flowtls
+      - name: 恢复 Go 缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
+
+      - name: 读取版本号
+        id: version
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      # Makefile 负责平台差异（windows 用另一套 tag 列表、文件名带 .exe）。
+      # 这里只传 GOOS/GOARCH，不重复一遍 tags 与 ldflags——重复就会漂移。
+      - name: make build ${{ matrix.goos }}/${{ matrix.goarch }}
+        run: make build GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+
+      - name: 校验产物存在且非空
         run: |
-          set -e
-          GOOS=windows GOARCH=amd64 go build ./...
-          GOOS=darwin  GOARCH=arm64 go build ./...
-          GOOS=linux   GOARCH=arm64 go build ./...
+          bin=$(ls dist/sing-box-*-${{ matrix.goos }}-${{ matrix.goarch }}* 2>/dev/null | head -1)
+          [ -n "$bin" ] || { echo "没有产出二进制"; exit 1; }
+          size=$(stat -c%s "$bin")
+          echo "$bin  $((size / 1024 / 1024)) MB"
+          # 一个 100MB 级的 sing-box 不可能小于 20MB；过小说明链接失败被吞了。
+          [ "$size" -gt 20000000 ] || { echo "产物过小，疑似构建失败"; exit 1; }
 
-      - name: sing-box 协议层（windows / darwin）
-        working-directory: sing-box
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ steps.version.outputs.value }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/sing-box-*-${{ matrix.goos }}-${{ matrix.goarch }}*
+          if-no-files-found: error
+          retention-days: 14
+
+  # -------------------------------------------------------------------- 发布
+  release:
+    name: 发布 Release
+    needs: [verify, build]
+    # 只在 tag 上跑：push 到 main 只产出 artifact，不建 Release。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          # 每个 artifact 单独一个目录，展开时不会互相覆盖。
+          merge-multiple: false
+
+      - name: 展平并生成校验和
         run: |
-          set -e
-          GOOS=windows GOARCH=amd64 go build ./protocol/... ./option/... ./constant/...
-          GOOS=darwin  GOARCH=arm64 go build ./protocol/... ./option/... ./constant/...
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          ls -lh
+          # sha256 是发布物的最低要求：用户下载后要能自己验证完整性。
+          sha256sum sing-box-* > sha256sum.txt
+          cat sha256sum.txt
 
-      - name: sing-box 发行版（linux/arm64）
-        run: make build GOARCH=arm64
+      - name: 生成 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/sing-box-*
+            release/sha256sum.txt
+          draft: false
+          prerelease: false
+          body: |
+            `sing-box $(cat VERSION)` — FlowTLS rev 发行版。
 
+            与官方版的唯一区别是版本号后缀 `-rev.N` 与内置的 `with_flowtls` 协议；
+            二进制名保持 `sing-box`，配置格式完全兼容。
+
+            校验完整性：
+
+            ```
+            sha256sum -c sha256sum.txt
+            ```
+
+  # ------------------------------------------------------- 真链路（自托管）
   e2e:
     name: 真链路矩阵（自托管，需 CAP_NET_RAW）
     # 托管 runner 没有 raw socket，只能跑在自带权限的机器上。

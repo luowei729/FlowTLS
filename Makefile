@@ -18,17 +18,31 @@ PREFIX       ?= dist
 GOOS         ?= linux
 GOARCH       ?= amd64
 
-# 上游默认 tags 是逗号分隔，必须用逗号拼接，不能换成空格
-UPSTREAM_TAGS := $(shell cat $(UPSTREAM_DIR)/release/DEFAULT_BUILD_TAGS_OTHERS)
+# 上游默认 tags 是逗号分隔，必须用逗号拼接，不能换成空格。
+#
+# **Windows 有独立的 tag 列表**（release/DEFAULT_BUILD_TAGS_WINDOWS），
+# 比 OTHERS 多 with_naive_outbound 与 with_purego。
+# 曾经这里只读 OTHERS，结果 windows 构建永远少两个特性，而 sing-box 官方
+# 发的是带这两个 tag 的——同一个版本号下两个二进制能力不同，很难被发现。
+TAGS_FILE := $(UPSTREAM_DIR)/release/DEFAULT_BUILD_TAGS_OTHERS
+ifeq ($(GOOS),windows)
+TAGS_FILE := $(UPSTREAM_DIR)/release/DEFAULT_BUILD_TAGS_WINDOWS
+endif
+UPSTREAM_TAGS := $(shell cat $(TAGS_FILE))
 TAGS          := $(UPSTREAM_TAGS),with_flowtls
 
 # 上游 LDFLAGS 只有 godebugDefault 和 checklinkname，不含 Version，
 # 所以这里追加 Version 不会覆盖任何东西。
+#
+# 注意 `-checklinkname=0` 不是可选项：tfo-go 用 linkname 挂到 net 包的
+# 内部符号（net.(*netFD).init），开启了链接器检查的平台会直接编译失败。
 LDFLAGS_UPSTREAM := $(shell cat $(UPSTREAM_DIR)/release/LDFLAGS)
 LDFLAGS          := -X 'github.com/sagernet/sing-box/constant.Version=$(VERSION)' $(LDFLAGS_UPSTREAM)
 
 GOFLAGS_COMMON := -trimpath -tags "$(TAGS)" -ldflags "$(LDFLAGS) -s -w -buildid="
-BIN            := $(PREFIX)/sing-box-$(VERSION)-$(GOOS)-$(GOARCH)
+# Windows 产物必须带 .exe，否则下载下来双击打不开。
+# 用 $(if $(filter ...)) 而不是 ifeq：这是赋值语句的一部分，不是指令块。
+BIN := $(PREFIX)/sing-box-$(VERSION)-$(GOOS)-$(GOARCH)$(if $(filter windows,$(GOOS)),.exe)
 
 .PHONY: build
 build:
