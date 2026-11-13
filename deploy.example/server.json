@@ -55,15 +55,28 @@
       //
       // 两个端口共存已验证：探测看得到真证书真页面，隧道同时可用。
       "masquerade": {
-        // 静态站点根目录。留空返回占位页（503），
-        // 而占位页本身就是指纹——生产必须填真实内容。
-        "site_dir": "/var/www/lumen-edge",
-
         // **真证书**，不能用自签：探测者能看到证书链。
         // fullchain 必须是「站点证书 + 中间证书」，
         // 私钥权限建议 600 且属主为运行 user。
         "certificate_path": "/etc/ssl/private/fullchain.pem",
-        "key_path": "/etc/ssl/private/privkey.pem"
+        "key_path": "/etc/ssl/private/privkey.pem",
+
+        // 两种模式二选一（同时填会报错）：
+        //
+        //   site_dir  —— 静态文件。简单，但目录结构、404 页、ETag 格式
+        //                都可枚举，仔细的探测者能看出是自建站。
+        //   proxy_url —— 反向代理到真实站点。**推荐**：探测者看到的一切
+        //                与直接访问那个站点逐字节一致（已实测）。
+        //
+        // 静态文件模式（占位页本身就是指纹，生产必须填真实内容）：
+        "site_dir": "/var/www/lumen-edge"
+
+        // 反向代理模式（把上面的 site_dir 删掉换成这两行）：
+        // 注意：回源第三方站点时必须同时把 rewrite_host 设为 true，
+        // 否则对方收到 Host=你的域名 会返回 403（已实测）。
+        //
+        //   "proxy_url": "https://example.com",
+        //   "rewrite_host": true
       }
     }
   ],

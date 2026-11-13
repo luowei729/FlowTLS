@@ -4,6 +4,8 @@
 # Go 构建缓存与工作区文件（不入库）
 go.work
 go.work.sum
+# CI 把 GOPATH 放在 workspace 里，避免污染 runner 的全局缓存
+.gopath/
 
 # 证书与私钥：绝不入库
 /ssl/

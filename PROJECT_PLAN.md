@@ -464,13 +464,41 @@ ClientHello 无 key_share 都是秒级可判）。已在 `flowtls check` 里对
 
 ### 剩余待办（P5）
 
-1. **CI**
-   把 `make test` + `make interop` 接进 GitHub Actions（无需特权，容易）；
-   `e2e_matrix.sh` 需要 `CAP_NET_RAW`，可只跑在自托管 runner。
+1. ~~**CI**~~ —— ✅ 2026-11-13 完成
+   `.github/workflows/ci.yml`：verify / test / cross 三个 job 跑在托管 runner，
+   e2e 独立成 job 用 `[self-hosted, flowtls-e2e]` 标签 opt-in。
 2. **跨境链路重测**
    README 的实测数据来自 Rust 版。协议相同，但 quic-go 的参数
    （InitialPacketSize / 流窗口 / 自适应策略）需要在真实链路上重跑
    `docs/bench.sh`，把数字换成 Go 版的。
-3. **伪装站细节打磨**（可选）
-   - 支持反向代理模式（`masquerade.proxy_url`，对齐 hysteria2）；
-   - 支持 HTTP/3（当前只有 h2 + http/1.1）。
+3. ~~**伪装站细节打磨**~~ —— 部分完成
+   - ✅ 反向代理模式（`masquerade.proxy_url` + `rewrite_host`，对齐 hysteria2）
+   - ⬜ HTTP/3（当前只有 h2 + http/1.1）—— 优先级低：
+     探测者用 HTTP/3 探测的成本高，且 h2 已经与真实站点无差别。
+
+---
+
+## 2026-11-13 14:45（北京时间）更新：P5-3 完成
+
+### 本次做完的事
+
+| 项 | 状态 |
+|---|---|
+| GitHub Actions CI（4 个 job，分特权/非特权） | ✅ |
+| 伪装站反向代理模式（`proxy_url` + `rewrite_host`） | ✅ |
+| 校验分层重构（check 能抓到的放构造函数） | ✅ |
+| 文档脚本可移植性（不再写死 /root/go） | ✅ |
+
+### 剩余待办
+
+1. **跨境链路重测**（唯一还需要真实环境的事）
+   README 的实测数据来自 Rust 版。协议相同，但 quic-go 的参数
+   （InitialPacketSize / 流窗口 / 自适应策略）需要在真实链路上重跑
+   `docs/bench.sh`，把数字换成 Go 版的。
+   没有链路访问权时无法进行——这是唯一的外部阻塞项。
+
+2. **HTTP/3 伪装**（可选，优先级低）
+   当前 `NextProtos: ["h2", "http/1.1"]`。真实 CDN 站点会通告 `h3`，
+   但服务端要支持 h3 需要 QUIC-over-UDP 的 443/8443 监听，
+   而 UDP 8443 上跑的是我们的 DATAGRAM 通路，两者会打架。
+   结论：**保持不支持**，并在文档里说明原因比硬加更诚实。

@@ -124,9 +124,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	// `sing-box check` 可能在证书还没挂载的机器上跑，
 	// 真读文件会把它变成一条对环境有依赖的检查。
 	// 缺少字段则一定能确定是配置笔误，可以在这里就拒掉。
+	// 伪装站的校验分两层，这个分层是刻意的：
+	//
+	//	这里（构造函数）—— 纯字符串/结构校验。`sing-box check` 会走构造函数，
+	//	                     所以这些错误在启动前就能被发现。
+	//	newMasquerade（Start）—— 读文件、bind 端口。check 可能在证书还没
+	//	                     挂载、也没有特权的机器上跑，这些动作会让 check
+	//	                     变成一条对环境有依赖的检查，体验直接崩。
+	//
+	// 教训：曾经把「proxy_url 与 site_dir 互斥」只写在 Start 里，
+	// 结果 check 完全静默通过，配置错了要到启动才知道。
 	if options.Masquerade != nil {
-		if options.Masquerade.CertificatePath == "" || options.Masquerade.KeyPath == "" {
-			return nil, E.New("flowtls: masquerade 必须提供 certificate_path 与 key_path")
+		if err := validateMasqueradeOptions(options.Masquerade); err != nil {
+			return nil, err
 		}
 	}
 
@@ -211,6 +221,8 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			SiteDir:         h.masqOpts.SiteDir,
 			CertificatePath: h.masqOpts.CertificatePath,
 			KeyPath:         h.masqOpts.KeyPath,
+			ProxyURL:        h.masqOpts.ProxyURL,
+			RewriteHost:     h.masqOpts.RewriteHost,
 		})
 		if err != nil {
 			_ = h.server.Close()
@@ -218,7 +230,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		h.masq = masq
 		h.logger.Info("flowtls masquerade site listening at ", masq.Addr(),
-			" (site_dir=", orDefault(h.masqOpts.SiteDir, "<内置占位页>"), ")")
+			" (", masqueradeMode(h.masqOpts), ")")
 	}
 
 	// 派生 ctx：入站关闭时能主动唤醒所有阻塞中的 Accept。

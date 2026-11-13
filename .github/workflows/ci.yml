@@ -1,0 +1,175 @@
+name: CI
+
+# 分三层，按「能不能在没有特权的情况下跑」划分：
+#
+#   verify / test  —— 普通 runner 就能跑，是每次 push 的必过关卡；
+#   cross          —— 交叉编译，验证 rules_stub.go 与 socket_stub.go 没漏；
+#   e2e            —— 需要 CAP_NET_RAW，只能自托管，靠标签 opt-in。
+#
+# 为什么不把 e2e 放进去硬跑：
+#   GitHub 托管 runner 拿不到 raw socket，跑了必然失败；
+#   而把失败设成「允许」又等于没有门禁。分成独立 job + 标签最诚实。
+
+on:
+  push:
+    branches: [main, legacy-rust]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支的旧运行直接取消：CI 关心的是最新提交。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 版本必须与 sing-box 的 go.mod 完全一致，
+  # 否则 sagernet/sing 的 pseudoversion 会对不上（见 AGENTS.md 第 9 条）。
+  #
+  # 刻意**不设 GOPATH**：setup-go 的缓存按默认 GOPATH 工作，
+  # 覆盖它会让缓存失效。docs/ 下的脚本自己探测 GOPATH，
+  # 所以在本地（/root/go）和 CI（~/go）都能跑。
+  GO_VERSION: "1.25.5"
+
+jobs:
+  verify:
+    name: 构建与版本校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            flowtls/go.sum
+            sing-box/go.sum
+
+      - name: make build
+        run: make build
+
+      # 断言三件事：版本号带 rev、tags 带 with_flowtls、二进制名保持 sing-box。
+      # 这三条是「与官方版区分」的全部依据，坏了就等于发了一个假官方版。
+      - name: make verify
+        run: make verify
+
+      # 硬要求：check 不需要 root。
+      # raw socket 只在 Start(StartStateStart) 里申请，构造函数绝不碰特权资源。
+      - name: 配置示例可通过 check（非 root）
+        run: |
+          for f in deploy.example/*.json; do
+            echo "checking $f"
+            ./dist/sing-box-$(cat VERSION)-linux-amd64 check -c "$f"
+          done
+
+  test:
+    name: 单测与冻结向量门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            flowtls/go.sum
+            sing-box/go.sum
+
+      - name: go vet
+        working-directory: flowtls
+        run: go vet ./...
+
+      # wire format v2 的绝对字节基线。
+      # Rust 参考实现已冻结在 legacy-rust 分支，但它导出的黄金向量在仓库里，
+      # 所以这道门禁不需要 Rust 工具链。
+      - name: 冻结向量门禁
+        run: bash docs/interop_check.sh
+
+      - name: 单测（含竞态检测）
+        run: make test
+
+      - name: gofmt 检查
+        run: |
+          out=$(gofmt -l flowtls sing-box/protocol/flowtls sing-box/option/flowtls.go)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："
+            echo "$out"
+            exit 1
+          fi
+
+  cross:
+    name: 交叉编译
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            flowtls/go.sum
+            sing-box/go.sum
+
+      # rules_stub.go / socket_stub.go 的存在意义就是这条能过。
+      # 一旦有人在 linux-only 文件里用了没打 tag 的符号，这里立刻红。
+      - name: flowtls（windows / darwin / arm64）
+        working-directory: flowtls
+        run: |
+          set -e
+          GOOS=windows GOARCH=amd64 go build ./...
+          GOOS=darwin  GOARCH=arm64 go build ./...
+          GOOS=linux   GOARCH=arm64 go build ./...
+
+      - name: sing-box 协议层（windows / darwin）
+        working-directory: sing-box
+        run: |
+          set -e
+          GOOS=windows GOARCH=amd64 go build ./protocol/... ./option/... ./constant/...
+          GOOS=darwin  GOARCH=arm64 go build ./protocol/... ./option/... ./constant/...
+
+      - name: sing-box 发行版（linux/arm64）
+        run: make build GOARCH=arm64
+
+  e2e:
+    name: 真链路矩阵（自托管，需 CAP_NET_RAW）
+    # 托管 runner 没有 raw socket，只能跑在自带权限的机器上。
+    # 想启用：给一台自托管 runner 打上 self-hosted + flowtls-e2e 标签。
+    runs-on: [self-hosted, flowtls-e2e]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: 真链路矩阵
+        run: bash docs/e2e_matrix.sh
+
+      # 脚本里 iptables_mode 固定为 none，正常不会改系统状态。
+      # 这里再确认一次，避免以后有人改成 auto 却忘了清理。
+      # 只查矩阵实际用的那个标记（ip_id_mark: 61703 → 0xf1004000），
+      # 不要用宽泛的 "0x"——宿主机可能本来就有别的 u32 规则。
+      - name: 确认没有残留 iptables 规则
+        run: |
+          if sudo iptables -t raw -S PREROUTING | grep -q '0xf1004000'; then
+            echo "发现残留规则："
+            sudo iptables -t raw -S PREROUTING
+            exit 1
+          fi
+          if sudo iptables -S OUTPUT | grep -q 'sport 44300'; then
+            echo "发现残留客户端规则："
+            sudo iptables -S OUTPUT
+            exit 1
+          fi
+
+      - name: 收集日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/ft-e2e/*.log
+          if-no-files-found: ignore

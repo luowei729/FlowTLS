@@ -44,9 +44,19 @@ SRC_PORT=44300
 TMP=/tmp/ft-e2e
 mkdir -p "$TMP"
 
-export PATH=/usr/local/go/bin:$PATH
-export GOPATH="${GOPATH:-/root/go}"
-export GOTOOLCHAIN=local
+# 环境探测要在写死默认值之前：本机 Go 装在 /usr/local/go，
+# 而 CI 的 runner 上 Go 已经在 PATH 里、GOPATH 也不是 /root/go。
+# 写死会让脚本在别的机器上直接失败（且报错信息指向权限，很难定位）。
+if [ -d /usr/local/go/bin ] && ! command -v go >/dev/null 2>&1; then
+	export PATH=/usr/local/go/bin:$PATH
+fi
+if [ -z "${GOPATH:-}" ]; then
+	export GOPATH="$(go env GOPATH 2>/dev/null || echo "$HOME/go")"
+fi
+# GOTOOLCHAIN=local：禁止 go 自动下载新工具链。
+# 依赖版本必须与 sing-box 的 go.mod 逐字节一致（AGENTS.md 第 9 条），
+# 让 go 自作主张升版本会破坏这一点。
+export GOTOOLCHAIN="${GOTOOLCHAIN:-local}"
 
 RUST_FLOWTLS="${RUST_FLOWTLS:-}"
 

@@ -1894,3 +1894,53 @@ sudo iptables -t raw -D PREROUTING -p tcp --dport 8443 \
 `print` 模式的价值就在这里：它把内部派生值暴露到了日志里。
 
 教训：文档里的进制换算不要手算，`python3 -c "print(0xF107)"`。
+
+## 76. 校验要分两层：check 能抓到的 vs 只能启动时抓到的
+
+sing-box 的 `check` 只走**构造函数**，不走 `Start`。所以校验放错层，
+就变成「配置错了必须真的启动一次才知道」。
+
+| 层 | 该放什么 | 不该放什么 |
+|---|---|---|
+| `NewInbound` / `NewOutbound` | 纯字符串/结构校验：必填字段、枚举值、互斥关系、URL 格式 | 读文件、bind 端口、申请 raw socket |
+| `Start(StartStateStart)` | 读证书、建 listener、申请特权资源 | 那些「不启动也能判断对错」的检查 |
+
+判据很简单：**这条校验需要访问文件系统或内核吗？**
+不需要就放构造函数，需要就放 Start。
+
+划错层的真实代价（本次踩的）：`proxy_url` 与 `site_dir` 互斥的检查
+一开始只写在 `newMasquerade`（Start 里），结果：
+
+```bash
+$ sing-box check -c bad.json
+$ echo $?
+0        # 静默通过，什么都看不出来
+```
+
+两个都填的配置能过 check，启动时才 FATAL。现在拆成
+`validateMasqueradeOptions`（纯字符串，构造函数调）+
+`newMasquerade`（读文件、bind，Start 调）两层。
+
+同一个教训在 `iptables_mode` 上也适用：拼错 `"atuo"` 必须在
+构造函数里就报错，而不是等到 Start 里试着执行 iptables。
+
+## 77. 反向代理做伪装站：rewrite_host 的坑
+
+`masquerade.proxy_url` 指向第三方站点（如 `https://example.com`）时，
+如果 `rewrite_host` 保持默认的 `false`，转发会**沿用客户端的 Host 头**，
+也就是 `Host: 你的域名:8443`。目标站点不认识这个 Host：
+
+```bash
+$ curl -sk https://<你的IP>:8443/
+HTTP/2 403        # 403 Forbidden（来自 example.com，不是我们）
+```
+
+修法是把 `rewrite_host` 设为 `true`，转发时改用 `proxy_url` 里的 Host。
+改完之后实测与直连**逐字节相同**（`cmp` 无差异），这才是伪装站该有的样子。
+
+反过来，回源指向**自己的**站点时保持 `false` 更自然：
+自己的站点通常靠 Host 做虚拟主机分流。
+
+响应头里唯一还能看出差别的只有**头的顺序**（Go 的 http 包按 key 排序输出，
+nginx/CDN 按自己的顺序）。这属于任何 Go 写的 HTTPS 服务都有的特征，
+不针对本项目，先不处理。

@@ -6,11 +6,14 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -35,7 +38,15 @@ type MasqueradeOptions struct {
 	// Origin CA 等）。探测者能看到证书链，自签证书等于自报家门。
 	CertificatePath string
 	KeyPath         string
-	// ServerName 用于日志与 SNI 提示，可为空。
+	// ProxyURL 非空时开启反向代理模式，优先于 SiteDir。
+	//
+	// 为什么反代比静态文件更难识破：静态站点的目录结构、响应头顺序、
+	// 404 页、ETag 格式都是可枚举的；而反代拿到的是一个真实在跑的站点，
+	// 探测者看到的一切都与直接访问那个站点完全一致。
+	ProxyURL string
+	// RewriteHost 决定反向代理转发时 Host 头用哪个（语义同 hysteria2）。
+	RewriteHost bool
+	// ServerName 仅用于日志，可为空。
 	ServerName string
 }
 
@@ -73,6 +84,23 @@ func newMasquerade(ctx context.Context, addr net.Addr, opts MasqueradeOptions) (
 		}
 		if !info.IsDir() {
 			return nil, E.New("flowtls: site_dir 不是目录: ", opts.SiteDir)
+		}
+	}
+	// 两种模式互斥：静默二选一会让运维以为自己配的那个生效了。
+	// （优先级写在注释里不够，报错才能真检到。）
+	if opts.ProxyURL != "" && opts.SiteDir != "" {
+		return nil, E.New("flowtls: masquerade 的 proxy_url 与 site_dir 只能填一个")
+	}
+	if opts.ProxyURL != "" {
+		u, err := url.Parse(opts.ProxyURL)
+		if err != nil {
+			return nil, E.Cause(err, "flowtls: 解析 proxy_url")
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, E.New("flowtls: proxy_url 必须带 http:// 或 https:// 前缀: ", opts.ProxyURL)
+		}
+		if u.Host == "" {
+			return nil, E.New("flowtls: proxy_url 缺少主机名: ", opts.ProxyURL)
 		}
 	}
 
@@ -125,6 +153,43 @@ func newMasquerade(ctx context.Context, addr net.Addr, opts MasqueradeOptions) (
 // 这两种情况。手写重写会把 "/" 改写成 "/index.html"，
 // 反而触发 FileServer 的 301 回跳，探测者看到一次多余的跳转。
 func (m *Masquerade) handler() http.Handler {
+	// 反代优先：它比静态文件更难识破，见 ProxyURL 字段注释。
+	if m.opts.ProxyURL != "" {
+		target, err := url.Parse(m.opts.ProxyURL)
+		if err != nil {
+			// newMasquerade 已经校验过一次，这里只是防御。
+			return http.NotFoundHandler()
+		}
+		proxy := &httputil.ReverseProxy{
+			Rewrite: func(r *httputil.ProxyRequest) {
+				r.SetURL(target)
+				if !m.opts.RewriteHost {
+					// 沿用客户端的 Host：目标站点按自己的虚拟主机规则处理，
+					// 响应看起来与他直接访问完全一样。
+					r.Out.Host = r.In.Host
+				}
+			},
+			// 用独立的 Transport 而不是 http.DefaultTransport：
+			// 后者不带超时，一次卡住的回源会永久占住一个连接。
+			Transport: &http.Transport{
+				ForceAttemptHTTP2:   true,
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     90 * time.Second,
+				// 回源超时：探测者会故意连一个慢路径，
+				// 咔住的连接比错误响应更可疑。
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				// 回源失败时不要泄露“这是个反代”：
+				// 真实站点不可用时也是 502，这里保持一致。
+				w.WriteHeader(http.StatusBadGateway)
+			},
+		}
+		return proxy
+	}
+
 	if m.opts.SiteDir == "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -188,4 +253,52 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// masqueradeMode 返回伪装站模式的简短描述，仅用于启动日志。
+//
+// 把「实际用的是哪种模式」写进日志很重要：proxy_url 与 site_dir
+// 都填了会报错，但只填一个时运维仍可能记错自己配的是哪个。
+func masqueradeMode(opts *option.FlowTLSMasqueradeOptions) string {
+	switch {
+	case opts == nil:
+		return "disabled"
+	case opts.ProxyURL != "":
+		if opts.RewriteHost {
+			return "proxy → " + opts.ProxyURL + " (rewrite_host)"
+		}
+		return "proxy → " + opts.ProxyURL
+	case opts.SiteDir != "":
+		return "site_dir=" + opts.SiteDir
+	default:
+		return "内置占位页"
+	}
+}
+
+// validateMasqueradeOptions 做**纯配置**校验，不碰文件系统。
+//
+// 放在这里而不是 newMasquerade，是因为 `sing-box check` 会走构造函数
+// 但不会走 Start：只有放在这里，配置错误才能在启动前被 check 抓到。
+// 读证书、建 listener 这类动作仍然留在 Start（见 inbound.go 的注释）。
+func validateMasqueradeOptions(opts *option.FlowTLSMasqueradeOptions) error {
+	if opts.CertificatePath == "" || opts.KeyPath == "" {
+		return E.New("flowtls: masquerade 必须提供 certificate_path 与 key_path（真证书，不能用自签）")
+	}
+	// 两种模式互斥：静默二选一会让运维以为自己配的那个生效了。
+	if opts.ProxyURL != "" && opts.SiteDir != "" {
+		return E.New("flowtls: masquerade 的 proxy_url 与 site_dir 只能填一个")
+	}
+	if opts.ProxyURL != "" {
+		u, err := url.Parse(opts.ProxyURL)
+		if err != nil {
+			return E.Cause(err, "flowtls: 解析 proxy_url")
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return E.New("flowtls: proxy_url 必须带 http:// 或 https:// 前缀: ", opts.ProxyURL)
+		}
+		if u.Host == "" {
+			return E.New("flowtls: proxy_url 缺少主机名: ", opts.ProxyURL)
+		}
+	}
+	return nil
 }

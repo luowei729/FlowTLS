@@ -34,6 +34,9 @@ type FlowTLSInboundOptions struct {
 }
 
 // FlowTLSMasqueradeOptions 是同端口伪装站点的配置。
+//
+// 属性优先级：proxy_url > site_dir > 内置占位页。
+// 前两者互斥，同时填会报错——静默二选一会让运维以为自己配的那个生效了。
 type FlowTLSMasqueradeOptions struct {
 	// SiteDir 是静态站点根目录。
 	// 留空返回占位页——**生产环境必须填真实内容**，占位页本身就是指纹。
@@ -42,6 +45,22 @@ type FlowTLSMasqueradeOptions struct {
 	// Origin CA 等）。探测者能看到证书链，自签证书等于自报家门。
 	CertificatePath string `json:"certificate_path,omitempty"`
 	KeyPath         string `json:"key_path,omitempty"`
+	// ProxyURL 开启反向代理模式：把请求转发到一个真实站点。
+	//
+	// 比静态文件更不容易被识破：静态站点的目录结构、响应头、404 页
+	// 都是可枚举的；而反代拿到的就是一个真实在跑的站点，
+	// 探测者看到的一切都与直接访问那个站点一致。
+	//
+	// 必须带 scheme（https:// 或 http://）。
+	ProxyURL string `json:"proxy_url,omitempty"`
+	// RewriteHost 决定转发时 Host 头用哪个：
+	//   false（默认）—— 沿用客户端请求的 Host，目标站点按自己的虚拟主机规则处理；
+	//   true          —— 改用 ProxyURL 里的 Host，适合目标站点对 Host 校验严的情形。
+	//
+	// **实战经验**：如果回源指向第三方站点（如 example.com），必须设 true，
+	// 否则目标站点收到 Host=你的域名 会直接返回 403。
+	// 回源指向自己的站点时保持 false 更自然。
+	RewriteHost bool `json:"rewrite_host,omitempty"`
 }
 
 // FlowTLSUser 是多用户条目。

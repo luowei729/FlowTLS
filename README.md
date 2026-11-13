@@ -120,6 +120,25 @@ Go 版通过 `masquerade` 配置把站点做在 inbound 内（和 Rust 版行为
    └─ 其余                  →  交给内核 TCP → 真网站
 ```
 
+两种模式二选一：
+
+| 模式 | 配置 | 特点 |
+|---|---|---|
+| 静态文件 | `site_dir` | 简单；但目录结构、404 页、ETag 格式可枚举 |
+| **反向代理** | `proxy_url` | **推荐**：探测者看到的一切与直接访问目标站点逐字节一致 |
+
+```json
+"masquerade": {
+  "certificate_path": "/etc/ssl/private/fullchain.pem",
+  "key_path": "/etc/ssl/private/privkey.pem",
+  "proxy_url": "https://example.com",
+  "rewrite_host": true
+}
+```
+
+> 回源第三方站点时必须把 `rewrite_host` 设为 `true`，否则对方收到
+> `Host=你的域名` 会返回 403。回源自己的站点则保持 `false` 更自然。
+
 不开 `masquerade` 时 inbound 只做隧道，端口可以交给 nginx / caddy
 （页面素材可用 [`web/index.html`](web/index.html)）。
 
@@ -277,6 +296,9 @@ curl -x http://admin:abcd1234@127.0.0.1:1080 https://www.google.com
 bash docs/interop_check.sh    # 冻结向量门禁（不需要 root，不需要 Rust）
 bash docs/e2e_matrix.sh       # 真链路矩阵（需要 root）
 ```
+
+CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编译；
+真链路矩阵需要 `CAP_NET_RAW`，只在打了 `flowtls-e2e` 标签的自托管 runner 上运行。
 
 ## 实测数据
 

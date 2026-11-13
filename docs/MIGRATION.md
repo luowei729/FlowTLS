@@ -75,7 +75,7 @@ udp:
 | `net.mode` | `iptables_mode` | `none`/`print`/`auto` 语义相同，但默认是 `print` |
 | `net.max_cwnd` | —— | Go 侧交给 quic-go 的 BBR，不再手工设窗口上限 |
 | `tls.cert` / `tls.key` | `masquerade.certificate_path` / `key_path` | 伪装网站的真证书，不是协议证书（见下） |
-| `site.dir` | `masquerade.site_dir` | 留空返回占位页，生产必须填真实内容 |
+| `site.dir` | `masquerade.site_dir` / `proxy_url` | 二选一；`proxy_url` 是 Rust 版没有的能力 |
 
 ### 两个「消失」的字段怎么处理
 
@@ -86,11 +86,24 @@ Go 版对应 `masquerade.certificate_path` / `masquerade.key_path`，
 
 ```json
 "masquerade": {
-  "site_dir": "/var/www/lumen-edge",
   "certificate_path": "/etc/ssl/private/fullchain.pem",
-  "key_path": "/etc/ssl/private/privkey.pem"
+  "key_path": "/etc/ssl/private/privkey.pem",
+  "site_dir": "/var/www/lumen-edge"
 }
 ```
+
+也可以用反向代理模式（Rust 版没有这个能力）：
+
+```json
+"masquerade": {
+  "certificate_path": "...",
+  "key_path": "...",
+  "proxy_url": "https://example.com",
+  "rewrite_host": true
+}
+```
+
+`proxy_url` 与 `site_dir` 互斥；`rewrite_host` 语义同 hysteria2。
 
 不配 `masquerade` 时 inbound 只做隧道，端口交给别的进程也行：
 

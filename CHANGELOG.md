@@ -1,5 +1,68 @@
 # CHANGELOG
 
+## 2026-11-13 14:45 (北京时间)
+
+### P5-3 完成：CI 落地 + 伪装站反向代理模式
+
+**CI（`.github/workflows/ci.yml`）**
+
+四个 job，按「能不能在没有特权的情况下跑」分层：
+
+| job | runner | 内容 |
+|---|---|---|
+| `verify` | ubuntu-latest | `make build` + `make verify` + 示例配置 `check`（非 root） |
+| `test` | ubuntu-latest | `go vet` + 冻结向量门禁 + `go test -race` + `gofmt -l` 断言 |
+| `cross` | ubuntu-latest | flowtls windows/darwin/arm64 + sing-box 协议层交叉编译 |
+| `e2e` | `[self-hosted, flowtls-e2e]` | 真链路矩阵，`workflow_dispatch` 手动触发 |
+
+托管 runner 拿不到 raw socket，所以 e2e 独立成 job 并用标签 opt-in；
+把它的失败设成「允许」等于没有门禁，不如诚实地不跑。
+
+**新增：伪装站反向代理模式（`masquerade.proxy_url`）**
+
+对齐 hysteria2 的能力，比静态文件更难识破：
+
+| 模式 | 可枚举的特征 |
+|---|---|
+| `site_dir`（静态） | 目录结构、404 页、ETag 格式、`Last-Modified` 精度 |
+| `proxy_url`（反代） | 无——探测者看到的一切与直连目标站点**逐字节相同**（已 `cmp` 验证） |
+
+```json
+"masquerade": {
+  "certificate_path": "...",
+  "key_path": "...",
+  "proxy_url": "https://example.com",
+  "rewrite_host": true
+}
+```
+
+**修复**
+
+| 问题 | 原因 | 处理 |
+|---|---|---|
+| `check` 抓不到 masquerade 配置错误 | 互斥/URL 校验只写在 `newMasquerade`（Start 阶段），而 check 只走构造函数 | 拆成 `validateMasqueradeOptions`（纯字符串，构造函数调）+ `newMasquerade`（读文件/bind，Start 调） |
+| 文档脚本在非 root 环境跑不起来 | 写死 `GOPATH=/root/go`、`PATH=/usr/local/go/bin` | 改成探测式：go 不在 PATH 才补 /usr/local/go，GOPATH 未设则取 `go env GOPATH` |
+| 反代回源第三方站点返回 403 | `rewrite_host` 默认 false，沿用客户端 Host，对方不认 | 文档 + 示例明确：第三方回源必须设 `true`；实测改后与直连逐字节相同 |
+
+**实测**
+
+| 项 | 结果 |
+|---|---|
+| `check` 两个都填 | FATAL「proxy_url 与 site_dir 只能填一个」 |
+| `check` 缺 scheme | FATAL「proxy_url 必须带 http:// 或 https:// 前缀」 |
+| 反代 `rewrite_host: true` | 200 / 577 字节，`cmp` 与直连 example.com **完全相同** |
+| 反代 `rewrite_host: false` | 403（预期，已写入文档） |
+| 启动日志 | `(proxy → https://example.com (rewrite_host))` |
+| 脚本可移植性 | `env -i PATH=/usr/bin:/bin` 下也能跑通门禁 |
+| 全量回归 | verify / test / 门禁 / gofmt / 示例 check / 交叉编译 全绿 |
+| 真链路矩阵 | 4 通过 / 0 失败 / 3 跳过，无 iptables 残留 |
+
+**文档**
+
+`README.md`（两种模式对比表 + rewrite_host 提示 + CI 说明）、
+`docs/MIGRATION.md`（`site.dir` 对应两种模式）、
+`deploy.example/server.json`（反代示例）、`DEVTIPS.md` 第 76、77 条。
+
 ## 2026-11-13 14:25 (北京时间)
 
 ### P5-1/P5-2 完成：iptables 三种模式接线 + 同端口真证书伪装站（证书恢复）
