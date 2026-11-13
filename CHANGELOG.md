@@ -1,5 +1,64 @@
 # CHANGELOG
 
+## 2026-11-13 12:37 (北京时间)
+
+### Go P3 完成：UDP（QUIC DATAGRAM）与 Rust 服务端互通
+
+**新增**
+
+| 文件 | 内容 |
+|---|---|
+| `flowtls/udp.go` | DATAGRAM 帧编解码（上行带地址 / 下行只有 session） |
+| `flowtls/quic/client.go` | `ListenPacket` + 下行分发协程 + `udpConn`（net.PacketConn） |
+| `flowtls/addr.go` | 新增无长度前缀的 `EncodeAddressFrame` / `EncodeDomainFrame` |
+| `flowtls/cmd/ftudp/` | UDP 联调工具（`-sessions N`、`-rounds N`） |
+| `flowtls/udp_test.go` | 7 个单测 |
+
+**实测（Rust 服务端）**
+
+| 用例 | 结果 |
+|---|---|
+| 单个会话 5 轮 DNS | PASS，61 字节回程，109ms |
+| 4 个并发会话 × 3 轮 | PASS，9ms |
+| 不同目标（8.8.8.8 / 1.1.1.1） | PASS |
+| 服务端日志确认 | `session=0` 复用、下行 61 字节、回程交给 QUIC |
+| TCP 回归（小包 + 4 流 × 5MB） | PASS，0 背压 |
+
+**与 hysteria2 的关键差异（设计要点）**
+
+hy2 的目标地址在会话建立时确定，后续包不再携带。本协议**上行每包都带目标
+地址**（多 7~9 字节），换来服务端完全无状态：客户端重连后服务端是新连接、
+会话表为空，第一个带地址的包就能自愈，不需要任何会话迁移协议。
+
+Go 侧因此支持**一个 session 发往多个目标**（`WriteTo` 的 addr 可以变），
+这与 `net.PacketConn` 的语义天然一致。
+
+**分发的单消费者约束**
+
+`quic.Conn.ReceiveDatagram` 是**单消费者**语义，多个协程同时读会互相抢包。
+所以只能用**一个**分发协程按 session 路由到各 udpConn 的通道，而不能让每个
+udpConn 自己去读。这一点和流（`AcceptStream`）不同，容易踩。
+
+**UDP 语义的取舍**
+
+| 位置 | 做法 | 理由 |
+|---|---|---|
+| 分发通道满（64） | 丢新包 | 绝不阻塞分发协程，否则一条慢会话拖死所有会话 |
+| 超 MTU | 丢包并返回 `errDatagramTooLarge` | 不做应用层分片（与 Rust 一致）；错误单独定义，让上层能区分「包太大」与「会话坏了」 |
+| `Close` | 只注销路由表，不关 rx | 分发协程可能正在写，关掉会 panic |
+
+**验收**
+
+```
+cd flowtls && go test ./...  → 24 passed（新增 7 个 UDP 用例）
+go vet                       → 干净
+GOOS=windows/darwin go build → OK
+cargo test                   → 25 passed
+bash docs/interop_check.sh   → PASS
+```
+
+**未做**：`flowtls/listener.go`（服务端 Accept）、`protocol/flowtls/`（sing-box 适配层）。
+
 ## 2026-11-13 12:25 (北京时间)
 
 ### Go P2 完成：`quic/` 子包，Go 客户端打通 Rust 服务端

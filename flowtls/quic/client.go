@@ -15,7 +15,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	gosync "sync"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	quicgo "github.com/sagernet/quic-go"
@@ -87,6 +88,205 @@ type Client struct {
 	session   *flowtls.Session
 	transport *quicgo.Transport
 	conn      *quicgo.Conn
+
+	// udpNext 是 UDP session id 分配器。
+	//
+	// 从随机值起步递增：session 只需在「一条 QUIC 连接内」唯一，
+	// 随机起点能避免客户端重连后旧连接残留的包被误投到新会话上
+	// （服务端重连后会话表本来就是空的，这属于防御性设计）。
+	udpNext atomic.Uint32
+
+	// udpRoutes 是下行路由表：session → 该会话的投递通道。
+	//
+	// 下行帧只有 [session][payload]，不带地址，客户端必须自己按 session
+	// 找回是哪个本地 UDP socket 发的。表项由 ListenPacket 注册、
+	// Close 注销。
+	udpRoutes sync.Map // map[uint32]*udpSession
+
+	// dispatcherOnce 保证下行分发协程只启动一次
+	dispatcherOnce sync.Once
+}
+
+// udpSession 是一条本地 UDP 映射出来的会话。
+type udpSession struct {
+	id     uint32
+	target netip.AddrPort
+	// rx 是下行投递通道。容量小是有意的：UDP 不重传，堆太多只是延迟。
+	rx chan []byte
+	// 目标地址帧（不含长度前缀），每个上行包都要带
+	targetFrame []byte
+}
+
+// ListenPacket 建立一条 UDP 会话，返回可直接当 net.PacketConn 使用的对象。
+//
+// 与 hysteria2 的差异：hy2 的 ListenPacket(ctx, destination) 是「一个会话一个
+// 固定目标」，本协议上行**每包都带目标地址**，所以这里的目标只是默认值——
+// 之后每次 WriteTo 都可以指定不同目标（多目标共享一个 session）。
+//
+// 为什么这样设计：服务端因此可以完全无状态，客户端重连后第一个包就能自愈。
+func (c *Client) ListenPacket(ctx context.Context, target string, port uint16) (net.PacketConn, error) {
+	_ = ctx
+	if c.conn == nil {
+		return nil, ErrNoSession
+	}
+	frame, err := encodeTargetFrame(target, port)
+	if err != nil {
+		return nil, err
+	}
+	id := c.udpNext.Add(1) - 1
+	s := &udpSession{
+		id:          id,
+		rx:          make(chan []byte, 64),
+		targetFrame: frame,
+	}
+	if a, err := netip.ParseAddr(target); err == nil {
+		s.target = netip.AddrPortFrom(a, port)
+	}
+	c.udpRoutes.Store(id, s)
+
+	// 第一次用到 UDP 时才启动分发协程：纯 TCP 用户不付这个成本。
+	c.dispatcherOnce.Do(func() { go c.dispatchDatagrams() })
+
+	return &udpConn{client: c, sess: s}, nil
+}
+
+// dispatchDatagrams 把 conn 收到的 DATAGRAM 按 session 分发到各自通道。
+//
+// 单独一个协程而不是让每个 udpConn 自己去 ReceiveDatagram：
+// quic-go 的 ReceiveDatagram 是**单消费者**语义，多个协程同时读会互相抢包。
+func (c *Client) dispatchDatagrams() {
+	for {
+		data, err := c.conn.ReceiveDatagram(c.conn.Context())
+		if err != nil {
+			// 连接关闭：通知所有会话退出
+			c.udpRoutes.Range(func(_, v any) bool {
+				close(v.(*udpSession).rx)
+				return true
+			})
+			return
+		}
+		session, payload, ok := flowtls.ParseServerDatagram(data)
+		if !ok {
+			continue
+		}
+		v, loaded := c.udpRoutes.Load(session)
+		if !loaded {
+			// 会话已关闭或从未存在：丢弃（UDP 语义，不报错）
+			continue
+		}
+		s := v.(*udpSession)
+		// 拷贝：data 由 quic-go 复用，下一轮会被覆盖
+		buf := make([]byte, len(payload))
+		copy(buf, payload)
+		select {
+		case s.rx <- buf:
+		default:
+			// 通道满：丢弃（UDP 不重传，绝不阻塞分发协程，
+			// 否则一条慢会话会拖死所有会话）
+		}
+	}
+}
+
+// udpConn 实现 net.PacketConn，对应一条 UDP 会话。
+type udpConn struct {
+	client *Client
+	sess   *udpSession
+	closed atomic.Bool
+}
+
+var _ net.PacketConn = (*udpConn)(nil)
+
+func (u *udpConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	data, ok := <-u.sess.rx
+	if !ok {
+		return 0, nil, net.ErrClosed
+	}
+	n := copy(p, data)
+	return n, net.UDPAddrFromAddrPort(u.sess.target), nil
+}
+
+// WriteTo 发送一个 UDP 数据报。
+//
+// addr 允许为 nil（沿用 ListenPacket 时给的目标），也允许指定不同目标——
+// 协议上行每包带地址，因此天然支持多目标共享一个 session。
+func (u *udpConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if u.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	frame := u.sess.targetFrame
+	if addr != nil {
+		if ap, ok := addrPortOf(addr); ok {
+			var err error
+			frame, err = flowtls.EncodeAddressFrame(ap)
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	// 每包带 session + 地址帧
+	pkt := flowtls.EncodeClientDatagram(nil, u.sess.id, frame, p)
+	// SendDatagram 的语义：超出当前 MTU 会返回 DatagramTooLargeError。
+	// 按 UDP 语义直接丢弃，不做应用层分片（与 Rust 侧一致）。
+	if err := u.client.conn.SendDatagram(pkt); err != nil {
+		if errors.As(err, new(*quicgo.DatagramTooLargeError)) {
+			return 0, errDatagramTooLarge
+		}
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// errDatagramTooLarge 表示载荷超出单包 MTU。
+//
+// 单独定义而不是直接透传：调用方（sing-box 的 UDP 转发层）需要区分
+// 「这条会话坏了」和「这个包太大」——后者只该丢一个包，不该关会话。
+var errDatagramTooLarge = errors.New("flowtls: UDP 载荷超出单包 MTU（不做分片，直接丢弃）")
+
+func (u *udpConn) Close() error {
+	if u.closed.Swap(true) {
+		return nil
+	}
+	u.client.udpRoutes.Delete(u.sess.id)
+	// 不关 rx：分发协程可能正在写入，关掉会 panic。
+	// 注销路由表后不会再有新数据进来，残留的由 GC 回收。
+	return nil
+}
+
+func (u *udpConn) LocalAddr() net.Addr {
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
+}
+
+func (u *udpConn) SetDeadline(t time.Time) error      { return nil }
+func (u *udpConn) SetReadDeadline(t time.Time) error  { return nil }
+func (u *udpConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// addrPortOf 从 net.Addr 提取 netip.AddrPort。
+func addrPortOf(addr net.Addr) (netip.AddrPort, bool) {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.AddrPort(), true
+	case *net.TCPAddr:
+		return netip.AddrPortFrom(a.AddrPort().Addr(), a.AddrPort().Port()), true
+	}
+	// 兜底：解析字符串
+	ap, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	return ap, true
+}
+
+// encodeTargetFrame 生成不含长度前缀的地址帧。
+func encodeTargetFrame(target string, port uint16) ([]byte, error) {
+	full, err := encodeTarget(target, port)
+	if err != nil {
+		return nil, err
+	}
+	// encodeTarget 返回 [len u16][ATYP][ADDR][PORT]，去掉前 2 字节
+	if len(full) < 3 {
+		return nil, flowtls.ErrBadAddress
+	}
+	return full[2:], nil
 }
 
 // NewClient 建立 flowtls 通道并完成 QUIC 握手。
@@ -252,7 +452,7 @@ type StreamConn struct {
 	stream *quicgo.Stream
 	// local / remote 只用于日志与 metadata，不参与任何寻址逻辑
 	local, remote net.Addr
-	closeOnce     gosync.Once
+	closeOnce     sync.Once
 }
 
 var _ net.Conn = (*StreamConn)(nil)

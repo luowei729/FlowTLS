@@ -1,6 +1,6 @@
 # PROJECT_PLAN
 
-## 当前状态（2026-11-13 12:25 北京时间）
+## 当前状态（2026-11-13 12:37 北京时间）
 
 ### 定位调整（用户决策）
 
@@ -10,7 +10,7 @@
 1. 互通门禁的「另一个独立实现」（防止自测全绿、上线全挂）
 2. 生产环境的回滚版本（新加坡机当前跑的是 Rust）
 
-策略是「先开发，后冻结」：Go 侧 P2~P4 开发期间 Rust 不动；
+策略是「先开发，后冻结」：Go 侧 P3~P4 开发期间 Rust 不动；
 Go 通过全部互通与压测后再冻结 Rust。
 
 ### 里程碑
@@ -19,10 +19,38 @@ Go 通过全部互通与压测后再冻结 Rust。
 |---|---|---|
 | P0 | subtree + 补丁 + stub 注册 + Makefile | ✅ |
 | P1 | `flowtls/` 主包：packet/codec/socket/session | ✅ |
-| **P2** | **`quic/` 子包 + Go 客户端打通 Rust 服务端** | ✅ |
-| P3 | UDP（udpnat2 + session 映射） | 待办 |
-| P4 | `Listener.Accept` + `protocol/flowtls/outbound.go` | 待办 |
+| P2 | `quic/` 子包 + Go 客户端打通 Rust 服务端 | ✅ |
+| **P3** | **UDP（QUIC DATAGRAM）+ 多会话路由** | ✅ |
+| P4 | `listener.go`（服务端 Accept）+ `protocol/flowtls/` 适配层 | 待办 |
 | P5 | 打包、CI 互通矩阵、配置迁移文档、冻结 Rust | 待办 |
+
+### P3 实测（Rust 服务端）
+
+| 用例 | 结果 |
+|---|---|
+| 单会话 5 轮 DNS | PASS，61 字节回程，109ms |
+| 4 并发会话 × 3 轮 | PASS，9ms |
+| 多目标（8.8.8.8 / 1.1.1.1） | PASS |
+| 服务端 session 复用 | 日志确认 `session=0` |
+| TCP 回归 | 小包 + 4 流 × 5MB，0 背压 |
+
+**P3 的设计要点**（与 hysteria2 不同）：上行每包带目标地址，服务端完全无状态，
+客户端重连后第一个包就能自愈。副作用是 Go 的 `net.PacketConn` 语义更自然——
+一个 session 可以同时发往多个目标。
+
+**踩到的坑**：`quic.Conn.ReceiveDatagram` 是单消费者语义，只能有一个分发
+协程按 session 路由，不能让每个 `udpConn` 自己去读（会互相抢包）。
+投递到会话通道时必须允许丢弃，否则一条慢会话会拖死整条连接的所有流。
+
+### P4 起点
+
+`flowtls/listener.go` 是本项目最后一个大件：服务端要按四元组分流、
+自己做三次握手、**每客户端一个 Session + 一个 quic.Transport**
+（这点与 hy2 不同，因为伪造 TCP 的 seq/ack 空间是每连接独立的）。
+
+---
+
+## 上一阶段状态（2026-11-13 12:25 北京时间）
 
 ### P2 实测（Rust 服务端，本机）
 

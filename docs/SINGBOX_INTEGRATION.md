@@ -147,9 +147,25 @@ make verify
 | P0 | subtree + 补丁 + stub 注册 + Makefile，`version`/`check` 可用 | ✅ 2026-11-13 |
 | P1 | `flowtls/` 主包：packet/codec/socket/session + 单测 | ✅ 2026-11-13 |
 | P2 | `quic/` 子包 + Go 客户端打通 Rust 服务端 | ✅ 2026-11-13 |
-| P3 | UDP（udpnat2 + session 映射），dig 通 | 待办 |
-| P4 | `Listener.Accept` + outbound/inbound 适配 | 待办 |
+| P3 | UDP（QUIC DATAGRAM）+ 多会话路由 | ✅ 2026-11-13 |
+| P4 | `listener.go`（服务端 Accept）+ outbound/inbound 适配 | 待办 |
 | P5 | 打包脚本、CI 互通矩阵、配置迁移文档 | 待办 |
+
+### P3 实测（Rust 服务端）
+
+| 用例 | 结果 |
+|---|---|
+| 单会话 5 轮 DNS | PASS，61 字节回程，109ms |
+| 4 并发会话 × 3 轮 | PASS |
+| 多目标（8.8.8.8 / 1.1.1.1） | PASS |
+| TCP 回归 | 小包 + 4 流 × 5MB，0 背压 |
+
+**UDP 与其他协议的关键差异**：上行每包带目标地址（多 7~9 字节），
+换来服务端完全无状态——客户端重连后第一个带地址的包就能自愈。
+副作用是 `net.PacketConn` 语义更自然：一个 session 可同时发往多个目标。
+
+**实现约束**：`quic.Conn.ReceiveDatagram` 是单消费者语义，
+必须有唯一的分发协程按 session 路由（不能让每个 `udpConn` 自读，会抢包）。
 
 ### P2 实测（Rust 服务端）
 

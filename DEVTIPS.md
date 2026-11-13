@@ -1607,7 +1607,59 @@ func (timeoutError) Temporary() bool { return true }
 
 否则 quic-go 会把正常超时当成致命错误直接关闭连接。
 
-## 69. 常用调试命令
+## 69. QUIC DATAGRAM 的接收是单消费者语义
+
+流（stream）可以多个 goroutine 各自 `AcceptStream`，但 **DATAGRAM 不行**：
+
+```go
+// 错误：多个 udpConn 各自去读，会互相抢包
+for each session {
+    go func() { data, _ := conn.ReceiveDatagram(ctx) }()   // 抢包！
+}
+
+// 正确：一个分发协程读，按 session 路由
+go func() {
+    for {
+        data, err := conn.ReceiveDatagram(ctx)
+        if err != nil { break }
+        session, payload, ok := ParseServerDatagram(data)
+        routes[session] <- payload      // 投递到对应会话
+    }
+}()
+```
+
+这不是 quic-go 的缺陷，是 DATAGRAM 的设计：它没有「流 ID」那样的
+天然分流键，quic-go 只能提供「下一个数据报」这一个队列。
+
+配套的两个细节：
+
+1. **`data` 由 quic-go 复用**，必须拷贝出来再投递，否则下一轮会被覆盖。
+2. **投递到会话通道时不能阻塞**（用 `select ... default` 丢弃）。
+   一条慢会话如果阻塞了分发协程，会拖死这条连接上的所有会话——
+   包括 TCP。这里丢包是正确的（UDP 不重传），阻塞是错误的。
+
+## 70. 上行每包带目标地址：换来服务端无状态
+
+hysteria2 的 UDP 是在会话建立时确定目标，后续包不带地址。
+FlowTLS 反其道而行：**上行每包都带**（多 7~9 字节）。
+
+收益不是省代码，而是**服务端完全无状态**：
+
+```
+客户端重连 → 服务端是全新连接、会话表为空
+          → 第一个带地址的上行包就能自愈，不需要会话迁移协议
+```
+
+排查时也省事：一行日志就能看出这个包发给谁，不需要回溯会话创建时的记录。
+
+代价只有每包几个字节。对 DNS（61 字节）来说是 11% 开销，对游戏/视频包
+（几百到上千字节）可以忽略。这个取舍在 Rust 版就验证过，Go 侧直接沿用。
+
+副作用是 Go 的 `net.PacketConn` 语义更自然了：`WriteTo(p, addr)` 的 `addr`
+可以每次不同——一个 session 同时发往多个目标是被协议支持的，
+而不是像 hy2 那样需要「一个目标一个会话」。
+
+## 71. 常用调试命令
 
 ```bash
 

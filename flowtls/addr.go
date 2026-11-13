@@ -67,6 +67,39 @@ func prefixLen(inner []byte) []byte {
 	return append(out, inner...)
 }
 
+// EncodeAddressFrame 生成**不含**长度前缀的地址帧 `[ATYP][ADDR][PORT]`。
+//
+// 用途：UDP DATAGRAM 里的目标地址就不带长度前缀
+// （外层已有 addrLen 字段，见 EncodeClientDatagram）。
+func EncodeAddressFrame(addr netip.AddrPort) ([]byte, error) {
+	if addr.Addr().Is4() {
+		o := addr.Addr().As4()
+		out := make([]byte, 0, 1+4+2)
+		out = append(out, AddrTypeIPv4)
+		out = append(out, o[:]...)
+		return binary.BigEndian.AppendUint16(out, addr.Port()), nil
+	}
+	if addr.Addr().Is6() {
+		o := addr.Addr().As16()
+		out := make([]byte, 0, 1+16+2)
+		out = append(out, AddrTypeIPv6)
+		out = append(out, o[:]...)
+		return binary.BigEndian.AppendUint16(out, addr.Port()), nil
+	}
+	return nil, ErrBadAddress
+}
+
+// EncodeDomainFrame 生成**不含**长度前缀的域名地址帧。
+func EncodeDomainFrame(host string, port uint16) ([]byte, error) {
+	if len(host) == 0 || len(host) > 255 {
+		return nil, fmt.Errorf("%w: 域名长度 %d 超出 1..255", ErrBadAddress, len(host))
+	}
+	out := make([]byte, 0, 1+1+len(host)+2)
+	out = append(out, AddrTypeDomain, byte(len(host)))
+	out = append(out, host...)
+	return binary.BigEndian.AppendUint16(out, port), nil
+}
+
 // DecodeAddress 解析「不含长度前缀」的地址帧，返回目标。
 // ipv6 为 true 时返回 IPv6 地址，域名返回 Addr 无效但 Host 有值。
 func DecodeAddress(frame []byte) (host string, port uint16, err error) {
