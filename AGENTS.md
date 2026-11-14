@@ -36,11 +36,11 @@ flowtls 传输层
   - 标准三次握手：SYN → SYN-ACK → ACK，之后才发数据
     （严格 NAT 会丢弃握手完成前的数据包；零等待版本已废弃）
   - AEAD 密钥 = HKDF-SHA256(password)，解密成功即鉴权
-  - 伪包识别特征 = **TCP 窗口缩放因子 wscale=12**（只在 SYN/SYN-ACK 里）
-    真实 Linux 是 7~10，`wscale=12` 在真实栈上极小概率出现；
-    TCP 选项是**端到端字段，运营商 NAT / 云网关不会改写**。
-    **不要改回 9**：IP ID 不再可靠（见下），9 与真实浏览器无法区分，
-    服务端会给真实 SYN 也回 SYN-ACK，与内核（伪装站）抢同一四元组。
+  - 伪包识别特征 = **IP ID 高字节标记**（与 Rust 逐条一致）
+    `(ip_id & mark) == mark` 且 SYN 且无载荷；mark 来自配置的 `ip_id_mark`
+    （默认 `0xF100`），每个部署应不同。
+    **不要改成 wscale 判断**：v1 曾用 `wscale=12`，但 wscale 必须做得和真实
+    Linux 一样（9~10）才不像伪造，一旦改成真实的就失去了识别能力。
         │  原始 IPv4 报文
         ▼
 ================ TCP 8443 ================
@@ -69,7 +69,7 @@ flowtls/                    独立 Go 模块 github.com/luowei729/flowtls
   socket_stub.go            非 Linux 空实现（保证能交叉编译）
   session.go                单条会话，net.PacketConn 语义
   listener.go               服务端：共享 raw socket + 单收包协程 + 四元组分发
-  rules.go                  iptables 规则构造（u32 匹配 IP ID 标记）+ 三种模式
+  rules.go                  iptables 规则构造（u32 匹配 IP ID 标记）+ auto/none
   rules_linux.go            Linux 上执行 iptables / 非 Linux 为 rules_stub.go
   quic/client.go            quic-go 客户端
   quic/server.go            quic-go 服务端
@@ -159,10 +159,11 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
     `simple_strtoul(base=0)` 解析，不带前缀会失败返回 0，规则永不命中，
     而 `iptables -C` 依然报告规则存在（`DEVTIPS.md` 第 74 条）。
 13. **iptables 规则刻意不自动删除**。重启期间规则必须继续生效，
-    否则内核会回 RST 打断重建中的隧道。卸载命令由 `print` 模式打印。
-14. **服务端分流必须按 wscale 判断，不能按 IP ID**：IP ID 掩码匹配
-    （`& 0x1E00 == 0x1E00`）有 1/16 误命中率，且部分链路会改写它。
-    误命中会让真实浏览器的 SYN 也收到伪 SYN-ACK（`DEVTIPS.md` 第 93 条）。
+    否则内核会回 RST 打断重建中的隧道。`mode` 只有 `auto` / `none`
+    两个合法值（与 Rust 一致），没有 `print`。
+14. **服务端分流必须按 IP ID 高字节判断**（与 Rust 一致），且**纯 SYN 判断
+    要优先于「已有会话」**。IP ID 用 `& 0xFF00` 掩掉低字节（低字节是按包
+    递增的序号）。
 15. **收包缓冲必须 ≥ 256KB**：网卡 GRO 会把多个 TCP 段合并成超过 64KB 的
     skb，缓冲不足时 `recvmmsg` **静默截断**（QUIC 的 `lost=` 恒为 0，
     只表现为握手慢、RTT 虚高）。同时必须保留 `MSG_TRUNC` 检测
@@ -182,7 +183,8 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 - 需要 root 或 CAP_NET_RAW。
 - **NAT 云主机可用**（Oracle Cloud 已验证）：网卡只有内网地址时，
   包里必须填**内网地址**，让网关做 1:1 SNAT。填公网地址会被网关
-  反欺骗**静默丢弃**。Go 版已自动纠正并打到启动日志（`DEVTIPS.md` 87）。
+  反欺骗**静默丢弃**（服务端抓包看得到 SYN-ACK 发出，客户端一个包都收不到）。
+  **本移植不做自动纠正**（Rust 也不做），`local_ip` 写错就是连不上。
 - **443 端口不可用**：国内出口设备对 443 的伪造 TCP 检查更严，建议用 8443/9443。
 - **单流窗口受 quic-go 组装器约束**：高丢包时窗口过大会积累大量乱序空洞，
   因此用自适应窗口规避。
@@ -190,5 +192,14 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
   需另起进程监听同端口；开了则由 inbound 自己 bind（唯一会 bind 内核 TCP 的地方）。
   自签证书等于自报家门，两种方式都不行。
 - **iptables 规则不会自动删除**：`auto` 幂等写入但不清理，
-  升级/卸载后按 `print` 输出里的卸载命令手工清。
+  升级/卸载后按启动日志里打印的命令手工清。
 - 内层 QUIC 证书是运行时自签，安全由外层 AEAD 保证。
+- **发送路径固定是 IPPROTO_RAW**（保留 Rust 的 ARP 解析缺陷，见
+  `PROJECT_PLAN.md` §7）。单次 `sendto` 在 Oracle ARM 实测 34µs，
+  因此发送必须走 sendmmsg 批量（`Session.txLoop`，一次最多 32 个）。
+- **真链路没有稳定的 2 倍差距**。早先的「6~7 vs 15~16」是非同时刻测量
+  （2026-11-14 16:35）。17:04 曾在 `cappedBbr` 加过「一个 RTT 突发一窗」的
+  发送等待，18:30 已删除：它会把 ACK 一起挡住，且不是 RTT 偏高的原因。
+  真正的原因是延迟确认只在下一个包到达时才发（19:05 修）。
+  19:10 同窗口对照：首字节 Go p50 77ms、Rust 98ms；下载 Go 8.5 MB/s、
+  Rust 6.7 MB/s；上传两边都约 5.8 MB/s。

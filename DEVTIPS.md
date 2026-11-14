@@ -3031,3 +3031,428 @@ tcpdump 生成的代码用的是 `0x00040000`（262144）。
 
 **教训**：纯优化如果不能验证，就不要默认开启。这条优化的收益
 （减少无关包解析）远小于它带来的风险（整条隧道不通）。
+
+## 101. 逐函数原样移植时，最容易错的是「拼装」而不是「算法」
+
+Go 版从零重移植（2026-11-14）后，算法层面全部一次通过（AEAD、HKDF、
+握手、伪造 ClientHello/ServerHello、IP/TCP 构包都与冻结向量字节一致），
+但真机部署时仍然一条都跑不通。五个缺陷全是**胶水层**的：
+
+1. `rule.spec` 里写了 `-A PREROUTING`，而 `command(op)` 又无条件插入动作词
+   → 真机执行 `iptables -t raw -A -A PREROUTING ...`，服务端 FATAL 起不来。
+   单测当时只 `strings.Join(spec, " ")` 判断内容，看不出重复。
+   **现在用「完整参数列表里动作词必须恰好出现一次」来断言。**
+2. 分流层是「按四元组快查会话」，而 Rust 是「每个包都先解密再交给 quinn，
+   新连接时 `conns.retain(|_, c| c.client != client)`」。
+   移植时只在 `handleFirstPacket` 里清了旧会话，但 `handlePacket` 的第 2
+   分支**先**命中旧会话，新连接的首包被当乱序包吞掉。
+   现象极具误导性：客户端日志「通道已建立」，之后所有请求超时，
+   直到 120 秒空闲回收才自己好。**客户端源端口是固定的，所以每次重启必现。**
+3. 出站 `Start` 里同步做初始建连。伪 TCP 握手最长 15 秒才判失败，
+   而 sing-box 是串行启动——outbound 的 Start 不返回，mixed/socks 入口
+   就不会开始监听。于是「客户端刚起来时所有请求立即失败」。
+   这也让 `docs/e2e_matrix.sh` 偶发 000（脚本只 sleep 3 秒）。
+4. 收包缓冲沿用 Rust 的 64KB，且 `Recvfrom` 没带 `MSG_TRUNC`。
+   GRO 聚合出来的 skb 带上 IP/TCP 头就可以超过 64KB，`recvfrom` **静默截断**，
+   包无声消失。必须用 `MSG_TRUNC` 拿真实长度才能发现（返回值会大于缓冲长度）。
+5. `SendBatch`（sendmmsg）实现了却没人调用，服务端逐包 `sendto`。
+   Oracle ARM 实测单次 `sendto` **34µs**，`sendmmsg` 32 个/批降到 20.6µs。
+   回环单流因此从 33 MB/s 提升到 45 MB/s。
+
+**结论**：移植的正确性检查不能只看「算法对不对」，必须有一个
+「真链路跑通 + 断言可执行产物」的门禁。只看单测绿就以为通了，会在这里翻车。
+
+## 102. 同一台机器上 `sendto` 比 `sendmmsg` 贵 1.65 倍（Oracle ARM 实测）
+
+```
+sendto              : 29 322 包/s（每包 34.10 µs）
+sendmmsg(32/批)     : 48 597 包/s（每批 658 µs，每包 20.6 µs）
+connect + write     : 30 025 包/s（每包 33.31 µs）—— connect 并不省
+connect + sendmmsg  : 31 363 包/s —— 反而更慢，别用
+```
+
+所以**别指望 `connect()` 缓存路由能省时间**；唯一的杠杆是批量。
+`sendmmsg` 的每个 message 必须自带 `sockaddr`（不要先 connect），否则更慢。
+
+按这个数字反推：1 核 ARM 上单方向 1.2 万包/秒就吃掉 ~0.4 秒 CPU，
+所以伪 TCP 层的发送**必须**批量，否则吞吐会被 syscall 卡在个位数 MB/s。
+
+## 103. `local_ip` 填公网地址会「看起来正常但完全不通」
+
+Oracle Cloud 的实例只有内网地址（如 `10.0.0.10`），公网地址由网关 1:1 映射。
+走 IPPROTO_RAW 时，IP 头里的 `saddr` 是**我们写进去的值，内核不会改写**：
+
+- 写内网地址 → 网关做 SNAT → 客户端正常收到；
+- 写公网地址 → 网关反欺骗**静默丢弃**。
+
+最迷惑的地方：服务端 `tcpdump` 能看到 SYN-ACK **已经发出**（抓的是本机网卡），
+客户端却一个包都收不到，双方日志都没有任何错误。
+
+排查手法：`grep 发送路径 sing-box.log`，确认 `源 IP=` 是内网地址。
+`deploy.example/server.json` 与 `DEPLOY_CREDENTIALS.md` 都已按此更正。
+
+## 104. 纯 ACK 的判定必须在「一批收完」之后，不能逐包判
+
+Rust 的事件循环是「阻塞收 1 帧 + `try_recv` 再凑最多 256 帧」，
+`ack_pending >= 2 || (ack_pending > 0 && last_ack.elapsed() >= 40ms)`
+这个 `due` 判定**只在整批处理完之后做一次**。
+
+Go 移植一开始把同一段判定写进了 `handleIncoming`，也就是**每帧判一次**。
+后果：一批 256 个数据帧会发出 128 个纯 ACK，而 Rust 只发 1 个。
+回环实测（200MB 下载、抓包按方向分类，排除内核 RST）：
+
+| 指标 | 逐帧判定（旧） | 批末判定（新） | 变化 |
+|---|---|---|---|
+| 客户端→服务端 纯 ACK | 4167 | 2393 | −42.6% |
+| 服务端→客户端 纯 ACK | 1095 | 809 | −26.1% |
+| 数据帧 | 8001 | 8001 | 不变 |
+
+吞吐（同一份 10MB 响应、各 3 轮）：旧 111/108/106 ms，新 103/96/97 ms，
+平均 **108.3 → 98.7 ms（+9%）**，且两轮都没有回归。
+
+**怎么在 Go 里做出同样的批边界**：给 raw socket 加一个
+`recvAvailable()`（`MSG_TRUNC | MSG_DONTWAIT`，队列空返回 `ok=false`），
+收包协程改成「阻塞收 1 帧 → 非阻塞再取干（上限 `maxRecvBatch=256`）→
+本轮结束才调一次 `flushDelayedACK()`」。
+`MSG_DONTWAIT` 是**单次调用**语义，不改 fd 的阻塞属性，
+所以不影响「发送 fd 必须阻塞」那条约束（那约束说的是 sendFD）。
+
+顺带纠正一个常见误判：批大小**不会**总是跑到 256。回环上收方不是瓶颈，
+一轮平均只凑到 ~3.3 帧（8001 帧 → 2393 个 ACK），所以这次的收益是
+「少发 30~40% 的 ACK」，不是「少发 99%」。真要凑满 256，得让收方处理
+慢于到达速率——这正是 Rust 那条 `pkt_rx.len()` 统计想观测的状态。
+
+## 105. 「差异清单」里的 ACK 延迟一项，影响被高估了
+
+审计 Rust↔Go 差异时曾把 `ack_frequency_config(max_ack_delay=5ms)`
+列为头号嫌疑。核对 quic-go 源码后可以确定它**不是**吞吐差距的主因：
+
+- `internal/ackhandler/received_packet_tracker.go` 的 `shouldQueueACK`
+  里，`ackElicitingPacketsReceivedSinceLastAck >= packetsBeforeAck(2)`
+  会**立即**回 ACK。25ms 的 `maxAckDelay` 只对稀疏流量（握手尾包、
+  单个探测包）生效。
+- `protocol.MaxAckDelay = 25ms` 是常量，`quicgo.Config` **没有任何字段**
+  可以覆盖它；`AckFrequencyFrame` 只被 `frame_parser.go` 解析后丢弃，
+  既不发送也不生效。
+- 想对齐只能改 quic-go 源码 → 违反 `AGENTS.md` 约束 9（依赖版本必须与
+  sing-box 逐字节一致）。**结论：接受差异，不要在这上面花时间。**
+
+## 106. `ConnectionStats().PacketsLost` 在 BBR 下恒为 0（只在 cubic 里累加）
+
+排查「Go×Go 真链路只有 Rust 一半」时，日志里一直有个没人在意的细节：
+两端的 `lost` 和 `loss_pct` **永远打印 0**，哪怕链路实测丢包 30%。
+
+原因在依赖里：
+
+```
+$ grep -rn "connStats.PacketsLost" quic-go@v0.61.0-sing-box-mod.12/
+connection.go:868:   PacketsLost: c.connStats.PacketsLost.Load(),   // 只读
+internal/congestion/cubic_sender.go:200: c.connStats.PacketsLost.Add(1)  // 唯一写入
+```
+
+也就是说**只有用 Cubic 时这个计数器才会动**。用 BBR 时它恒为 0。
+`PacketsSent` 不同——它在 `internal/ackhandler/sent_packet_handler.go:331`
+累加，与拥塞控制器无关，是可靠的。
+
+这不是显示问题。`quic/quic/capped.go` 的窗口自适应循环靠它算丢包率：
+
+```go
+loss = (PacketsLost 增量) / (PacketsSent 增量)   // 恒为 0/非0 = 0
+case loss < lossLowMark:  next = cur * 1.20      // 每 2 秒 ×1.2
+```
+
+于是从 Rust 移植过来的「高丢包压窗口」机制**在 Go 里是死代码**，
+`win_cap` 只会从 8MB 往上顶（被 cfg 封住），从不收缩。
+
+修法：在 `cappedBbr` 里覆写 `OnCongestionEventEx`，从
+`[]congestion.LostPacketInfo` 自己数包数和字节数，然后**原样委托给内层**：
+
+```go
+func (c *cappedBbr) OnCongestionEventEx(priorInFlight, eventTime, acked, lost) {
+    if len(lost) > 0 { c.lostPackets.Add(len(lost)); ... }
+    c.CongestionControlEx.OnCongestionEventEx(...)   // 内层行为不变
+}
+```
+
+修完 `loss_pct` 立刻变成 30（Rust 是 33），`win_cap` 从 8MB 掉到 1.5MB，
+与 Rust 一致。
+
+**教训**：移植一个依赖的统计量之前，先 `grep` 它是谁写的。
+「字段存在」不等于「字段有值」——尤其当它只被某个非默认实现填充时。
+
+## 107. 本机复现跨境链路的方法：`tc netem` + 端口过滤
+
+真链路两端的吞吐数字**不可重复**（跨境链路波动极大、且两次测量往往相隔数天），
+所以要么并发测，要么本机复现。本机复现的关键是**只对合成流限速**：
+
+```bash
+# 错：整块 lo 加 netem，会把 curl↔SOCKS5、服务端↔目标这些本地 TCP 一起限速，
+#     10% 丢包下 curl 直接卡死，测的是本地 TCP 而不是隧道。
+tc qdisc add dev lo root netem delay 70ms loss 10%
+
+# 对：prio 分流，只把 8443 的包送进 netem 子队列
+tc qdisc add dev lo root handle 1: prio bands 3
+tc qdisc add dev lo parent 1:3 handle 30: netem delay 70ms loss 10% limit 5000
+tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip sport 8443 0xffff flowid 1:3
+tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dport 8443 0xffff flowid 1:3
+
+# 收尾一定要删，否则会一直挂着
+tc qdisc del dev lo root
+```
+
+已知偏差：`lo` 的 qdisc 是**双向共用**的，而真实链路两个方向各有队列。
+所以这个仿真对「发送方把队列打满」的场景偏悲观。看到某一端 `sent` 停住时，
+先用 `tc -s qdisc show dev lo` 确认 `backlog`（积压）而不是 `dropped`，
+再用 `/proc/<pid>/task/*/wchan` 看进程到底阻塞在哪（`__skb_wait_for_more_packets`
+= 正常等包，`sk_wait_data` 类 = 卡在发送）。
+
+本机实测（200MB 单流下载，Rust 用 `cargo build --release`）：
+
+| 条件 | Rust↔Rust | Go↔Go |
+|---|---|---|
+| 回环无延迟 | 44 MiB/s | 90 MiB/s |
+| +70ms 单向延迟（≈140ms RTT） | 13.1 MiB/s | 19.5 MiB/s |
+| +2% 均匀丢包 | 10.4 MB/s | 9.3 MB/s |
+| +5% 均匀丢包 | 8.0 MB/s | 7.6 MB/s |
+| +10% 均匀丢包 | 6.4 MB/s | 6.0 MB/s |
+| +突发丢包 gemodel(40%,87%)≈5% | 3.3 MB/s | **<0.12 MB/s（停滞）** |
+
+**结论**：均匀丢包下两者几乎重合（Go 慢 3~10%），
+**只有突发丢包才把 Go 打崩**。所以「Go×Go 只有 Rust 一半」这个结论
+不能用均匀丢包解释，必须用突发丢包（或别的因素）去查。
+
+## 108. 每次建连固定多花 ~514ms：`resolveNeighborMAC` 的 25×20ms 死等
+
+`flowtls.Dial` 里有一段恒定 514ms 的耗时（回环上实测 510~518ms，
+QUIC 握手本身只要 3ms、RTT 1.4ms）。用临时探针把两段分开计时可以确认：
+**这段延迟发生在 `newRawSocket()` 里，与握手无关**
+（把 `handshake` 设成 `none` 仍然是 514ms）。
+
+来源是 `resolveNeighborMAC`：
+
+```go
+if mac, ok := arpLookup(nextHop, ifname); ok { return mac, true }
+triggerARP(nextHop)
+for i := 0; i < 25; i++ {              // ← 25 × 20ms = 500ms
+    time.Sleep(20 * time.Millisecond)
+    if mac, ok := arpLookup(nextHop, ifname); ok { return mac, true }
+}
+```
+
+而 `arpLookup` 因为**刻意保留 Rust 的 `from_str_radix("0x2", 16)` 解析缺陷**
+（`/proc/net/arp` 的 Flags 列带 `0x` 前缀，解析必然失败）而**永远返回 false**，
+所以这 500ms 是纯粹的等待，之后照样回退到 IPPROTO_RAW。
+
+Rust 侧 `socket.rs:445` 是一模一样的 25×20ms，所以这是**忠实移植**，
+不是新引入的 bug；也正因为 Rust 也这样，「Go 慢」与它无关。
+但它确实是每次重连都要付的固定成本——如果要消除，
+需要同时决定「是否放弃与 Rust 的行为一致」，属于需要产品决策的改动，
+不要顺手改掉。
+
+另外注意：`IPPROTO_RAW` 第一次发送偶尔返回 `EPERM`（`sendmmsg: operation
+not permitted`），只出现 1 次、不影响建连，暂未定位，记录在案。
+
+## 109. 跨境链路吞吐必须**交替**测，隔几分钟的两次数据没有可比性
+
+这一条纠正了一个影响了两三天的错误前提。
+
+之前一直拿「Go×Go 6~7 MB/s，Rust↔Rust 15~16 MB/s」当基准，去追 2 倍的实现差距。
+真链路实测发现：**这条链路自己就在 5~15 MB/s 之间来回摆**。
+
+同一条连接、同一台机器上连续采样：
+
+```
+rtt=77ms   srtt=77ms   cwnd=2.39MB  sent=84261  lost=2213  loss_pct=2   win_cap=8MB
+（几分钟后）
+rtt=235ms  srtt=234ms  cwnd=3.27MB  sent=274025 lost=25992 loss_pct=0   win_cap=4.05MB→8MB
+```
+
+RTT 从 77ms 涨到 235ms（3 倍），累计丢包从 2.6% 涨到 9.5%。
+在这种链路上，先测 Go、过 5 分钟再测 Rust，得到的「差距」几乎全是链路漂移。
+
+**正确做法**：交替测，同一时间窗内轮流跑两边。
+
+```bash
+for r in 1 2 3; do
+  跑 Go   → 记录
+  跑 Rust → 记录
+done
+```
+
+交替实测（100MB 单流下载，脚本 `/tmp/ft-bench/ab-real.sh`）：
+
+| 轮次 | Go×Go | Rust↔Rust |
+|---|---|---|
+| 1 | 15.5 MB/s | 13.6 MB/s |
+| 2 | 5.0 MB/s | 14.5 MB/s |
+| 3 | 0（握手超时） | 14.7 MB/s |
+| 换新版客户端后 1 | 11.0 MB/s | 5.1 MB/s |
+| 换新版客户端后 2 | 12.3 MB/s | 5.2 MB/s |
+
+**互有胜负，没有稳定的 2 倍差距。**
+
+## 110. 抓包量丢包**突发结构**不需要两端对时钟
+
+真链路要回答的问题往往不是「丢了多少」，而是「丢得均匀还是成串」。
+伪造 TCP 在这里帮了大忙：每个数据包在线上就是一段连续的 `seq:end`。
+
+做法：
+
+```bash
+tcpdump -n -i ens3 -s 96 "host <服务端IP> and tcp port 8443" > cap.txt
+python3 gapstats.py cap.txt     # 把收到的区间按 seq 排序合并，区间之间的空洞=丢包
+```
+
+脚本 `/tmp/ft-bench/gapstats.py` 会输出空洞个数、丢失字节、以及
+**每个空洞折算成「连续丢了几个包」的分布**。
+
+实测结论（真链路，一次 100MB 下载）：
+
+```
+空洞(丢包事件): 6543
+突发长度分布：连续丢 1 包 = 6543 次（100%）
+单次丢包字节：中位 1365，最大 12732
+```
+
+→ **真链路是均匀的单包丢失，不是突发丢包。**
+这一条直接排除了「突发丢包导致 Go 崩塌」的外推可能
+（`tc netem loss gemodel` 造出来的突发丢包在真链路上并不存在）。
+
+注意：抓包本身会拖慢链路（实测 12 MB/s → 4.4 MB/s），
+所以**抓包那一轮的数字不能用来比较性能**，只用来分析结构。
+
+## 111. 比 Rust 多出来的「更严格」校验，往往是移植缺陷
+
+`isSYNACKFor` 在 Go 里是：
+
+```go
+p.Flags&TCPSYN != 0 && p.Flags&TCPACK != 0 && p.Ack == s.synISN+1
+```
+
+Rust `client.rs:767` 只有前两个条件。多出来的 `Ack` 校验看起来更严谨，
+实际只会制造一种故障：ACK 号对不上 → **有效的 SYN-ACK 被静默丢弃** →
+客户端等 1/2/4/8 秒退避后重传 SYN → 撞上 sing-box 的建连超时，
+日志表现为 `flowtls 握手失败: context deadline exceeded`。
+实测 7 次建连里出现 3 次，而且全都集中在链路较差的窗口。
+
+四元组已由 `matchPeer` 过滤（源 IP/端口全对得上），真正的鉴权是后续 AEAD，
+所以这个字段校验没有任何安全收益。
+
+**规律**：逐行移植时，凡是「比参考实现多出来的判断」都要能说出为什么。
+说不出来就是 bug——它只会拒绝本该接受的输入。
+
+## 113. Go 的 QUIC RTT 比 Rust 稳定地多约一个往返（2026-11-14 17:45）
+
+同一时刻两条隧道并行：1080 是 Go→Go（8443），1081 是 Rust→Rust（8445）。
+空闲时 Rust 两端都报 80~85ms，Go 服务端稳定报 220~221ms。
+应用层首字节 p50 是 252ms 对 113ms。差额约 140ms，接近一个往返，
+连续 3 分钟都这样，不是链路漂移。
+
+下载速度这次没有拉开（都在 4.4~6.9 MB/s）。所以「RTT 高」和「吞吐低」
+不是同一件事，不要用下载速度反过来证明 RTT 正常。
+
+抓包后把差额缩到了一个地方（2026-11-14 18:05，两端都是当天最新二进制）：
+
+| 方向 | 请求离开本机 → 对端 ACK 回来 |
+|---|---|
+| Rust 44321 → 8445 | **79ms** |
+| Go 44323 → 8443 | **216ms** |
+
+本机发出是立即的（两个包间隔 0.1ms）。多出来的约 137ms 全在
+「对端收到之后、ACK 离开之前」。首字节也一样：Go 223~228ms，Rust 约 85ms。
+
+试过给收包循环加 5ms 唤醒（服务端、客户端都加了）。假设是
+「quic-go 的 ACK 要等下一次 Recv 返回才写得出去」。部署后往返仍是
+216ms，**假设不成立，改动已撤回**。不要再从这个方向改：
+它会给每条连接多一个协程和一次拷贝，而 RTT 不变。
+
+quic-go 的 ACK 闹钟是 25ms（`protocol.MaxAckDelay`），也对不上 137ms。
+
+给 `Session.ReadFrom` 加 5ms 超时也试过（2026-11-14 18:55，两端都部署）。
+假设是 quic-go 堵在读取上，醒不过来就看不到到期的 ACK。
+部署后抓包仍是 221ms，假设不成立，改动已撤回。
+
+真正的原因在更外面（2026-11-14 19:05 两端对抓）：
+
+`flushDelayedACK` 只在 `Recv` 返回后调用。单个请求/响应之后没有下一个包，
+ACK 就一直攒着。服务端网卡上「请求到达 → ACK 发出」是 0.08ms，
+客户端网卡上看同一段却是 221ms：客户端把对端响应的 ACK 压到了下一次收包。
+QUIC 的 RTT 采样采的就是这个被推迟的 ACK。
+
+修法不是去叫醒 quic-go，而是让收包循环自己每 5ms 醒一次，
+没有新包也跑 `flushDelayedACK`。客户端 `recvLoop` 和服务端
+`Listener.recvLoop` 都要加，单加一边只修半个方向。
+修复后首字节 74–77ms，Rust 同时是 86–99ms。
+19:10 再跑了 90 秒：Go p50 77ms（337 次），Rust p50 98ms（188 次）。
+
+这一轮走过的错路，以后不要再试：
+
+1. 在 `cappedBbr` 自己加「一个 RTT 发满一窗」。ACK 和数据走同一条判断，
+   确认也被挡住。Rust 没有这层。
+2. 给 `Session.ReadFrom` 加 5ms 超时去叫醒 quic-go。部署后仍是 221ms，
+   还会每秒空转约 200 次。
+3. 每 5ms 新开一次 raw `Recv`。收包 fd 是共享的，两个 Recv 会抢包；
+   用 `SetReadDeadline` 也会覆盖 quic-go 自己的握手超时。
+   留下来的写法是：一个长期收包协程，主循环只在 channel 和 5ms 定时器上选择。
+
+## 112. 握手完成后不要再加自己的发送等待（2026-11-14 18:30）
+
+通道只握手一次。`awaitingSYNACK` 在收到 SYN-ACK 后就清掉，
+之后 `WriteTo` 直接封包，`txLoop` 凑到多少发多少，没有定时器。
+
+曾在 `cappedBbr` 上按「一个 RTT 发满一窗」自己挡过 `HasPacingBudget`。
+这会让 ACK 也跟着等。Rust 没有这层，已删除。
+删掉之后抓包仍是 221ms（Rust 79ms），所以它不是这 140ms 的原因，
+但也不该留着。
+
+抓包还能看出：对端的 **TCP ACK 是 221ms 才回来的纯 ACK**，
+不是随数据包一起回来。也就是说对端收到请求后没有立刻产生 QUIC 响应，
+而是等到下一次发送机会。这个时机在 quic-go 内部，不在 `WriteTo`。
+
+## 112-old. 钳窗口在 quic-go 里不等于钳速率（2026-11-14 17:04，结论已过时）
+
+Rust 的注释写「只钳 window 就够」，因为 quinn 的 pacing 是
+`capacity = window / rtt`，读的就是被钳过的 `window()`。
+
+quic-go 拆成了两条独立路径：
+
+- `GetCongestionWindow` / `CanSend`：在途字节上限
+- `TimeUntilSend` / `HasPacingBudget`：pacer 的令牌桶，带宽来自
+  BBR 自己的估计，**完全不读窗口**
+
+只覆写前一条时，估计被抬到数 Gbps 后，一个 RTT 内就把整窗突发打出去，
+随后干等 ACK。连接不掉、进程也在，吞吐接近 0。这和「窗口上限没生效」
+看起来一样，但日志里 `win_cap` 是正常的。
+
+修法是在 `cappedBbr` 上再覆写发送路径，按 `窗口上限 / MinRTT`
+限制**一个 RTT 内的突发量**（不是把每个包均匀拉开——均匀拉开会把
+8MB 窗口压成每秒几千包）。内层估计正常时，取两者更晚的那个，行为不变。
+
+**不要**改成「每字节间隔 = RTT/窗口」：那个公式把突发也拆掉了，
+吞吐会塌一个数量级。Rust 允许的是一个 RTT 发满一窗。
+
+上面这条修法本身已经撤回，见 112。留在这里只说明 quic-go 的 pacer
+确实不读窗口；不要再按这条去给 `cappedBbr` 加 `TimeUntilSend`。
+
+## 114. 测速客户端主动断流，日志会刷一片 `error code 0`（2026-11-14 19:16）
+
+用户自己跑测速时，客户端和服务端会同时出现：
+
+```
+connection download closed: stream N canceled by local with error code 0
+connection download closed: stream N canceled by remote with error code 0
+```
+
+客户端写 `by local`，服务端写 `by remote`，是同一件事的两面。
+测速程序拿够样本就关掉自己的下载，quic-go 用错误码 0
+（`NO_ERROR`）取消流。sing-box 的 `IsClosedOrCanceled` 不认这种
+取消，所以打成 ERROR，不是握手失败、也不是丢包。
+
+判断依据（2026-11-14 19:12–19:16 这一次）：
+
+- 目标全是测速节点（`:8080` 下载、`:443`），持续时间聚在 15s 和 60s。
+- 同一时段没有 `panic`、握手失败、收包截断、超时。
+- 19:16 之后密度回落，隧道还在。
+
+只有出现 `by remote` 但客户端没有对应的 `by local`、或者错误码不是 0、
+或者同时有握手失败，才值得再查。

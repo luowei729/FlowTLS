@@ -39,16 +39,21 @@
       // 只影响伪 ClientHello 的外观，不参与任何校验
       "sni": "your.domain",
 
-      // 标准三次握手默认开启。**不要关**：
-      // 严格 NAT / 状态防火墙只放行握手完成的流量，关掉会直接被丢。
-      // 仅在客户端有公网 IP 且链路无状态检查时可设为 true 省一个 RTT。
-      "disable_handshake": false,
+      // 标准三次握手，取值只有两个（与 Rust 完全一致）：
+      //   symbolic — 默认。SYN → SYN-ACK → ACK，之后才发数据
+      //   none     — 跳过握手直接发数据
+      //
+      // **不要设成 none**：严格 NAT / 状态防火墙只放行握手完成的流量，
+      // 关掉会直接被丢。仅在客户端有公网 IP 且链路无状态检查时可省一个 RTT。
+      "handshake": "symbolic",
 
-      // 客户端规则落地方式，取值同服务端。
+      // 客户端规则落地方式，取值同服务端：auto / none。
+      //
       // 客户端规则的作用：屏蔽内核对伪连接回的 RST。
       // Session 走 raw socket，内核里没有对应 socket，收到 SYN-ACK 就回 RST，
       // 而 RST 会让中间设备立即拆掉 NAT 映射。
-      "iptables_mode": "print",
+      // 共 2 条：OUTPUT 拦 RST、INPUT 丢回程。
+      "iptables_mode": "auto",
 
       // QUIC 拥塞窗口上限（字节），默认 8MB（可省略）。
       //

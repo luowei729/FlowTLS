@@ -1,153 +1,303 @@
-# PROJECT_PLAN
+# PROJECT_PLAN — Go v3「原样移植 Rust」
 
-## 2026-11-14 当前阶段：Go v2「精简移植」
+## 0. 这次为什么重来
 
-### 为什么推倒重来（用户决策）
+Go v1/v2 的失败不是个别 bug，而是**架构偏离**：
 
-Go v1 功能全通，但**代码结构与 Rust 严重偏离**，导致排障成本不断上升：
-
-| 维度 | Rust v1（冻结基线） | Go v1（归档） |
+| 维度 | Rust（唯一基准） | Go v1/v2（已删除） |
 |---|---|---|
-| 传输层 | `faketcp/{packet,codec,socket}` 三层，职责单一 | 同左，但 `session.go` 1229 行、`socket_linux.go` 971 行 |
-| 连接模型 | `client.rs` / `server.rs` **一个事件循环 + 显式状态** | `quic/client.go` 897 + `quic/server.go` 289 + 适配层 1267 |
-| 抽象层数 | 0 层包装（`drain_transmits` 直接发） | `udpConn`/`udpSession`/`inboundPacketConn`/`streamConn`/`suspectConn`/`dialing`/`attemptCtx`/`invalidate` |
-| 故障定位 | 看一处 event loop 的日志 | 需要跨 4 个包、6 层包装反推 |
+| 发送 | 事件循环内 `poll_transmit` → **同步 `sendmmsg`** | `WriteTo` 只入队，独立协程批发送 |
+| 结果 | RTT = 链路 RTT | 本地排队被 quic-go 计入 RTT（213ms vs 73ms） |
+| 存活判定 | 无（只靠 QUIC idle timeout） | 自造 `lastSeenAt` + `Probe`，被内核 RST 欺骗 |
+| 通道获取 | `ProxyClient.tx` 单一通道 | `getClient`/`dialing`/`attemptCtx`/`invalidate`/`suspectConn` 五层 |
+| 拥塞控制 | BBR + 窗口钳制 | 额外加 Brutal（Rust 没有） |
+| 分流 | IP ID 高字节 + `wscale=9` | 改成 `wscale=12` + conntrack 规则 + BPF |
 
-结论：**继续在 v1 上打补丁，每修一个 bug 都会新增一层抽象**
-（`suspectConn` 就是为了绕开「连接已死但未检测到」而加的，结果它自己又引入
-「本端 Close 引发的读错误被误判 → 每个请求重建连接」的新 bug）。因此采纳用户建议：
+结论：**只做翻译，不做设计**。凡 Rust 没有的机制一律不引入。
 
-> 重新制定开发计划，Go 代码归档，精简高效地移植 Rust 代码，
-> 而不是越写越复杂、排查问题越来越难。
+## 1. 硬规则（违反即回退）
 
-### 归档（已完成）
+1. **只用 `legacy-rust` 分支的 `src/` 作为唯一依据**。设计文档以代码为准，
+   不以历史 DEVTIPS/CHANGELOG 里的自造结论为准。
+2. **不自造机制**。不做 Probe、不做 suspectConn、不做发送队列、不做 Brutal、
+   不做 BPF 过滤器、不做 conntrack 规则、不做额外重试层。
+3. **wire format 逐字节对齐**，用 `legacy-rust` 的冻结向量做门禁。
+4. **参数逐项照抄**：`wscale=9`、`initial_mtu=1332`、窗口 16MB/4MB、
+   `keep_alive=10s`、`idle=30s`、`max_bidi=1024`、队列/水位常数。
+5. **每个 Go 函数必须能指出它对应 Rust 的哪个函数**。对不上就说明我在发明。
 
-| 名称 | 内容 |
-|---|---|
-| tag `go-v1-archive-20261114` | 归档点：发送队列修复后、重构前 |
-| 分支 `legacy-go` | 指向同一 commit，长期保留 |
-| `legacy-rust` 分支 | Rust 权威实现（wire format 与行为基准） |
-| `docs/PROJECT_PLAN-v1.md` | v1 计划原文 |
+## 2. Rust → Go 文件映射
 
-回滚方式：`git checkout legacy-go`。
-
-### 本轮已定位并修复的三个真根因（v1 上完成，v2 必须保留）
-
-三个都是「Go 移植时丢了 Rust 的关键判断或语义」，不是调参问题：
-
-| # | 缺陷 | 证据 | 修法 |
-|---|---|---|---|
-| 1 | **服务端分流丢了 IP ID 判断**，任何 SYN 都回 SYN-ACK | 双端抓包：同一四元组收到两个不同 ISN 的 SYN-ACK（内核 + flowtls）；客户端取到内核那个后，后续 ack 全错 | 按 wscale 分流（TCP 选项不被 NAT 改写），见下 |
-| 2 | **IP ID 分流本身不可靠** | 掩码匹配 `& 0x1E00 == 0x1E00` 有 1/16 误命中率；部分链路改写 IP ID | 主特征改为 **wscale=12**（`U32WScaleExpr`，偏移 56 = `NOP+kind3+len3+12`） |
-| 3 | **发送队列过深且满了丢弃**，本地排队被计入 RTT | quic-go 在打包时记录发送时刻；队列 4096 深时实测 RTT 213ms~1.02s，而 ICMP 73ms | 队列降到 32，满时阻塞生产者；纯 ACK 走独立队列/协程；`sendBatch` 对剩余报文重试 |
-
-**修复后实测（新加坡 ARM，Go↔Go）**
-
-| 指标 | 修复前 | 修复后 |
+| Rust | Go | 职责 |
 |---|---|---|
-| 伪 TCP 握手（抓包） | 214ms | **80.8ms** |
-| QUIC min_rtt（客户端） | 213ms | **76.1ms** |
-| QUIC min_rtt（服务端） | 213ms | **72.4~76.1ms** |
-| 单流 100MB | 5 MB/s | **15.2~23.0 MB/s** |
-| 4 并发 10MB 合计 | — | **12.3 MB/s**（Rust 同场景 5.8） |
-| 普通 curl 访问 8443 | 收到 2 个 SYN-ACK | 只收到内核 1 个 ✅ |
+| `faketcp/packet.rs` | `packet.go` | IP/TCP 拼装解析、`syn_options`、`TcpClock`、`advertised_window`、`seq_len`、IP ID |
+| `faketcp/codec.rs`（1~300 行） | `codec.go` | `Obfs`（HKDF/AEAD/nonce 计数器/首包头）、`parse_records`、`parse_first_header` |
+| `faketcp/codec.rs`（300 行后） | `handshake.go` | `build_client_hello`、`build_server_hello` |
+| `faketcp/socket.rs` | `socket_linux.go` + `socket_stub.go` | `send`/`send_batch`/`recv`、AF_PACKET、ARP、默认路由 |
+| `rules.rs` | `rules.go` + `rules_linux.go`/`rules_stub.go` | iptables 规则构造与落地 |
+| `config.rs`（类型部分） | `config.go` | `ClientConfig`/`ServerConfig` |
+| `proxy/mod.rs`（`encode_target`/`decode_target`） | `addr.go` | 地址帧 |
+| `proxy/udp.rs` | `udp.go` | DATAGRAM 帧 |
+| `client.rs::SendCtx` | `session.go` | **net.PacketConn 适配层**（quic-go 接口边界，见 §4） |
+| `client.rs::run` + `run_session` | `client.go` | 握手、重连、stream/udp |
+| `server.rs::run` + `ServerConn` + `handle_packet` | `server.go` | 四元组分流、会话、流/UDP |
+| `quic/config.rs` | `quic/config.go` | quic-go 配置 |
+| `quic/capped.rs` | `quic/capped.go` | BBR + 窗口钳制 |
+| `proxy/{socks5,http,udp}.rs` | **不移植** | 由 sing-box 的 mixed/socks 入口提供 |
+| `check.rs` | **不移植** | 由 `sing-box check` + `New*` 校验替代 |
+| — | `sing-box/protocol/flowtls/{inbound,outbound,masquerade}.go` | 纯接线，无业务逻辑 |
 
-五条根因（缺一不可，逐条验证过）：
+## 3. 唯一的架构差异：quinn-proto → quic-go
 
-| # | 缺陷 | 文件 |
+这是**库边界**，不是设计选择。必须把影响压到最小：
+
+| Rust（`quinn_proto`） | Go（`quic-go`） | 等价性 |
 |---|---|---|
-| 1 | 服务端丢了伪 SYN 判断 | `listener.go` |
-| 2 | IP ID 分流有 1/16 误命中且会被改写 → 改用 wscale=12 | `packet.go`/`rules.go` |
-| 3 | 发送队列 4096 深且满即丢 → 本地排队被计入 RTT | `session.go` |
-| 4 | 服务端逐包 `recvfrom` → ACK 迟滞 150ms | `listener.go` |
-| 5 | 服务端 `IPPROTO_RAW` 发送 → 1 核 ARM 第一瓶颈 | `socket_linux.go` |
+| 手动 `poll_transmit()` 取包 | quic-go 内部调 `WriteTo` | **`WriteTo` 内同步 `sendto` 即等价**（无队列、无额外协程） |
+| 手动 `handle_timeout()` | quic-go 用 `SetReadDeadline` 驱动 | `ReadFrom` 必须真实实现 deadline |
+| 手动 `conn.handle(datagram)` | quic-go 内部 reader 调 `ReadFrom` | `ReadFrom` 返回已解密明文即等价 |
+| `Event::Stream(Opened/Readable)` | `conn.AcceptStream(ctx)` + 每流 goroutine | 结构相同（Rust 也是每流一个 task） |
+| `datagrams().send/recv` | `conn.SendDatagram`/`ReceiveDatagram` | 一致 |
+| `transport_config.ack_frequency(5ms)` | **quic-go 无此配置** | 不可对齐，如实记录 |
+| `congestion_controller_factory` | `conn.SetCongestionControl(cc)` | 一致（只装一次，不重装） |
 
-### v2 目标结构（与 Rust 一一对应）
+**发送路径的唯一结论**：`Session.WriteTo` = `seal` → `appendSegment` → `raw.Send()`，
+全程同步，不排任何队列。这是 v1/v2 最致命的偏离点，v3 直接照 Rust。
 
-原则：**一个概念只出现在一个文件里，不做「为了通用」的包装。**
+批量 `sendmmsg` 只用于**我们自己**一次要发多个包的场合（握手：ACK+ClientHello；
+服务端：ServerHello 三段）。quic-go 路径就是单包 `sendto`——与 Rust 的
+`drain_transmits(n=1)` 等价。
+
+## 4. `session.go` 允许存在什么
+
+quic-go 要求 `net.PacketConn`，所以必须有一层适配。**只允许**：
+
+- `ReadFrom`：从 `rx chan []byte`（深度 **8192**，同 Rust `mpsc::channel(8192)`）取；
+  `select` 三分支：数据 / `readDeadline` / `closed`。
+- `WriteTo`：持锁 `seal` + `appendSegment` + `raw.Send()`，**同步返回**。
+- `LocalAddr`/`RemoteAddr`/`Close`/`SetReadDeadline`/`SetDeadline`。
+- 统计字段（`pktsSent`/`pktsRecv`）供日志。
+
+**不允许**：发送队列、flush 协程、ctrl 队列、`TxStats` 以外的新概念。
+
+收包侧：一个 goroutine 阻塞 `raw.Recv()`（64KB 缓冲，同 Rust `vec![0u8; 65536]`），
+按端口过滤 → 解析记录 → AEAD 解密 → `rx <- plain`。对应 Rust 的 recv 线程
+（`client.rs:488-518`）。
+
+## 5. 参数与常量对照表（逐项照抄）
 
 ```
-flowtls/                       传输层（与 v1 相同，仅收窄 API）
-  packet.go / codec.go         保持不变（wire format 冻结）
-  socket_linux.go              sendmmsg/recvmmsg；只暴露 Send/SendBatch
-  session.go                   ← 精简目标：1229 → ~700 行
-  listener.go                  四元组分流；按 wscale 判伪 SYN
-
-flowtls/quic/                  QUIC 适配（对外只暴露 Client / Server）
-  client.go                   ← 精简目标：897 → ~450 行
-  server.go                   289 行，基本不变
-  capped_bbr.go               BBR + 窗口上限（逻辑与 Rust capped.rs 对齐）
-
-sing-box/protocol/flowtls/     只有两个文件（无第三个抽象层）
-  outbound.go                 ← 精简目标：537 → ~260 行
-  inbound.go                  ← 精简目标：730 → ~360 行
-  masquerade.go               不变
+WSCALE                 = 9               packet.rs
+IPID_MARK              = 0xF100          packet.rs
+TS_OPT_LEN             = 12              packet.rs
+SYN 选项               MSS1460+SACK+TS+NOP+wscale9（20 字节）
+advertised_window      = clamp((16MB-unread)>>9, 1, 65535)
+initial_mtu            = 1332            quic/config.rs
+min_mtu                = 1332
+mtu_discovery          = off
+receive_window         = 16MB
+stream_receive_window  = 4MB
+send_window            = clamp(max_cwnd*2, 2MB, 16MB)
+keep_alive             = 10s
+max_idle               = 30s
+max_concurrent_bidi    = 1024
+datagram recv/send buf = 1MB
+ack 频率               = 5ms（quic-go 不支持，记录差异）
+SYN 重传               1/2/4/8s，总超时 15s        client.rs
+服务端 pending 复用    10 秒 + ISN 必须相同        server.rs
+recv 通道深度          8192                        client.rs
+PacketBatch::MAX       32                          socket.rs
+pending_high_water     = clamp(max_cwnd/4, 512KB, 1MB)   server.rs
+客户端 HIGH_WATER      = 1MB                       client.rs
+自适应窗口             2s 周期；>20% ×0.9，<5% ×1.2；
+                      safe_cap = 1024*1308/loss*0.7；
+                      clamp(1.5MB, 8MB).min(max_cwnd)
 ```
 
-### 具体精简清单
+## 6. 实施阶段与门禁
 
-**outbound.go（目标 -50%）**
+### P0 骨架
+- `flowtls/go.mod`：`sagernet/sing`、`sagernet/quic-go` pseudoversion 与
+  `sing-box/go.mod` **逐字节一致**；`GOTOOLCHAIN=local`。
+- 从 `legacy-rust` 恢复 `flowtls/testdata/`（冻结向量）。
+- **门禁**：`go build ./...`、`GOOS=darwin/windows` 交叉编译。
 
-| 删除 | 理由 | 替代 |
+### P1 报文层
+- `packet.go` ← `packet.rs`（含 `build_packet_into` 的追加语义）。
+- `codec.go` / `handshake.go` ← `codec.rs`。
+- `rules.go` ← `rules.rs`。
+- **门禁**：`TestSynOptionsLayout`（20 字节逐字节）、`TestU32ExprHasHexPrefix`、
+  `interop_check.sh`（Rust 向量 → Go 解密 → Go 向量 → Rust 解密）。
+
+### P2 raw socket
+- `socket_linux.go`：`send` / `send_batch`（sendmmsg）/ `recv`、
+  `sockaddr_ll` **手写 20 字节**布局、AF_PACKET 阻塞发送、IPPROTO_RAW 回退、
+  默认路由 + ARP。
+- **门禁**：`TestSendmmsgAcceptsKernelLayout`（绕过退化路径直接断言内核接受）、
+  `TestRecvmmsgActuallyReceives`（真收到包）。
+
+### P3 客户端
+- `session.go`（§4 的最小适配）+ `client.go`（握手、重连、stream/udp）。
+- `quic/config.go`、`quic/capped.go`。
+- 联调：`cmd/ftdial`。
+- **门禁**：Go 客户端 ↔ **Rust 服务端** 单流 40MB 与 Rust 基线同量级（±10%）。
+
+### P4 服务端
+- `server.go`：四元组分流、SYN-ACK（pending 复用）、每客户端 Transport、
+  流处理（`pending` / `flush_pending` / `reset_stream`）、UDP 出站。
+- 联调：`cmd/ftserver`。
+- **门禁**：**Rust 客户端** ↔ Go 服务端与 Go↔Rust 双向都通；
+  4 流 × 10MB 无「背压超过 30 秒」；UDP 6 项 PASS。
+
+### P5 sing-box 接线
+- `inbound.go` / `outbound.go` / `masquerade.go`：只做 protocol ↔ sing-box 翻译。
+- outbound 的连接获取：**单函数** `channel(ctx)`（Rust `ProxyClient` 单通道的等价物），
+  不含 Probe / suspectConn。
+- **门禁**：`sing-box check`（不用 root）、`make verify`、真链路 HTTP/HTTPS/UDP。
+
+### P6 横向验证
+- `docs/e2e_matrix.sh` 全绿；`bash docs/bench.sh` 延迟分层（纯隧道 = 1 RTT）。
+- 连跑 30 分钟，采样 `/proc/net/packet` 确认 raw socket 数恒为 1（无泄漏）。
+- **门禁**：`min_rtt` ≈ ICMP RTT；单流 100MB ≥ Rust 同刻结果。
+
+## 7. 必须保留的正确性修正（不是设计，是语言/内核接口硬约束）
+
+已实测确认，属于移植的一部分：
+
+| 项 | 原因 | 不做的后果 |
 |---|---|---|
-| `suspectConn` | 它解决「连接已死未检测到」，但同时引入「本端 Close 引发的读错误被误判 → 每请求重建连接」 | 统一的 `channelAlive()`：只在 `DialConn` 失败或 `Probe` 失败时失效 |
-| `dialing chan struct{}` + `attemptCtx` | 三层重试（getClient / attemptCtx / DialContext 各一层）叠加 | 单层：`channel(ctx)` 内部保证「并发建连只建一次」 |
-| `invalidate` 的「只失效指定 client」 | 是为修 `suspectConn` 造的 bug 而存在 | 连接失效只有 `channel` 一个入口 |
+| `sockaddr_ll` 手写 20 字节、family 在首位 | `syscall.SockaddrLinklayer` 布局与内核不符（48 字节、Protocol 在首） | sendmmsg 全静默失败 |
+| AF_PACKET 发送 fd **不加 O_NONBLOCK** | Rust 也没加；非阻塞 + EAGAIN 静默丢弃会让握手包随机丢失 | 握手 851ms（链路 73ms） |
+| 发送 socket 创建时 `protocol=0` | 传 `ETH_P_IP` 会让发送 fd 同时接收整机 IPv4 包，队列涨到 32MB 无人读 | RTT 随运行时间恶化 |
+| recv 缓冲 ≥ 64KB + 检测 `MSG_TRUNC` | 网卡 GRO 聚合包可超 64KB，不足会静默截断（QUIC `lost=0`） | 握手慢、RTT 虚高 |
+| `rawSocket` 必须有归属方并在 `Close` 关 fd | Rust 用 `Drop`；Go 无析构，漏关会累积泄漏 | 重连 N 次后 RTT 线性恶化 |
+| `sendmmsg`/`recvmmsg` 对 `EINTR`/`ERESTARTSYS(512)` 重试 | Go 异步抢占发 SIGURG 会打断阻塞 syscall | 偶发丢一批包 |
 
-**inbound.go（目标 -50%）**
+**明确不做**：BPF 过滤器（本机无法验证，曾导致隧道不通）、conntrack 规则、
+`wscale=12`、Brutal、Probe、发送队列。
 
-| 删除 | 理由 | 替代 |
-|---|---|---|
-| `inboundPacketConn` 每会话 channel + 协程 | 会话多时 goroutine 爆炸 | 单分发协程 + 每会话 `pipe`（对齐 hy2 `service_packet.go`） |
-| `serveConn` 的双 `wg` 嵌套 | 两层 WaitGroup 只为了等 streams/datagrams 结束 | `conn.Context()` 已能判定结束 |
+## 8. 如何自证「没有夹带私货」
 
-**session.go**
+每个阶段结束时跑：
 
-| 删除 | 理由 |
-|---|---|
-| `txDropped` 的「队列满丢弃」路径 | 改为阻塞后不再需要（保留计数仅用于关闭时） |
-| `sendFIN` 的同步发送 | 与 `Close` 顺序耦合，改为入队 + `txStop` 前 flush |
+```bash
+# Go 导出符号
+grep -hoE '^func (\([^)]*\) )?[A-Z][A-Za-z0-9]*' flowtls/*.go | sed 's/.*[ )]//' | sort -u
+# Rust 函数清单
+git show legacy-rust:src/client.rs | grep -oE '^(pub )?(async )?fn [a-z_0-9]+' | sort -u
+# 没有 Rust 对应物的符号 = 私货，必须能解释成「Go 接口边界」
+```
 
-### 验收门禁（每步都要过）
-
-1. `cd flowtls && go test -race ./...`
-2. `make build` + `make verify`（版本号带 rev、tags 带 with_flowtls）
-3. `./dist/... check -c client.json`（不需要 root，AGENTS.md 硬要求）
-4. `bash docs/interop_check.sh`（wire format 未漂移）
-5. 真链路：伪 TCP 握手 ≤ 100ms、`min_rtt` ≤ 100ms、10MB 下载 ≥ 10MB/s（≥5 轮报区间）
-6. 普通 `curl http://server:8443/` 只收到 1 个 SYN-ACK（分流正确）
-7. `GOOS=darwin/windows go build ./...` 能过（交叉编译）
-
-### 里程碑
+## 9. 里程碑
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| A | 归档 Go v1（tag + 分支 + 计划原文） | ✅ |
-| B | 五个真根因修复（分流 / wscale / 队列 / recvmmsg / AF_PACKET） | ✅ |
-| C | 精简 `outbound.go`（删 suspectConn 四件套，537→406） | ✅ |
-| D | 精简 `inbound.go` | 已评估：与 hy2 同构的最小结构，不再拆分 |
-| E | 精简 `session.go` / `quic/client.go`（收窄 API） | 待办（不影响性能） |
-| F | 文档收敛：AGENTS / DESIGN / DEVTIPS 与代码一致 | ✅ |
+| P0 | 骨架 + go.mod + 冻结向量 | **完成** |
+| P1 | packet / codec / handshake / rules | **完成**（冻结向量 PASS） |
+| P2 | raw socket | **完成**（sendmmsg 内核布局单测 PASS） |
+| P3 | session + client + quic | **完成**（本机回环 45 MB/s） |
+| P4 | server | **完成**（4 格矩阵含 UDP 全通） |
+| P5 | sing-box 接线 | **完成**（双端 `check` 零 root 通过） |
+| P6 | 横向验证 | **部分完成**，见下 |
 
-**D 项的评估结论**：`inbound.go` 的 UDP 部分（`inboundPacketConn` +
-`canceler.NewPacketConn` + `readDeadline`）是 hysteria2 `service_packet.go`
-的同构实现，属于「UDP 会话生命周期」这一个概念所必需的最小结构；
-再拆只会增加层数。真正的复杂度来自注释（解释为什么），而注释是资产。
+### P6 剩余项（2026-11-14）
 
-E 项是纯代码整理（`Session` 的 `TxStats`/`CtrlStats` 可以合并为一个
-`TransportStats`），不影响正确性，留到有实际需求时再做。
+| 项目 | 结果 |
+|---|---|
+| 4 格互通矩阵（Go/Rust 双向 × TCP/UDP） | **10 / 10 PASS** |
+| 冻结向量门禁 / 单测 `-race` / 双端 `check` | PASS |
+| 延迟分层：ICMP 73.7ms、纯隧道 p50 75ms、HTTPS p50 160ms | **1 RTT，无额外开销** |
+| 同源端口连续重启 2 次 | PASS（修复前必挂） |
+| UDP 6 项 / 主动探测只回 1 个 SYN-ACK / 真证书 TLS 1.3 | PASS |
+| 30 分钟稳定性 + `/proc/net/packet` 泄漏复查 | **待做** |
+| 真链路吞吐追平 Rust | **已达标**（19:10 同窗口）：下载 Go 8.5 / Rust 6.7 MB/s，上传两边约 5.8 MB/s |
+| 首字节追平链路 RTT | **已达标**：Go p50 77ms，Rust 同窗口 p50 98ms（链路约 73ms） |
 
----
+下面「212ms」那条线索已经结案，保留是为了说明它怎么来的，不是现状。
+原因见 `DEVTIPS.md` 113：延迟确认只在下一个包到达时才发，QUIC 把这段等待采进了 RTT。
 
-## 历史（Go v1，已归档）
+### P6 差异审计结论（2026-11-14 15:30 更新）
 
-保留原始里程碑供追溯，详见 `docs/PROJECT_PLAN-v1.md`、`DEVTIPS.md`、`CHANGELOG.md`。
+逐函数对完 Rust 冻结版后，剩余差异只剩 5 项，逐项处置如下：
 
-| 阶段 | 内容 | 状态 |
+| # | 差异 | Rust | Go | 处置 |
+|---|---|---|---|---|
+| A | 收包批量 256 | 事件循环凑批 | 逐帧 | **已修**（`recvAvailable` + `drainAvailable`） |
+| H | 纯 ACK 判定粒度 | 批末判一次 | 逐帧判 | **已修**（`flushDelayedACK`），纯 ACK −26~43% |
+| D | ACK 延迟 | 5ms（ACK Frequency） | 25ms（常量） | **受依赖约束**：`quicgo.Config` 无字段可覆盖；且每 2 包立即回 ACK，实际影响仅限稀疏流量 |
+| C | BBR 实现 | quinn 原生（`DRAIN_TO_TARGET=true`） | sing-quic `ProfileStandard` | **受依赖约束**：`Profile` 字段未导出，`ProfileConservative` 会同时改坏三个增益参数 |
+| E/F | send_window / 初始窗口 | `max_cwnd×2` / 64KB | 无旋钮 / ~42.6KB | **受依赖约束**：`quicgo.Config` 与 `sing-quic` 均无入口 |
+
+结论：A/H 已对齐；C/D/E/F 在「依赖版本必须与 sing-box 逐字节一致」
+（`AGENTS.md` 约束 9）下无法对齐，除非改 quic-go / sing-quic 源码。
+
+### 差异 I：丢包率统计失效（2026-11-14 16:15 修复）
+
+**这是移植缺陷，不是库边界差异。** quic-go 的 `ConnectionStats().PacketsLost`
+只在 `internal/congestion/cubic_sender.go` 里累加，**BBR 下恒为 0**。
+而窗口自适应循环正是用它算丢包率 → 丢包率恒为 0 → 上限每 2 秒 ×1.2
+只增不减，「高丢包压窗口」在 Go 里从未生效。
+
+已修：`cappedBbr` 覆写 `OnCongestionEventEx` 自建计数。修复后
+`loss_pct` 30（Rust 33）、`win_cap` 8MB → 1.5MB，与 Rust 对齐。
+
+### 本机链路仿真的实测结论（重要）
+
+用 `tc netem` + 端口过滤只对 8443 合成流限速（方法见 `DEVTIPS.md` 107），
+200MB 单流下载：
+
+| 条件 | Rust↔Rust | Go↔Go |
 |---|---|---|
-| P0 | subtree + 补丁 + stub 注册 + Makefile | ✅ |
-| P1 | `flowtls/` 主包：packet/codec/socket/session | ✅ |
-| P2 | `quic/` 子包 + Go 客户端打通 Rust 服务端 | ✅ |
-| P3 | UDP（QUIC DATAGRAM）+ 多会话路由 | ✅ |
-| P4 | `listener.go` + `protocol/flowtls/` 适配层 | ✅ |
-| P5 | 打包、CI、配置迁移、冻结 Rust | ✅（Rust 已冻结） |
+| 回环无延迟 | 44 MiB/s | 90 MiB/s |
+| +70ms 单向延迟 | 13.1 MiB/s | 19.5 MiB/s |
+| +2% / 5% / 10% 均匀丢包 | 10.4 / 8.0 / 6.4 MB/s | 9.3 / 7.6 / 6.0 MB/s |
+| +突发丢包 gemodel≈5% | 3.3 MB/s | **<0.12 MB/s（停滞）** |
+
+据此修正一个此前的判断：**「Go×Go 只有 Rust 一半」不能用均匀丢包解释**
+——均匀丢包下两者差 3~10% 而已；Go 只在**突发丢包**下崩塌。
+崩塌点已定位到内层 sing-quic BBR 的带宽估计（cwnd 在 8KB~25KB 震荡，
+Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效。
+该行为在依赖内部，改它违反约束 9 → 记为已知限制。
+
+**下一步（若继续）**：在真链路两端同时抓包、同一时钟对齐，
+直接量「QUIC 包发出 → ACK 回来」与本地发送时刻的差，
+确认真链路是否也是突发丢包模式；否则本机结论无法直接外推。
+
+### 真链路验证结论（2026-11-14 16:35）—— 推翻「恒定慢 2 倍」
+
+上一节的「下一步」已经做了，结论需要修正：
+
+1. **真链路不是突发丢包**。用伪造 TCP 的 `seq:end` 空洞统计（不需要两端对时钟）：
+   6543 个空洞 **100% 是单包丢失**。所以「gemodel 突发丢包」那组本机数据**不能外推**。
+2. **真链路自身在 5~15 MB/s 之间漂移**：RTT 77ms → 235ms、累计丢包 2.6% → 9.5%。
+   隔几分钟的两次测量没有可比性。
+3. **交替 A/B（同一时间窗）**：
+
+   | 轮次 | Go×Go | Rust↔Rust |
+   |---|---|---|
+   | 修 `isSYNACKFor` 前 | 15.5 / 5.0 / 0（握手超时） | 13.6 / 14.5 / 14.7 |
+   | 修后 | 11.0 / 12.3 | 5.1 / 5.2 |
+
+   **没有稳定的 2 倍差距**，两个实现互有胜负。历史上的「6~7 vs 15~16」
+   基本可判定为非同时刻测量的产物。
+
+4. 唯一确定属于我们代码的偏差已修：`isSYNACKFor` 比 Rust 多一个
+   `p.Ack == synISN+1`，会把有效 SYN-ACK 静默丢弃（实测 7 次建连 3 次超时）。
+   修复后握手失败 0 次。
+
+17:04 曾把「窗口只钳在途字节、不钳 pacing」当成卡死原因，在 `cappedBbr` 加了
+「一个最小 RTT 内最多突发一窗」。这层会把 ACK 也挡住，且部署后抓包仍是 221ms，
+18:30 已删除。后来证实的原因是伪 TCP 延迟确认的发送时机，见下一节。
+
+### 真链路结论（2026-11-14 19:10）—— RTT 已经回到链路本身
+
+同一分钟、1080 只走 Go→Go、1081 只走 Rust→Rust，三段各 90 秒、互不抢带宽：
+
+| 项 | Go | Rust |
+|---|---|---|
+| 首字节 p50 / 失败 | 77ms / 0（337 次） | 98ms / 0（188 次） |
+| 下载 100MB p50 | 8.5 MB/s（7 次全完成） | 6.7 MB/s（6 次全完成） |
+| 上传 20MB p50 | 5.8 MB/s（24 次全完成） | 5.9 MB/s（26 次全完成） |
+
+不再把「Go 稳定慢一倍」当成未解决项。30 分钟长稳定性仍未单独跑过，
+上面这三段各 90 秒不能替代它。

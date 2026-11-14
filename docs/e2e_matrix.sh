@@ -106,14 +106,9 @@ fi
 # ---------- 构建 ----------
 log ""
 log "==> 构建"
-(
-	cd flowtls
-	"$GO" build -o "$TMP/ftdial" ./cmd/ftdial || exit 1
-	"$GO" build -o "$TMP/ftudp" ./cmd/ftudp || exit 1
-) || {
-	log "Go 工具构建失败"
-	exit 1
-}
+# 只构建 sing-box 本体：矩阵两端都用真实发行版，而不是 Go 侧的联调小工具。
+# （v1 时代这里还会构建 cmd/ftdial 与 cmd/ftudp，但脚本从未调用它们，
+#   Rust 参考实现里也没有对应 bin，属于白白的失败源，已删除。）
 make build >/dev/null 2>&1 || {
 	log "sing-box 构建失败"
 	exit 1
@@ -123,7 +118,7 @@ SB=dist/sing-box-1.14.4-rev.1-linux-amd64
 	log "找不到 $SB"
 	exit 1
 }
-ok "Go 工具链 / sing-box"
+ok "sing-box 构建"
 
 # ---------- 清理与退出处理 ----------
 PIDS=()
