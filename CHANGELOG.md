@@ -37,6 +37,12 @@ connection download closed: stream N canceled by local|remote with error code 0
 首字节长尾各有一次（Go 448ms、Rust 297ms），其余都贴着 p50。
 上传和下载没有失败，也没有中断在半截的样本。
 
+## 2026-11-14 19:30 (北京时间)
+
+### sing-box/protocol/flowtls/web/index.html 已替换为 NGINX 的默认页面
+
+伪装页面默认改为 nginx 官方的默认页面
+
 ## 2026-11-14 19:05 (北京时间)
 
 ### 修复：延迟确认只在下一个包到达时才发送，单个响应的 ACK 被推迟一个往返
