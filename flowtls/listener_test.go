@@ -35,15 +35,15 @@ func newTestRawSocket() *rawSocket {
 // newTestSession 构造一个可安全关闭的最小会话。
 func newTestSession(peer netip.AddrPort, peerISN uint32) *Session {
 	return &Session{
-		raw:       newTestRawSocket(),
-		peer:      peer,
-		localPort: 8443,
+		raw:        newTestRawSocket(),
+		peer:       peer,
+		localPort:  8443,
 		remotePort: peer.Port(),
-		peerISN:   peerISN,
-		mark:      IPIDMarkOf(0xF107),
-		clock:     NewTcpClock(),
-		rx:        make(chan []byte, 1),
-		closeCh:   make(chan struct{}),
+		peerISN:    peerISN,
+		mark:       IPIDMarkOf(0xF107),
+		clock:      NewTcpClock(),
+		rx:         make(chan []byte, 1),
+		closeCh:    make(chan struct{}),
 	}
 }
 

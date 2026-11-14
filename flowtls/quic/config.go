@@ -96,6 +96,7 @@ func ServerTLSConfig() (*tls.Config, error) {
 // 无法对齐的项（quic-go 没有对应配置）：
 //   - `send_window = max_cwnd*2 clamp(2MB,16MB)`：quic-go 内部自行管理；
 //   - `ack_frequency(max_ack_delay=5ms)`：quic-go 用对端协商的默认值。
+//
 // 这两项记录在此而不"绕过"——绕过需要改 quic-go 源码，不属于移植范围。
 func baseConfig() *quicgo.Config {
 	return &quicgo.Config{

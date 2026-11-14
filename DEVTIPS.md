@@ -3457,28 +3457,16 @@ connection download closed: stream N canceled by remote with error code 0
 只有出现 `by remote` 但客户端没有对应的 `by local`、或者错误码不是 0、
 或者同时有握手失败，才值得再查。
 
-## 115. sing-box 正式 Release 自动同步与发布（2026-11-14 20:00）
+## 115. 手动同步正式版并触发全架构发布（2026-11-14 20:19）
 
-`.github/workflows/upstream-sync.yml` 每 6 小时检查 GitHub 最新正式 Release tag，
-源码严格同步该 tag，不跟随 `stable` 或其他开发分支。版本按
-`<上游版本>-rev.N` 递增，新上游正式版本从 `rev.1` 开始。同步后同时更新 Go
-directive 和三个必须与 sing-box 对齐的依赖。
+自动同步源码方案已放弃。开发者先手动将 `sing-box/` 更新到官方正式 Release tag，
+核对 `sing-box/go.mod` / `go.sum`，并把 Go、`quic-go`、`sing`、`sing-quic`
+版本逐字节同步到 `flowtls/go.mod` / `go.sum`。完成审查和测试后推送 `main`。
 
-上游 subtree 使用三方合并：不冲突的本项目定制会保留。`sing-box/go.mod` 和
-`sing-box/go.sum` 是上游权威依赖清单，冲突时采用上游版本，之后同步 `flowtls/go.mod`。
-其他源码文件冲突时 workflow 失败，不推送、不发布，需人工解决后重跑。只有已推送到
-`main` 的本地定制才会出现在 Actions runner 上。不要对源码冲突强制覆盖。
+之后在 Actions 手动运行 `Build`，版本留空则读取 `VERSION`，也可输入
+`<上游正式版>-rev.N`。Build 先跑测试，再构建全部平台；全部通过后才创建
+`v<版本>` tag 和正式 Release。已存在的 tag 会在构建前被拒绝，不能覆盖发行版。
 
-首轮曾误从 `stable` 分支同步并在 `sing-box/go.mod` 冲突，已失败且未发布。
-当前只跟随正式 Release tag；截至 2026-11-14，上游最新正式版为 `v1.14.4`，
-其 Go 和关键依赖与当前 vendored go.mod 一致。
-
-仓库添加 `upstream` remote 后，`gh` 可能把默认仓库选成 `SagerNet/sing-box`。
-调用 `gh release view` / `gh workflow run` 时必须传 `--repo "$GITHUB_REPOSITORY"`，
-否则 dispatch 会因 GITHUB_TOKEN 对上游无权限而 403。
-
-同步 workflow 通过 `GITHUB_TOKEN` 推送 main 后，GitHub 不会因该 push 自动触发
-其他 workflow，所以它显式 dispatch `build.yml`。Build 先跑测试和全架构矩阵，
-全部成功后才创建 tag 和正式（非 prerelease）Release。轮询检查无源码更新时，
-已有 Release 就退出；当前版本尚无 Release（首次发布或上次失败）则再次派发构建。
-Android 不纳入矩阵：FakeTCP 需要 Linux raw socket。
+不要运行或重新添加定时上游拉取。曾试过同步 `stable`（引入开发版依赖冲突）
+和自动派发（多 remote 导致 403），自动方式已经移除。Android 不纳入矩阵：
+FakeTCP 需要 Linux raw socket。

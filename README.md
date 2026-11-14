@@ -8,8 +8,8 @@
 最早验证协议的 Rust 实现已冻结在 `legacy-rust` 分支，仅作参考实现与历史记录
 （详见 [`docs/EVOLUTION.md`](docs/EVOLUTION.md)）。
 
-正式版由 GitHub Actions 自动打包发布，并每 6 小时检查 sing-box 最新正式 Release
-tag；只同步正式发行源码，不跟随开发分支。上游发布新版本后会对齐关键依赖并发布全架构产物。
+正式版通过 GitHub Actions 手动打包发布。开发者先手动同步 sing-box 正式 Release
+源码及依赖，再触发全架构构建；测试和所有目标构建通过后才创建正式 Release。
 
 ## 它解决什么问题
 

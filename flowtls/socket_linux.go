@@ -89,7 +89,7 @@ type rawSocket struct {
 	// 而伪 TCP 层没有重传，现象只是「吞吐偏低 + 周期性」。
 	// 必须靠 MSG_TRUNC 把真实长度拿回来才能发现。
 	truncated atomic.Uint64
-truncLog  atomic.Bool
+	truncLog  atomic.Bool
 }
 
 // newRawSocket 创建收发 socket（对应 Rust `RawSocket::new_with_local`）。

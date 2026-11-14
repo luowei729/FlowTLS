@@ -53,11 +53,11 @@ func main() {
 		os.Exit(2)
 	}
 	cfg := flowtls.ServerConfig{
-		Listen:    addr,
-		Password:  *password,
-		IPIDMark:  uint16(*ipidMark),
-		NetMode:   mode,
-		LocalIP:   parseLocalIP(*localIP),
+		Listen:         addr,
+		Password:       *password,
+		IPIDMark:       uint16(*ipidMark),
+		NetMode:        mode,
+		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,
 		UDPMaxSessions: 256,
 	}
@@ -67,9 +67,9 @@ func main() {
 		onStats = func(s ftquic.PathStats) { ftquic.LogStats(s) }
 	}
 	srv, err := ftquic.NewServer(ftquic.ServerOptions{
-		FlowTLS:  cfg,
-		MaxCwnd:  *maxCwnd,
-		OnStats:  onStats,
+		FlowTLS: cfg,
+		MaxCwnd: *maxCwnd,
+		OnStats: onStats,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)

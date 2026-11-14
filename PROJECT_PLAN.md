@@ -302,13 +302,11 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 不再把「Go 稳定慢一倍」当成未解决项。30 分钟长稳定性仍未单独跑过，
 上面这三段各 90 秒不能替代它。
 
-### 正式发行自动化（2026-11-14 20:00）
+### 正式发行流程（2026-11-14 20:19，手动触发）
 
-- `Sync sing-box release` 每 6 小时只检查上游最新正式 Release tag，不跟随开发分支。
-- 源码有变化时用 subtree 三方合并；`sing-box/go.mod` / `go.sum` 冲突采用上游版本，其他项目定制源码冲突时失败关闭并等待人工处理。
-- 按 `<上游版本>-rev.N` 递增发行版本，并把 `flowtls/go.mod` 的 Go、`quic-go`、
-  `sing`、`sing-quic` 对齐到 vendored sing-box。
-- `Build` 在测试通过后构建完整架构矩阵，矩阵全绿后才创建 Git tag 和正式 Release。
-- 只有推送到 `main` 的提交会进入 Actions；未提交的本地修改不会被自动同步。
+- 开发者手动同步 sing-box 官方正式 Release 源码及依赖，不自动拉取或更新源码。
+- 审查并推送后，在 Actions 手动运行 `Build`；版本留空取 `VERSION`，也可显式输入。
+- 测试与所有架构矩阵通过后才创建 tag 和正式 Release；已有 tag 会拒绝覆盖。
+- 首次 Build 被 gofmt 门禁拦截，4 个 Go 文件已格式化；`make test`（race）和冻结向量检查通过。
 - Linux 覆盖 amd64、arm、386、MIPS/MIPS64、PPC64LE、s390x、riscv64、loong64；
-  另保留 Windows、macOS、FreeBSD 的现有目标。Android 不发布，因为 FakeTCP 依赖 Linux raw socket。
+  另保留 Windows、macOS、FreeBSD 目标。Android 不发布，因为 FakeTCP 依赖 Linux raw socket。
