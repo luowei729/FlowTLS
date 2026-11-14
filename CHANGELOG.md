@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-11-14 22:15 (北京时间)
+
+### 修复：跳板客户端 65501 端口映射自环
+
+跳板（198.51.100.11）`/opt/proxy/client.json` 加了 65501 的 `direct` 入站，
+但没加 `inbound: [fwd-server-65501] → flowtls-out` 路由规则。目标 127.0.0.1 命中
+`ip_is_private → direct` 后 sing-box 连自己的 65501 形成无限自环，
+fd 耗尽报 `too many open files`。已把规则插到私网规则之前并重启，
+`curl 127.0.0.1:65501` 经隧道返回服务器 tproxy 容器页面，socks 51080 → 204 正常。
+详见 DEVTIPS 118。
+
 ## 2026-11-14 21:19 (北京时间)
 
 ### 修复：未配置 site_dir 时使用 web/index.html（随 1.14.4-rev.2 发布）

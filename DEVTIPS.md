@@ -3457,6 +3457,23 @@ connection download closed: stream N canceled by remote with error code 0
 只有出现 `by remote` 但客户端没有对应的 `by local`、或者错误码不是 0、
 或者同时有握手失败，才值得再查。
 
+## 118. direct 入站改写到 127.0.0.1 必须先于私网直连规则（2026-11-14 22:15）
+
+用 `direct` 入站做端口映射（`override_address: 127.0.0.1`）时，路由规则
+`{"inbound": ["<该入站tag>"], "outbound": "flowtls-out"}` **必须放在
+`ip_is_private → direct` 之前**。漏掉这条规则时，改写后的目标是 127.0.0.1，
+命中"私网直连"，sing-box 去连**自己**监听的同一端口 → 回到自己的入站 → 无限自环。
+
+自环的特征（2026-11-14 跳板实测）：
+
+- journal 里连环出现 `inbound connection from 127.0.0.1:<临时端口>` 到自己；
+- 几秒内 `connection upload/download closed: too many open files`（fd 被循环耗尽）；
+- curl 表现为连上但无数据。重启进程能临时恢复，不删自环源头必然复发。
+
+另一个陷阱：以为「改成 80 能访问」说明映射通了——实际 `127.0.0.1:80` 命中的
+是本机自己的 80 端口服务，根本没走隧道。验证映射必须用能区分两端的页面或
+在服务端抓 sing-box 日志确认出站方向是 `outbound/flowtls` 而不是 `outbound/direct`。
+
 ## 115. 手动同步正式版并触发全架构发布（2026-11-14 20:19）
 
 自动同步源码方案已放弃。开发者先手动将 `sing-box/` 更新到官方正式 Release tag，
