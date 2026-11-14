@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-11-14 21:19 (北京时间)
+
+### 修复：未配置 site_dir 时使用 web/index.html（随 1.14.4-rev.2 发布）
+
+此前省略 `masquerade.site_dir` 会回退到 `masquerade.go` 中硬编码的 “It works” 页面，
+与仓库 `web/index.html` 不一致。现在用 `go:embed` 将该文件嵌入二进制；目录未配置或
+找不到首页时都使用它。若显式配置 `site_dir` 且其中有 `index.html`，仍优先返回该文件。
+
+`/tmp/flowtls-server.json` 已移除 `site_dir`，证书路径按部署配置改为 `/opt/proxy/`。
+新增默认页面回归测试，FlowTLS 适配层 race 测试通过。需要重新构建并部署二进制后生效。
+
 ## 2026-11-14 20:38 (北京时间)
 
 ### 首次正式发行完成：v1.14.4-rev.1

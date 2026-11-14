@@ -311,3 +311,9 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 - 首次 Build 被 gofmt 门禁拦截，4 个 Go 文件已格式化；`make test`（race）和冻结向量检查通过。
 - Linux 覆盖 amd64、arm、386、MIPS/MIPS64、PPC64LE、s390x、riscv64、loong64。
   Windows/macOS/FreeBSD 的 `socket_stub.go` 缺少运行所需的 FakeTCP 定义，不列入当前发行目标。
+
+### 伪装站默认页（2026-11-14 21:19）
+
+- 省略 `site_dir` 时直接使用嵌入二进制的 `protocol/flowtls/web/index.html`，不再返回硬编码 “It works”。
+- 显式 `site_dir` 仍优先；目录中缺少请求文件或首页时回退到嵌入页。
+- 默认页回归测试及适配层 race 测试通过；需重新构建并部署二进制才会更新运行中的网站。

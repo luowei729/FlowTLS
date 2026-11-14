@@ -7,7 +7,7 @@ package flowtls
 //	TLS 1.3，ALPN 只宣告 http/1.1（真实世界大量站点如此，不成为指纹特征）
 //	TLS 握手 10s 超时，连接总时长 30s 超时
 //	单次请求头上限 16KB（防止被恶意超长请求拖垮）
-//	GET/HEAD      → 静态文件 → 目录 index.html → 内置占位页
+//	GET/HEAD      → 静态文件 → 目录 index.html → 编译时嵌入的 web/index.html
 //	/robots.txt   → Allow: /
 //	/favicon.ico  → 204（比 404 更像正常站点）
 //	其它方法      → 405
@@ -23,6 +23,7 @@ package flowtls
 
 import (
 	"crypto/tls"
+	_ "embed"
 	"fmt"
 	"net"
 	"os"
@@ -36,6 +37,11 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+// 默认伪装页直接嵌入二进制，省略 site_dir 时使用仓库维护的页面。
+//
+//go:embed web/index.html
+var builtinIndexHTML string
+
 const (
 	// 与 Rust 常量一致
 	masqueradeTLSTimeout    = 10 * time.Second
@@ -44,35 +50,6 @@ const (
 	masqueradeReadChunk     = 4096
 
 	robotsTXT = "User-agent: *\nAllow: /\n"
-
-	// 内置占位页：编译期常量，保证离线也能响应。
-	// **生产环境必须用 site_dir 换成真实内容**——占位页本身就是指纹。
-	builtinIndexHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Welcome</title>
-<style>
-  body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-         background:#0f172a; color:#e2e8f0; display:flex; align-items:center;
-         justify-content:center; min-height:100vh; }
-  .card { max-width:32rem; padding:2.5rem 3rem; text-align:center;
-          background:#1e293b; border-radius:.75rem;
-          box-shadow:0 10px 30px rgba(0,0,0,.35); }
-  h1 { font-size:1.5rem; margin:0 0 .75rem; font-weight:600; }
-  p  { margin:.5rem 0; line-height:1.6; color:#94a3b8; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>It works</h1>
-    <p>This site is up and running.</p>
-    <p>Content is being prepared.</p>
-  </div>
-</body>
-</html>
-`
 )
 
 // masquerade 是同端口伪装站点。
@@ -118,7 +95,7 @@ func newMasquerade(host string, port uint16, opts *option.FlowTLSMasqueradeOptio
 
 func displayDir(dir string) string {
 	if dir == "" {
-		return "内置占位页"
+		return "内置页面 web/index.html"
 	}
 	return dir
 }

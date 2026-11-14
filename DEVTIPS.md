@@ -3474,3 +3474,10 @@ FakeTCP 需要 Linux raw socket。首轮矩阵还实测 Windows、macOS、FreeBS
 
 首次正式发行 `v1.14.4-rev.1` 于 2026-11-14 20:38 完成：19 个 Linux 包和
 `sha256sum.txt`，测试与所有架构构建均通过。后续上游同步必须由开发者手动进行。
+
+## 117. 默认伪装页来自嵌入的 web/index.html（2026-11-14 21:19）
+
+`masquerade.site_dir` 是可选覆盖项：设置后静态文件和该目录的 `index.html` 优先；
+省略该字段时使用编译进二进制的 `sing-box/protocol/flowtls/web/index.html`。
+不要在代码里再维护一份不同的首页常量，否则服务器重启后展示内容会与仓库文件不一致。
+修改 `web/index.html` 后必须重新构建、部署服务端二进制；旧二进制仍含旧页面。
