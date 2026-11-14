@@ -163,6 +163,16 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 14. **服务端分流必须按 wscale 判断，不能按 IP ID**：IP ID 掩码匹配
     （`& 0x1E00 == 0x1E00`）有 1/16 误命中率，且部分链路会改写它。
     误命中会让真实浏览器的 SYN 也收到伪 SYN-ACK（`DEVTIPS.md` 第 93 条）。
+15. **收包缓冲必须 ≥ 256KB**：网卡 GRO 会把多个 TCP 段合并成超过 64KB 的
+    skb，缓冲不足时 `recvmmsg` **静默截断**（QUIC 的 `lost=` 恒为 0，
+    只表现为握手慢、RTT 虚高）。同时必须保留 `MSG_TRUNC` 检测
+    （`DEVTIPS.md` 第 98 条）。
+16. **AF_PACKET 发送 fd 必须是阻塞的**（配 `SO_SNDTIMEO` 兜底）。
+    非阻塞 fd + `EAGAIN` 静默丢弃会让握手包随机丢失，
+    而伪 TCP 层没有重传（`DEVTIPS.md` 第 98 条）。
+17. **`handleIncoming` 必须忽略 RST**：本协议从不发 RST，
+    收到 RST 只可能来自对端内核。把它当「对端存活」会让死连接被长期复用
+    （`DEVTIPS.md` 第 98 条）。
 
 ## 已知限制
 

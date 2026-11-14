@@ -2871,3 +2871,163 @@ TCP 包」更挑剔（DEVTIPS 86），而客户端上行主要是纯 ACK，包�
 | `sing-box/protocol/flowtls/inbound.go` | 730 | 730 | 已是 hy2 同构最小结构，不动 |
 | `flowtls/quic/client.go` | 897 | 897 | 待办：与 Rust `client.rs` 的 `run_session` 对齐 |
 | `flowtls/session.go` | 1229 | 1229 | 待办：收窄发送 API |
+
+## 98. 「包发出去了但没上线」的四种静默失败（2026-11-14 事故复盘）
+
+用户报「1080 连不上」。查下来是四个**互相叠加**的缺陷，共同点是
+**日志里没有任何错误**，因为包被静默丢弃或状态被误判。
+
+### 4.1 AF_PACKET 发送 fd 非阻塞 + EAGAIN 被当 UDP 语义
+
+```go
+// 错误写法
+_ = syscall.SetNonblock(fd, true)   // AF_PACKET 发送 fd
+...
+if errors.Is(err, syscall.EAGAIN) { return nil }  // 静默丢弃
+```
+
+Rust 版的 AF_PACKET fd **没有** `O_NONBLOCK`，所以 `sendto` 会等待。
+Go 版多写了一句「必须非阻塞」的优化，配上「EAGAIN 按 UDP 语义丢弃」，
+就成了「握手包随机丢失」。
+
+抓包证据：`SYN 0.000 → SYN-ACK 0.851s`（链路 RTT 仅 73ms），
+客户端的 SYN 重传定时器是 1s，所以每次都卡 ~850ms。
+
+修法：阻塞 fd + `SO_SNDTIMEO=200ms`（防止真拥塞时永久卡死），
+`Send`/`sendLoop` 对 EAGAIN/ENOBUFS 重试，仍失败则**上报错误**。
+
+### 4.2 批量收包缓冲小于 GRO 聚合包 → 内核静默截断
+
+```go
+bufs[i] = make([]byte, 2048)   // ← 以为「伪包最大 1417 字节」
+```
+
+网卡开着 GRO（默认开），内核会把同一 TCP 流的多个段合并成一个 skb，
+**而且 GRO 聚合包可以超过 64KB**（IP total_len 是 16 位，但 skb 长度
+由 `gro_size` 决定，不受它约束）。
+
+缓冲不够时 `recvmmsg` 会**截断并丢弃多余部分且不返回错误**，
+只在 `msg_flags` 里置 `MSG_TRUNC`。后果：
+
+- QUIC 的 `lost=` 恒为 0（包死在收包缓冲，QUIC 完全不知道）；
+- 伪 TCP 握手 473~682ms、QUIC 握手 3.7s、首包延迟 610ms；
+- 反复修「发送队列」「拥塞控制」都没用。
+
+修法：`recvBufSize = 256KB`（32 × 256KB = 8MB/端），
+并在 `RecvBatch` 里检查 `MSG_TRUNC`——**这个检测是必须的**，
+否则下次又会「lost=0 但吞吐上不去」。
+
+排查方法：把 `MSG_TRUNC` 计数打一条 Warn。第一次出现时立刻就知道
+是收包缓冲问题，不用再抓包二分。
+
+### 4.3 ERESTARTSYS(512)：Go 异步抢占打断 syscall
+
+单测偶发 `RecvBatch 失败: recvmmsg: errno 512`。
+
+`512 = ERESTARTSYS`，**不在标准 errno 表里**（最大约 133），
+所以 `syscall` 包的常量中没有它。触发条件是进程在阻塞的系统调用中
+收到信号，且该调用需要重启：**Go 运行时的异步抢占正是这种情形**
+（GC/调度器向线程发 SIGURG）。
+
+修法：
+
+```go
+const erestartSys = syscall.Errno(512)
+for {
+    r0, _, errno = syscall.Syscall6(...)
+    if errno == 0 || (errno != syscall.EINTR && errno != erestartSys) { break }
+}
+```
+
+内核没有消费数据，重试完全安全。不重试的后果：
+收包侧白等一轮（延迟抖动），**发送侧更严重——一次打断就丢一批报文**。
+
+### 4.4 内核回的 RST 被当作「对端存活」
+
+这是「隧道已死但客户端一直可用」的直接原因：
+
+1. 服务端重启/会话被回收后，伪包仍到达服务端内核；
+2. 内核在 8443 上找不到匹配 socket，为**每个**伪包回一个 RST；
+3. 这些 RST 的 src/dst 端口与我们的四元组**完全一致**，
+   `ParseFrame` + `matchPeer` 全部通过；
+4. `handleIncoming` 更新 `lastSeenAt` → `Probe` 判定「链路存活」；
+5. 客户端一直复用死连接，请求全部超时，直到用户手动重启。
+
+修法：`handleIncoming` 开头直接忽略 RST——**本协议从不发 RST**
+（只有 SYN/SYN-ACK/ACK/PSH/FIN），收到 RST 只可能来自对端内核。
+
+配套把 `probeTimeout` 1s→400ms、`openStreamTimeout` 8s→1s：
+服务端重启后首个请求从 11.4s 降到 2~3s。
+
+### 教训
+
+1. **「日志没有错误」不等于「没有丢包」**。用户态伪造 TCP 栈有三处
+   会静默丢弃：非阻塞 fd 的 EAGAIN、收包缓冲截断、信号打断的 syscall。
+   三处都必须有计数或告警。
+2. 移植时**每一句「优化」都要对照 Rust 版确认是否需要**。
+   `SetNonblock` 这一句没有任何收益（发送已收敛到单协程），
+   却引入了随机丢包。
+3. 缓冲大小不能按「我们构造的包有多大」来定，要按**内核可能给的包有多大**来定。
+   GRO 是默认开启的，它会重写游戏规则。
+4. 生存判定（`lastSeenAt`）必须只接受**本协议真的会发的包**。
+   任何「四元组匹配就算活着」的判据都会被对内核对端的 RST 欺骗。
+
+---
+
+## 99. iptables 的 IP ID 分流在真实链路上命中 0 次
+
+实测数据（服务端跑了 6 小时）：
+
+```
+-A PREROUTING ... --tcp-flags SYN,ACK SYN -m u32 --u32 "0x38&0xffffffff=0x103030c" -j DROP
+   pkts 9,352,020              ← wscale 规则（SYN）命中正常
+
+-A PREROUTING ... -m u32 --u32 "0x4&0xff00ffff=0x1e004000" -j DROP
+   pkts 0                      ← IP ID 规则**从未命中**
+```
+
+原因：**客户端的 NAT 会改写 IP ID**。客户端发出时 IP ID 是 7697，
+服务端收到时变成 7753 —— 已经是 NAT 自己的计数器。
+
+结论：
+- **SYN 靠 wscale**（TCP 选项端到端不变）——有效；
+- **数据包不能靠 IP ID**——必须用状态机特征。
+
+数据包的正确拦法（不依赖任何可被改写的字段）：
+
+```bash
+# filter/INPUT：真实浏览器完成过三次握手 → ESTABLISHED；
+# 伪连接的 SYN 已在 raw 表被丢 → 数据包到达时 conntrack 视为 NEW。
+iptables -A INPUT -p tcp --dport 8443 ! --syn \
+  -m conntrack --ctstate NEW -j DROP
+# filter/OUTPUT：内核为伪数据包回的 RST 不出网卡。
+# 否则每个下行包引出一个 RST，包量翻倍，云网关还可能对小包限速。
+iptables -A OUTPUT -p tcp --sport 8443 --tcp-flags RST RST -j DROP
+```
+
+`! --syn` 在 iptables 里是**两个参数**（`"!"` 与 `"--syn"`），
+拼成 `"!--syn"` 会报错。`-A`/`-D` 的一致性比较也要注意：
+以 `-A ` 开头的字符串没有前导空格，`strings.Replace(s, " -A ", ...)` 匹配不到。
+
+---
+
+## 100. `SO_ATTACH_FILTER` 的返回值被当 int：0xFFFFFFFF 等于「丢弃」
+
+为了减少「收包协程处理整机无关流量」的开销，实现了经典 BPF 端口过滤。
+第一次写的时候 accept 分支返回 `0xFFFFFFFF`（「整包长度」），结果
+**socket 一个包都收不到**，而 `setsockopt` 返回成功、无任何日志。
+
+内核把 BPF 返回值当 `int` 用：`0xFFFFFFFF` 即 -1，被判为丢弃。
+tcpdump 生成的代码用的是 `0x00040000`（262144）。
+
+即便如此，这个优化**仍默认关闭**，原因：
+
+1. 两次真链路部署都导致「隧道一个包都收不到」；
+2. 本机无法验证：这台虚拟化机器上 AF_PACKET 看不到自己的出向包
+   （基准测试收到 0 个），所以「过滤器到底写对没」在本地测不出来。
+
+保留完整实现 + 单测（`bpf_linux_test.go`，环境不支持时 skip），
+需要时用 `FLOWTLS_BPF=1` 启用。
+
+**教训**：纯优化如果不能验证，就不要默认开启。这条优化的收益
+（减少无关包解析）远小于它带来的风险（整条隧道不通）。
