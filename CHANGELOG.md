@@ -1,17 +1,26 @@
 # CHANGELOG
 
+## 2026-11-14 20:11 (北京时间)
+
+### 修正：自动同步只使用 sing-box 正式发行 tag
+
+首轮 Action 曾按 `stable` 分支拉取，在开发中的 `sing-box/go.mod` 冲突后安全停止，
+没有推送同步提交或创建 Release。按要求改为只同步 GitHub 最新正式 Release tag。
+已核实上游最新正式版为 `v1.14.4`，其 Go 与关键依赖版本和当前 vendored go.mod 一致。
+
 ## 2026-11-14 20:00 (北京时间)
 
-### 新增：自动跟随 sing-box stable 并发布全架构正式版
+### 新增：自动跟随 sing-box 正式 Release 并发布全架构版本
 
-新增 `upstream-sync.yml`，每 6 小时轮询 sing-box `stable` 与最新正式 Release。
-检测到源码或正式版本变化后同步 subtree、按 `<上游版本>-rev.N` 更新版本、
+新增 `upstream-sync.yml`，每 6 小时轮询 sing-box 最新正式 Release tag，不跟随开发分支。
+检测到正式版本变化后同步对应 tag 的 subtree、按 `<上游版本>-rev.N` 更新版本、
 对齐 Go 版本及 `quic-go` / `sing` / `sing-quic` 依赖，再派发 Build workflow。
 
 Build workflow 覆盖 Linux 主流服务器/软路由架构及现有 Windows、macOS、FreeBSD
 目标。全部测试与架构构建通过后才创建 tag 和非 prerelease GitHub Release，
 附带 LICENSE、压缩包和 SHA-256。CI 不再重复创建 Release。
-本地定制通过 subtree 三方合并保留；同一位置冲突时自动同步停止，不覆盖、不发布。
+本地定制通过 subtree 三方合并保留；`sing-box/go.mod` / `go.sum` 冲突时采用上游依赖清单，
+其他源码冲突时自动同步停止，不覆盖、不发布。
 
 ## 2026-11-14 19:16 (北京时间)
 

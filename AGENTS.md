@@ -7,7 +7,7 @@ FlowTLS 是一个「外观是 TCP + TLS、内部是 QUIC 数据报」的代理�
 它与 hysteria2 / anytls 同一形态：**sing-box 的一个独立协议库**。
 发行版从本仓库构建，二进制名保持 `sing-box`，只靠版本号
 `<上游版本>-rev.N` 与官方版区分。GitHub Actions 每 6 小时检查
-sing-box `stable` 分支和最新正式 Release；检测到变化后自动同步、测试、
+sing-box 最新正式 Release tag；检测到新正式版后自动同步、测试、
 构建全架构产物并发布正式 Release（详见 `.github/workflows/`）。
 
 同端口（默认 8443）还需要一个真证书网站用于应对主动端口探测——

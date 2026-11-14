@@ -304,8 +304,8 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 
 ### 正式发行自动化（2026-11-14 20:00）
 
-- `Sync sing-box stable` 每 6 小时检查上游 `stable` 分支和最新正式 Release。
-- 源码有变化时用 subtree 三方合并；项目定制不冲突时保留，冲突时失败关闭并等待人工处理。
+- `Sync sing-box release` 每 6 小时只检查上游最新正式 Release tag，不跟随开发分支。
+- 源码有变化时用 subtree 三方合并；`sing-box/go.mod` / `go.sum` 冲突采用上游版本，其他项目定制源码冲突时失败关闭并等待人工处理。
 - 按 `<上游版本>-rev.N` 递增发行版本，并把 `flowtls/go.mod` 的 Go、`quic-go`、
   `sing`、`sing-quic` 对齐到 vendored sing-box。
 - `Build` 在测试通过后构建完整架构矩阵，矩阵全绿后才创建 Git tag 和正式 Release。

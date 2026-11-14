@@ -3457,15 +3457,21 @@ connection download closed: stream N canceled by remote with error code 0
 只有出现 `by remote` 但客户端没有对应的 `by local`、或者错误码不是 0、
 或者同时有握手失败，才值得再查。
 
-## 115. sing-box 上游自动同步与正式发布（2026-11-14 20:00）
+## 115. sing-box 正式 Release 自动同步与发布（2026-11-14 20:00）
 
-`.github/workflows/upstream-sync.yml` 每 6 小时检查上游 `stable` 分支和最新正式
-Release。源码变化同步 subtree；版本按 `<上游版本>-rev.N` 递增，新上游正式版本从
-`rev.1` 开始。同步后同时更新 Go directive 和三个必须与 sing-box 对齐的依赖。
+`.github/workflows/upstream-sync.yml` 每 6 小时检查 GitHub 最新正式 Release tag，
+源码严格同步该 tag，不跟随 `stable` 或其他开发分支。版本按
+`<上游版本>-rev.N` 递增，新上游正式版本从 `rev.1` 开始。同步后同时更新 Go
+directive 和三个必须与 sing-box 对齐的依赖。
 
-上游 subtree 使用三方合并：不冲突的本项目定制会保留；同一代码块冲突时命令失败，
-workflow 不会推送或发布，需人工解决后重跑。只有已推送到 `main` 的本地定制才会
-出现在 Actions runner 上。不要用强制覆盖或 `git checkout` 丢弃冲突文件。
+上游 subtree 使用三方合并：不冲突的本项目定制会保留。`sing-box/go.mod` 和
+`sing-box/go.sum` 是上游权威依赖清单，冲突时采用上游版本，之后同步 `flowtls/go.mod`。
+其他源码文件冲突时 workflow 失败，不推送、不发布，需人工解决后重跑。只有已推送到
+`main` 的本地定制才会出现在 Actions runner 上。不要对源码冲突强制覆盖。
+
+首轮曾误从 `stable` 分支同步并在 `sing-box/go.mod` 冲突，已失败且未发布。
+当前只跟随正式 Release tag；截至 2026-11-14，上游最新正式版为 `v1.14.4`，
+其 Go 和关键依赖与当前 vendored go.mod 一致。
 
 同步 workflow 通过 `GITHUB_TOKEN` 推送 main 后，GitHub 不会因该 push 自动触发
 其他 workflow，所以它显式 dispatch `build.yml`。Build 先跑测试和全架构矩阵，

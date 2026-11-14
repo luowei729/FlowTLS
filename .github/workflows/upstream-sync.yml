@@ -1,7 +1,7 @@
-name: Sync sing-box stable
+name: Sync sing-box release
 
 on:
-  # 每 6 小时检查一次上游 stable 分支；检查到新提交后同步并发布正式版。
+  # 每 6 小时检查一次上游最新正式 Release；不跟随 stable/development 分支。
   schedule:
     - cron: "17 */6 * * *"
   # 可从 Actions 页面手动重跑；始终以 main 为同步基线。
@@ -25,14 +25,14 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: 同步 sing-box stable 并计算发行版本
+      - name: 同步 sing-box 正式 Release 并计算发行版本
         id: sync
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          # 版本号以 sing-box 最新正式 Release 为基线，源码跟随 stable 分支。
+          # 版本和源码都固定到 GitHub 最新正式 Release tag，避免引入开发版代码。
           release_tag=$(curl -fsSL \
             -H 'Accept: application/vnd.github+json' \
             https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
@@ -53,11 +53,32 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git remote add upstream https://github.com/SagerNet/sing-box.git
-          git fetch --no-tags upstream stable
+          git fetch --no-tags upstream "refs/tags/${release_tag}:refs/tags/${release_tag}"
 
           before_tree=$(git rev-parse HEAD:sing-box)
-          # subtree 冲突时立即失败，不跳过冲突继续生成不完整发行版。
-          git subtree pull --prefix=sing-box upstream stable --squash
+          # go.mod/go.sum 必须跟随该正式版；只对这两个依赖清单采用上游侧。
+          # 其他本地定制源码发生冲突时失败关闭，等待人工合并。
+          if ! git subtree pull --prefix=sing-box upstream "$release_tag" --squash; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ -z "$conflicts" ]; then
+              echo "subtree pull 失败，但没有可自动处理的文件冲突。"
+              exit 1
+            fi
+            while IFS= read -r conflict; do
+              case "$conflict" in
+                sing-box/go.mod|sing-box/go.sum)
+                  echo "依赖清单冲突，采用 sing-box ${release_tag} 版本：$conflict"
+                  git checkout --theirs -- "$conflict"
+                  git add "$conflict"
+                  ;;
+                *)
+                  echo "项目定制与上游冲突，停止自动发布：$conflict"
+                  exit 1
+                  ;;
+              esac
+            done <<< "$conflicts"
+            git commit --no-edit
+          fi
           after_tree=$(git rev-parse HEAD:sing-box)
 
           source_changed=false
@@ -155,4 +176,4 @@ jobs:
           # 先派发完整矩阵构建；全部成功后 Build workflow 才创建 tag 和正式 Release。
           gh workflow run build.yml --ref "$build_ref" \
             --field "version=$VERSION" --field "publish=true"
-          echo "已同步 sing-box stable，并派发正式版构建：$TAG"
+          echo "已同步 sing-box ${RELEASE_TAG}，并派发正式版构建：$TAG"
