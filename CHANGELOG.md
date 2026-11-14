@@ -4,6 +4,10 @@
 
 ### 修复：未配置 site_dir 时使用 web/index.html（随 1.14.4-rev.2 发布）
 
+**已发布**：https://github.com/luowei729/FlowTLS/releases/tag/v1.14.4-rev.2
+（19 个 Linux 架构 + `sha256sum.txt`，非 prerelease）。已下载 amd64 包验证：
+二进制版本号与 tags 正确，嵌入页为 `web/index.html` 内容，旧的 “It works” 占位页已不存在。
+
 此前省略 `masquerade.site_dir` 会回退到 `masquerade.go` 中硬编码的 “It works” 页面，
 与仓库 `web/index.html` 不一致。现在用 `go:embed` 将该文件嵌入二进制；目录未配置或
 找不到首页时都使用它。若显式配置 `site_dir` 且其中有 `index.html`，仍优先返回该文件。
