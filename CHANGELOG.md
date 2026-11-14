@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-11-14 20:14 (北京时间)
+
+### 修复：多 remote 下 gh CLI 派发到错误仓库
+
+正式版同步在依赖对齐后通过，但 `gh workflow run` 自动选择了 `upstream`
+remote（`SagerNet/sing-box`），因此被 GitHub 403 拒绝；没有修改远端 main，
+也没有生成 Release。已在 `gh release view` 和 workflow dispatch 命令中显式指定
+`GITHUB_REPOSITORY`，确保只操作 FlowTLS 仓库。
+
 ## 2026-11-14 20:11 (北京时间)
 
 ### 修正：自动同步只使用 sing-box 正式发行 tag

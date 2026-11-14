@@ -109,7 +109,7 @@ jobs:
             version=$current_version
             tag="v${version}"
             if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-              if gh release view "$tag" >/dev/null 2>&1; then
+              if gh --repo "$GITHUB_REPOSITORY" release view "$tag" >/dev/null 2>&1; then
                 echo "源码和正式 Release 均无变化，跳过。"
                 echo "skip=true" >> "$GITHUB_OUTPUT"
                 exit 0
@@ -174,6 +174,6 @@ jobs:
           fi
 
           # 先派发完整矩阵构建；全部成功后 Build workflow 才创建 tag 和正式 Release。
-          gh workflow run build.yml --ref "$build_ref" \
+          gh --repo "$GITHUB_REPOSITORY" workflow run build.yml --ref "$build_ref" \
             --field "version=$VERSION" --field "publish=true"
           echo "已同步 sing-box ${RELEASE_TAG}，并派发正式版构建：$TAG"

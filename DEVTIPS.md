@@ -3473,6 +3473,10 @@ directive 和三个必须与 sing-box 对齐的依赖。
 当前只跟随正式 Release tag；截至 2026-11-14，上游最新正式版为 `v1.14.4`，
 其 Go 和关键依赖与当前 vendored go.mod 一致。
 
+仓库添加 `upstream` remote 后，`gh` 可能把默认仓库选成 `SagerNet/sing-box`。
+调用 `gh release view` / `gh workflow run` 时必须传 `--repo "$GITHUB_REPOSITORY"`，
+否则 dispatch 会因 GITHUB_TOKEN 对上游无权限而 403。
+
 同步 workflow 通过 `GITHUB_TOKEN` 推送 main 后，GitHub 不会因该 push 自动触发
 其他 workflow，所以它显式 dispatch `build.yml`。Build 先跑测试和全架构矩阵，
 全部成功后才创建 tag 和正式（非 prerelease）Release。轮询检查无源码更新时，
