@@ -3464,9 +3464,10 @@ connection download closed: stream N canceled by remote with error code 0
 版本逐字节同步到 `flowtls/go.mod` / `go.sum`。完成审查和测试后推送 `main`。
 
 之后在 Actions 手动运行 `Build`，版本留空则读取 `VERSION`，也可输入
-`<上游正式版>-rev.N`。Build 先跑测试，再构建全部平台；全部通过后才创建
+`<上游正式版>-rev.N`。Build 先跑测试，再构建全部受支持的 Linux 架构；通过后才创建
 `v<版本>` tag 和正式 Release。已存在的 tag 会在构建前被拒绝，不能覆盖发行版。
 
 不要运行或重新添加定时上游拉取。曾试过同步 `stable`（引入开发版依赖冲突）
 和自动派发（多 remote 导致 403），自动方式已经移除。Android 不纳入矩阵：
-FakeTCP 需要 Linux raw socket。
+FakeTCP 需要 Linux raw socket。首轮矩阵还实测 Windows、macOS、FreeBSD 会因
+`socket_stub.go` 缺少 `localIP` / `maxSendBatch` 编译失败，因此这些系统不是当前发行目标。

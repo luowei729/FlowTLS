@@ -6,11 +6,12 @@
 
 删除自动同步上游 workflow。开发者手动同步 sing-box 正式 Release 源码与依赖，
 检查后在 Actions 手动运行 `Build`；输入版本（默认取 `VERSION`），先跑测试和
-全架构矩阵，全部通过才创建 `v<版本>` tag 与正式 Release。已存在的 tag 会被拒绝，
+全部受支持的 Linux 架构矩阵，通过才创建 `v<版本>` tag 与正式 Release。已存在的 tag 会被拒绝，
 避免覆盖版本。
 
 先前试行自动同步时遇到开发分支依赖冲突和 workflow 派发 403；自动方案已停止，
-失败过程没有创建正式 Release。
+失败过程没有创建正式 Release。首轮 Build 的 20 个 Linux 架构通过，Windows/macOS/FreeBSD
+因非 Linux socket stub 缺少 FakeTCP 编译所需定义而失败，故发行目标限定为 Linux。
 
 ## 2026-11-14 19:16 (北京时间)
 

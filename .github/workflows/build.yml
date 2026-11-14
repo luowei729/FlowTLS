@@ -142,8 +142,7 @@ jobs:
       # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
       fail-fast: false
       matrix:
-        # Linux 架构覆盖 sing-box 的主要服务器、软路由和 NAS 目标；
-        # 非 Linux 目标保留现有可交叉编译平台。Android 不发布：FakeTCP 需要 Linux raw socket。
+        # FlowTLS 使用 Linux raw socket；非 Linux 的 socket_stub.go 不提供协议运行所需的字段和批量发送实现。
         include:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
@@ -164,15 +163,6 @@ jobs:
           - { goos: linux, goarch: s390x }
           - { goos: linux, goarch: riscv64 }
           - { goos: linux, goarch: loong64 }
-
-          - { goos: windows, goarch: amd64 }
-          - { goos: windows, goarch: "386" }
-          - { goos: windows, goarch: arm64 }
-
-          - { goos: darwin, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-
-          - { goos: freebsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@v4
 

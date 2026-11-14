@@ -1,22 +1,14 @@
 name: CI
 
-# 构建全部在 Actions 里完成，本地只需要 `make build` 产出本机可用的二进制。
-# 多架构走 matrix，一个平台一个 job，互不阻塞。
+# CI 只做快速验证和测试；多架构发行产物统一由手动 Build workflow 生成。
 #
 # 分层原则：按「能不能在没有特权的情况下跑」划分
 #
-#   verify / test  —— 普通 runner，几十秒到几分钟，是每次 push 的必过关卡
-#   build (matrix) —— 分支/PR 多架构编译检查，产物仅作为短期 Actions artifact
-#   release        —— 由 build.yml 独立负责正式 tag Release
+#   verify / test  —— 普通 runner，检查配置、单测和代码格式
+#   release        —— 开发者手动运行 build.yml，构建全架构并发布正式 Release
 #   e2e            —— 需要 CAP_NET_RAW，只能自托管，靠标签 opt-in
 #
-# 缓存为什么不用 setup-go 自带的（cache: false）
-#
-#   setup-go 的缓存 key 只含 go.sum hash + OS，**不含 GOARCH**。
-#   matrix 里十个平台会命中同一个 key，而 GitHub 的 cache 同一个 key
-#   只能保存一次——后保存的静默失败，最后谁的缓存留下是随机的。
-#   所以这里显式接管：module 缓存跨平台共享，build 缓存也共享，
-#   但只由 verify job 负责保存（其余 job 只 restore）。
+# Go 模块缓存由 verify job 保存；test job 只恢复共享缓存。
 
 on:
   push:
@@ -68,9 +60,6 @@ jobs:
         id: version
         run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
-      - name: make build
-        run: make build
-
       # 断言三件事：版本号带 rev、tags 带 with_flowtls、二进制名保持 sing-box。
       # 这三条是「与官方版区分」的全部依据，坏了就等于发了一个假官方版。
       - name: make verify
@@ -86,15 +75,7 @@ jobs:
             "$bin" check -c "$f"
           done
 
-      - name: 上传 linux/amd64 产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: sing-box-${{ steps.version.outputs.value }}-linux-amd64
-          path: dist/sing-box-*-linux-amd64
-          if-no-files-found: error
-          retention-days: 14
-
-      # 只在这里保存：matrix 的十个 job 同时保存同一个 key 必然互相覆盖。
+      # 只在 verify 保存 Go 缓存，避免并发写入同一个缓存 key。
       - name: 保存 Go 缓存
         if: steps.gocache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -148,80 +129,6 @@ jobs:
             echo "$out"
             exit 1
           fi
-
-  # ------------------------------------------------------------ 多架构发行版
-  build:
-    name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: verify
-    runs-on: ubuntu-latest
-    strategy:
-      # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
-      fail-fast: false
-      matrix:
-        # linux/amd64 不在这里：verify job 已经产出并上传过了。
-        #
-        # **为什么在 ubuntu-latest 上编译所有平台而不是用对应系统的 runner**
-        #
-        #   1. CGO_ENABLED=0，产出与在目标系统上编译的二进制逐字节等价；
-        #   2. macOS runner 单价约是 Linux 的 10 倍、Windows 约 2 倍，排队也慢；
-        #   3. Go 的交叉编译是官方支持的一等能力，不是 hack。
-        #
-        # 代价是没法在 CI 里「运行」非本机架构的二进制——
-        # 那属于冒烟测试，需要 QEMU（linux/arm64）或真实机器，不在本 workflow 范围。
-        include:
-          - { goos: linux, goarch: arm64 }
-          - { goos: linux, goarch: arm }
-          - { goos: linux, goarch: "386" }
-          - { goos: linux, goarch: mipsle }
-          - { goos: linux, goarch: mips64le }
-          - { goos: windows, goarch: amd64 }
-          - { goos: windows, goarch: arm64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: freebsd, goarch: amd64 }
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: sing-box/go.mod
-          cache: false
-
-      - name: 恢复 Go 缓存
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
-          restore-keys: |
-            gomod-${{ runner.os }}-
-
-      - name: 读取版本号
-        id: version
-        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
-
-      # Makefile 负责平台差异（windows 用另一套 tag 列表、文件名带 .exe）。
-      # 这里只传 GOOS/GOARCH，不重复一遍 tags 与 ldflags——重复就会漂移。
-      - name: make build ${{ matrix.goos }}/${{ matrix.goarch }}
-        run: make build GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
-
-      - name: 校验产物存在且非空
-        run: |
-          bin=$(ls dist/sing-box-*-${{ matrix.goos }}-${{ matrix.goarch }}* 2>/dev/null | head -1)
-          [ -n "$bin" ] || { echo "没有产出二进制"; exit 1; }
-          size=$(stat -c%s "$bin")
-          echo "$bin  $((size / 1024 / 1024)) MB"
-          # 一个 100MB 级的 sing-box 不可能小于 20MB；过小说明链接失败被吞了。
-          [ "$size" -gt 20000000 ] || { echo "产物过小，疑似构建失败"; exit 1; }
-
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: sing-box-${{ steps.version.outputs.value }}-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/sing-box-*-${{ matrix.goos }}-${{ matrix.goarch }}*
-          if-no-files-found: error
-          retention-days: 14
 
   # ------------------------------------------------------- 真链路（自托管）
   e2e:

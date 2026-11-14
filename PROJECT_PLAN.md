@@ -308,5 +308,5 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 - 审查并推送后，在 Actions 手动运行 `Build`；版本留空取 `VERSION`，也可显式输入。
 - 测试与所有架构矩阵通过后才创建 tag 和正式 Release；已有 tag 会拒绝覆盖。
 - 首次 Build 被 gofmt 门禁拦截，4 个 Go 文件已格式化；`make test`（race）和冻结向量检查通过。
-- Linux 覆盖 amd64、arm、386、MIPS/MIPS64、PPC64LE、s390x、riscv64、loong64；
-  另保留 Windows、macOS、FreeBSD 目标。Android 不发布，因为 FakeTCP 依赖 Linux raw socket。
+- Linux 覆盖 amd64、arm、386、MIPS/MIPS64、PPC64LE、s390x、riscv64、loong64。
+  Windows/macOS/FreeBSD 的 `socket_stub.go` 缺少运行所需的 FakeTCP 定义，不列入当前发行目标。
