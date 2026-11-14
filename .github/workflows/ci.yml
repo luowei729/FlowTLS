@@ -85,6 +85,22 @@ jobs:
             ~/.cache/go-build
           key: gomod-${{ runner.os }}-${{ hashFiles('flowtls/go.sum', 'sing-box/go.sum') }}
 
+  # ---------------------------------------------------------------- 泄露检查关卡
+  # 真实的服务器 IP / 域名 / 凭据一旦进仓库就收不回来：写进历史后即使重写，
+  # GitHub 上的旧对象仍可能被按 SHA 读取或已被第三方缓存。所以每次提交都跑一遍。
+  # 想把额外的真实地址也拦下来，在仓库 Settings → Secrets 里加 LEAK_DENYLIST
+  # （空格分隔的 IP 或域名），脚本会一并检查；不要把它写进仓库文件。
+  leak-check:
+    name: 泄露检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 扫描被跟踪文件
+        env:
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+        run: bash docs/leak_check.sh
+
   # ------------------------------------------------------------------ 单测关卡
   test:
     name: 单测与冻结向量门禁

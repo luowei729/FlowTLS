@@ -116,6 +116,9 @@ cd flowtls && go test -race ./...
 # 冻结向量门禁（不需要 root / 不需要 Rust）
 bash docs/interop_check.sh
 
+# 泄露检查（不需要 root；确认真实 IP/域名/凭据没进仓库）
+bash docs/leak_check.sh
+
 # 真链路矩阵（需要 root；未设 RUST_FLOWTLS 时只跑 Go↔Go）
 bash docs/e2e_matrix.sh
 RUST_FLOWTLS=/tmp/flowtls-rust/target/debug/flowtls bash docs/e2e_matrix.sh
@@ -175,6 +178,12 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 17. **`handleIncoming` 必须忽略 RST**：本协议从不发 RST，
     收到 RST 只可能来自对端内核。把它当「对端存活」会让死连接被长期复用
     （`DEVTIPS.md` 第 98 条）。
+18. **真实 IP、域名、凭据一律不许写进仓库**。文档、测试、注释统一用
+    `203.0.113.x` / `198.51.100.x` / `192.0.2.x`（RFC 5737 文档段）和
+    `example.com`；真实值只放在被忽略的 `deploy/` 与 `DEPLOY_CREDENTIALS.md`。
+    FakeTCP 的抗探测能力全靠「IP + ip_id_mark + SNI 都不公开」，三者同时
+    泄露等于把部署指纹交出去。`docs/leak_check.sh` 用白名单扫描被跟踪文件，
+    CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
 
 ## 已知限制
 

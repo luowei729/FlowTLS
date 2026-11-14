@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-11-15 01:10 (北京时间)
+
+### 安全：全历史脱敏（真实服务器 IP 与伪装域名曾进 public 仓库）
+
+仓库自 2026-11-10 起是 public，`CHANGELOG.md` / `DEVTIPS.md` /
+`docs/PROJECT_PLAN-v1.md` / `docs/bench.sh` / `flowtls/packet_test.go` 等文件
+把三台服务器的公网 IP、内网地址、`ip_id_mark`、客户端源端口和伪装域名写成了
+明文（三个分支都有）。
+
+**核查确认未泄露**：`DEPLOY_CREDENTIALS.md`、`deploy/` 目录、`ssl/` 里的真证书
+（CloudFlare Origin CA），以及任何私钥 / token / 生产密码——全历史 blob 与
+commit message 扫描均零命中；`sing-box/` 里的 `PRIVATE KEY` 全是上游测试夹具。
+
+处理：
+- `git-filter-repo` 重写 `main` / `legacy-go` / `legacy-rust` 三个分支与 5 个 tag
+  的全部 2899 个提交，blob 与 commit message 都替换；占位值统一为
+  `203.0.113.10` / `198.51.100.11` / `203.0.113.12` / `10.0.0.10` /
+  `example.com`，`ip_id_mark` 示例改 30583、源端口示例改 44333。
+- 强制推送全部分支与 tag（`legacy-go` 原先只在本地，这次一并推了清洗后的版本）。
+- 重写后复查 30866 个对象，泄露串命中数为 0。
+- 新增 `docs/leak_check.sh` 白名单门禁并接入 CI，防止再次发生。
+
+**已知残留**：被强推掉的旧提交在 GitHub 上仍可按 SHA 直连读取
+（`raw.githubusercontent.com/.../<旧SHA>/...` 返回 200，已实测）。彻底清掉需要
+向 GitHub Support 申请清理未引用对象与 cached views，或删除后重建仓库。
+
+**必须按「已泄露」处理部署**：IP 已公开约 5 天，应更换 `ip_id_mark`、
+更换伪装域名与证书，必要时迁机；`docs/bench.sh` 里暴露的 8081 明文 HTTP 代理
+需关闭或加认证。
+
 ## 2026-11-14 22:15 (北京时间)
 
 ### 修复：跳板客户端 65501 端口映射自环

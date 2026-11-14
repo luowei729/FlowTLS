@@ -3498,3 +3498,37 @@ FakeTCP 需要 Linux raw socket。首轮矩阵还实测 Windows、macOS、FreeBS
 省略该字段时使用编译进二进制的 `sing-box/protocol/flowtls/web/index.html`。
 不要在代码里再维护一份不同的首页常量，否则服务器重启后展示内容会与仓库文件不一致。
 修改 `web/index.html` 后必须重新构建、部署服务端二进制；旧二进制仍含旧页面。
+
+## 119. 真实 IP 写进文档等于永久泄露（2026-11-15 01:10）
+
+public 仓库放了 5 天，`CHANGELOG.md` / `DEVTIPS.md` / `docs/bench.sh` /
+测试注释里的三台服务器公网 IP、内网地址、`ip_id_mark`、客户端源端口和伪装域名
+全是明文。FakeTCP 的抗主动探测优势来自「攻击者不知道 IP、不知道 mark、不知道
+SNI」，这三样一起公开，等于把部署指纹交出去，可以针对性扫描、指纹识别和封锁。
+
+脱敏用 `git-filter-repo` 重写全部 ref（三分支 + 五 tag + 2899 个提交）：
+
+```bash
+git-filter-repo --replace-text rules.txt --force
+git-filter-repo --force --message-callback 'return message.replace(b"真域名", b"example.com")'
+git push --force --all && git push --force --tags
+```
+
+踩到的四个坑：
+
+1. **`git grep -I` 会把二进制当「无匹配」跳过**。第一次扫私钥时带了 `-I`，
+   结果是假阴性；换 `grep -a` 才看到内容。扫「有没有私钥」时不能用 `-I`。
+2. **纯数字参数不能裸替换**。`7687` / `44312` 在 commit、tree、blob 的 SHA 和
+   `go.mod` 的伪版本校验和里到处都是，直接 `7687==>30583` 会把依赖哈希改坏。
+   只能用锚定正则：`regex:ip_id_mark:\s*7687`、`regex:source_port:\s*44312`。
+3. **commit message 也会泄露**。本次有一条 message 写着「CloudFlare Origin CA
+   真证书（通配真实域名）」，blob 全干净了它还在，必须配 `--message-callback`。
+4. **强推后旧对象仍可读**。`raw.githubusercontent.com/<owner>/<repo>/<旧SHA>/…`
+   照样返回 200，因为对象只是「未被引用」而没被 GC。只有 GitHub Support 清理
+   或删库重建才能彻底删除——所以**发现泄露的第一时间是改密码/换参数，
+   而不是重写历史**。
+
+预防：`docs/leak_check.sh` 用白名单扫描被跟踪文件（回环 / 私网 / CGNAT /
+链路本地 / 组播 / RFC 5737 文档段 / RFC 2544 / 公共 DNS / 占位地址之外一律
+报错），CI 每次提交都跑；文档里统一写 `203.0.113.x` 和 `example.com`。
+`deploy/` 与 `DEPLOY_CREDENTIALS.md` 靠 `.gitignore` + 本门禁双重保护。
