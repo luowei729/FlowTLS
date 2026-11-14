@@ -3471,3 +3471,6 @@ connection download closed: stream N canceled by remote with error code 0
 和自动派发（多 remote 导致 403），自动方式已经移除。Android 不纳入矩阵：
 FakeTCP 需要 Linux raw socket。首轮矩阵还实测 Windows、macOS、FreeBSD 会因
 `socket_stub.go` 缺少 `localIP` / `maxSendBatch` 编译失败，因此这些系统不是当前发行目标。
+
+首次正式发行 `v1.14.4-rev.1` 于 2026-11-14 20:38 完成：19 个 Linux 包和
+`sha256sum.txt`，测试与所有架构构建均通过。后续上游同步必须由开发者手动进行。

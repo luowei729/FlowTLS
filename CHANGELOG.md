@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-11-14 20:38 (北京时间)
+
+### 首次正式发行完成：v1.14.4-rev.1
+
+通过手动 Build workflow 发布 19 个已验证的 Linux 架构包及 `sha256sum.txt`，
+Release 为正式版（非 prerelease）：
+https://github.com/luowei729/FlowTLS/releases/tag/v1.14.4-rev.1
+
+测试门禁、19 个架构构建、打包和 Release 上传全部通过。push 触发的 CI 也通过，
+现只运行验证/测试，不再重复构建矩阵。
+
 ## 2026-11-14 20:19 (北京时间)
 
 ### 调整：放弃自动更新上游源码，改为手动触发全架构发布
