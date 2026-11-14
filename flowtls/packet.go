@@ -90,6 +90,48 @@ func RandomIPID(mark uint16) uint16 {
 // 也是中间盒判定「非真实栈」的明显特征。
 func randomUint32() uint32 { return mrand.Uint32() }
 
+// QuickDstPort 从原始以太网帧里**只**读出 TCP 目的端口，不做任何校验。
+//
+// 设计成 (port, sure) 两个返回值，语义刻意保持简单：
+//
+//	sure == false → 无法判断（VLAN、截断、IP 选项异常），调用方必须回退 ParseFrame
+//	sure == true  → port 可信；port == 0 表示「一定不是 TCP/IPv4 报文」
+//
+// 用途：服务端的 AF_PACKET 收包 fd 不绑定网卡（要同时收 lo 与多网卡），
+// 因此会收到整机所有 IP 包——实测一台跑 5 个容器的服务器上，无关包是
+// 隧道包的 10 倍以上。这些包最终都要被丢掉，而完整 ParseFrame
+// （解析 IP 选项、TCP 选项、校验长度）比读四个字节贵一个数量级。
+// 先做这一步预筛，能让 recvLoop 在积压时快数倍排空。
+//
+// **绝不能把 sure == false 当成「不匹配」丢弃**：那会丢掉 VLAN 包，
+// 让隧道在带标签的网络里完全不工作。
+func QuickDstPort(frame []byte) (port uint16, sure bool) {
+	if len(frame) < 14 {
+		return 0, false
+	}
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	if etherType == 0x8100 {
+		// VLAN：内层 ethertype 在偏移 16、IP 头从 18 开始；不做预筛。
+		return 0, false
+	}
+	if etherType != 0x0800 {
+		// 非 IPv4（IPv6/ARP/LLDP/STP...）：一定不是我们的包。
+		return 0, true
+	}
+	ip := frame[14:]
+	if len(ip) < 20 {
+		return 0, false
+	}
+	if ip[0]>>4 != 4 || ip[9] != 6 {
+		return 0, true // 非 IPv4 / 非 TCP
+	}
+	ihl := int(ip[0]&0x0F) * 4
+	if ihl < 20 || len(ip) < ihl+4 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(ip[ihl+2 : ihl+4]), true
+}
+
 // ParsedPacket 是解析后的 IPv4 + TCP 报文视图。
 // Payload 直接借用接收缓冲区，零拷贝。
 type ParsedPacket struct {

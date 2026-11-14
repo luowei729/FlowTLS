@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -555,9 +556,19 @@ func NewClient(ctx context.Context, opts ClientOptions) (*Client, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	tDial := time.Now()
 	session, err := flowtls.Dial(dialCtx, opts.FlowTLS)
 	if err != nil {
 		return nil, fmt.Errorf("flowtls 握手失败: %w", err)
+	}
+	// 分阶段耗时必须可见：重建链路的耗时直接影响用户首个请求的等待，
+	// 而「伪 TCP 握手」与「QUIC 握手」慢的原因完全不同
+	// （前者通常是 SYN/SYN-ACK 重传，后者是 UDP 层的包丢失或 PTO）。
+	//
+	// 默认只在 debug 开关下输出：这是排障信息，不应该污染生产日志。
+	if os.Getenv("FLOWTLS_DEBUG_HANDSHAKE") == "1" {
+		log.Printf("flowtls: 伪 TCP 握手完成，耗时 %v",
+			time.Since(tDial).Round(time.Millisecond))
 	}
 
 	quicConf := opts.QUIC
@@ -589,6 +600,10 @@ func NewClient(ctx context.Context, opts ClientOptions) (*Client, error) {
 		_ = session.Close()
 		_ = transport.Close()
 		return nil, fmt.Errorf("QUIC 握手失败: %w", err)
+	}
+	if os.Getenv("FLOWTLS_DEBUG_HANDSHAKE") == "1" {
+		log.Printf("flowtls: 建连总耗时 %v（含 QUIC 握手）",
+			time.Since(tDial).Round(time.Millisecond))
 	}
 	// ---- 拥塞控制：原生 BBR + 自适应窗口上限 ----
 	//

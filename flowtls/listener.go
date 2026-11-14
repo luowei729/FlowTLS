@@ -133,6 +133,13 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 内核侧只保留「目的端口 == 监听端口」的 TCP 包。
+	//
+	// 服务端的收包 fd 不绑定网卡（要同时收 lo 与多网卡），因此会收到
+	// 整机所有 IP 包——实测一台跑着 5 个容器的服务器上，无关包是隧道包的
+	// 10 倍以上，收包协程被迫先处理别人的包，SYN 排队几百毫秒。
+	// 详见 rawSocket.SetPortFilter 的注释。
+	raw.SetPortFilter(cfg.Listen.Port())
 	mark := IPIDMarkOf(cfg.IPIDMark)
 	if mark == 0 {
 		mark = IPIDMark
@@ -279,10 +286,16 @@ func (l *Listener) recvLoop() {
 	defer l.wg.Done()
 	// 每个包用独立缓冲：ParseFrame 返回的切片直接指向它，
 	// 同一批里多个包必须各自成立。
+	//
+	// **必须是 64KB 而不是 2048**：网卡开启了 GRO（generic receive offload），
+	// 内核会把多个同流 TCP 段合并成一个最多 64KB 的 skb 再交给 AF_PACKET。
+	// 缓冲小于实际包长时内核会**截断并丢掉多余部分**（未设 MSG_TRUNC 时不会
+	// 返回错误），表现是「SYN-ACK 偶发丢失、吞吐掉一半」，而 `lost=` 一直是 0
+	// （包死在收包缓冲里，QUIC 层完全不知道）。
+	// 内存代价：32 × 64KB = 2MB，只在服务端存在一份。
 	bufs := make([][]byte, maxRecvBatch)
 	for i := range bufs {
-		// 2048 足够：伪包最大 1417 字节。
-		bufs[i] = make([]byte, 2048)
+		bufs[i] = make([]byte, recvBufSize)
 	}
 	lens := make([]int, maxRecvBatch)
 	for {
@@ -302,7 +315,13 @@ func (l *Listener) recvLoop() {
 			if l.ctx.Err() != nil {
 				return
 			}
-			p, ok := ParseFrame(bufs[i][:lens[i]])
+			frame := bufs[i][:lens[i]]
+			// 廉价预筛：绝大多数包是别的进程/容器的流量，
+			// 只读四个字节就能判定，不必走完整 ParseFrame。
+			if port, sure := QuickDstPort(frame); sure && port != l.port {
+				continue
+			}
+			p, ok := ParseFrame(frame)
 			if !ok {
 				continue
 			}

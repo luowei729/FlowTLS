@@ -29,6 +29,10 @@ const maxSendBatch = 32
 // recvmmsg 的缓冲数组，而 session.go 是跨平台文件。
 const maxRecvBatch = 32
 
+// recvBufSize 与 Linux 侧一致：必须能装下 GRO 聚合后的报文（可超过 64KB）。
+// 缓冲不足会让内核静默截断，包死在收包缓冲里（见 socket_linux.go）。
+const recvBufSize = 256 * 1024
+
 // bindRecv 与 Linux 侧保持同一签名：只有客户端需要把接收 fd 绑到出口网卡，
 // 服务端必须保持不绑定（否则收不到 lo / 多网卡上的包）。
 func newRawSocket(dst netip.Addr, local netip.Addr, bindRecv bool) (*rawSocket, error) {
@@ -38,6 +42,10 @@ func newRawSocket(dst netip.Addr, local netip.Addr, bindRecv bool) (*rawSocket, 
 func (s *rawSocket) Close() error { return nil }
 
 func (s *rawSocket) Send(pkt []byte, dst netip.Addr) error { return ErrPlatformUnsupported }
+
+// SetPortFilter 与非 Linux 对位：调用方（Dial / NewListener）无条件调用，
+// 缺这个方法会让 darwin/windows 编译失败。非 Linux 没有 AF_PACKET，空实现。
+func (s *rawSocket) SetPortFilter(localPort uint16) {}
 
 func (s *rawSocket) SendBatch(pkts [][]byte, dst netip.Addr) (int, error) {
 	return 0, ErrPlatformUnsupported

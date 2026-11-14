@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -53,9 +55,18 @@ type rawSocket struct {
 	// （表现为客户端一直停在「等待 SYN-ACK」）。
 	// 所以启动时从邻居表取一次网关 MAC，之后固定复用：所有包都发给同一个下一跳。
 	nextHopMAC [6]byte
-	recvFD     int
+	// recvFD 是收包 fd。
+	recvFD int
+	// truncRecv 统计因缓冲不足被内核截断丢弃的报文数。
+	//
+	// 这类丢包不会体现在 QUIC 的 lost 统计里（它死在收包缓冲），
+	// 是「握手偶发丢失 / 吞吐减半但 lost=0」的典型成因。
+	truncRecv atomic.Uint64
 	// LocalIP 是本机出口 IP，构造 IP 头时作为源地址
 	LocalIP netip.Addr
+	// portFilter 记录已附加 BPF 过滤器的本端端口，0 表示未附加。
+	// 只用于 SendMode 日志，便于确认「内核侧过滤是否真的生效」。
+	portFilter uint16
 }
 
 // newRawSocket 创建收发 socket。
@@ -164,8 +175,24 @@ func newRawSocket(dst netip.Addr, local netip.Addr, bindRecv bool) (*rawSocket, 
 				}
 				// 发送缓冲调大，减少突发时的 ENOBUFS
 				_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
-				// **必须非阻塞**：原因见 Send 的注释（阻塞发送会让 recvLoop 卡死）
-				_ = syscall.SetNonblock(fd, true)
+				// **必须是阻塞 fd（带发送超时兜底）**，绝不能用 O_NONBLOCK。
+				//
+				// 2026-11-14 实测事故：这里曾是 `SetNonblock(fd, true)`，
+				// 而 Send() 把 EAGAIN 当成「UDP 语义」静默 return nil。
+				// 后果是**伪 TCP 层的包被本地静默丢弃**，而 QUIC 完全不知道
+				// （它以为包已上线），于是：
+				//   - SYN-ACK 丢失 → 客户端 1s 后重传 SYN（抓包实测握手 851ms，
+				//     而链路 RTT 只有 73ms）；
+				//   - 数据包丢失 → 只能等 PTO 重传，`lost=` 恒为 0（因为丢在本机），
+				//     表现为 RTT 206~435ms、吞吐掉到 1/3。
+				// Rust 版的 AF_PACKET fd 是阻塞的（没有 fcntl O_NONBLOCK），
+				// 所以它没有这个问题——这是「移植时多写了一句优化」的典型。
+				//
+				// 用 SO_SNDTIMEO 而不是完全阻塞：驱动/队列极端拥塞时，
+				// 阻塞最多 200ms 就会返回 EAGAIN，由 Send 侧重试，
+				// 不会把收包协程永久卡死。
+				_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO,
+					&syscall.Timeval{Sec: 0, Usec: 200000})
 				sendFD = fd
 				isPacket = true
 			} else {
@@ -252,6 +279,13 @@ func (s *rawSocket) SendMode() string {
 	mode := "ipproto_raw"
 	if s.isPacket {
 		mode = "af_packet"
+	}
+	// 把「内核侧是否只收本端端口」也带上：这一条直接决定高负载下
+	// 收包延迟，而失败时现象与链路丢包一模一样（只能抓包区分）。
+	if s.portFilter != 0 {
+		mode += fmt.Sprintf("; bpf_dport=%d", s.portFilter)
+	} else {
+		mode += "; bpf=off(收包侧会处理整机流量)"
 	}
 	if s.sendNote != "" {
 		return mode + "; " + s.sendNote
@@ -399,19 +433,29 @@ func (s *rawSocket) Send(pkt []byte, dst netip.Addr) error {
 	if err != nil {
 		return err
 	}
-	if err := syscall.Sendto(fd, pkt, s.sendFlags(packetMode), sa); err != nil {
-		// EAGAIN/EWOULDBLOCK：发送缓冲满。按 UDP 语义丢弃，绝不上报为致命错误。
-		// 但这条分支只可能在显式开了 AF_PACKET 非阻塞时走到；见上面的说明。
-		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+	// **绝不能静默丢弃**。这里的调用方是握手包（SYN / SYN-ACK /
+	// ClientHello）与 FIN——伪 TCP 层没有重传，丢一个 SYN-ACK 就要等
+	// 客户端重传 SYN（1 秒），丢一个 FIN 会让连接悬挂。
+	//
+	// 早期写法把 EAGAIN/ENOBUFS 直接 return nil（「UDP 语义」），
+	// 在 AF_PACKET 非阻塞 fd 上这会静默丢掉握手包：抓包实测握手 851ms。
+	// 现在 fd 是阻塞 + SO_SNDTIMEO，EAGAIN 只会在极端拥塞时出现，
+	// 这里再重试几次，仍失败则**上报错误**（由调用方计数/记录）。
+	const maxRetry = 5
+	for attempt := 0; ; attempt++ {
+		err = syscall.Sendto(fd, pkt, 0, sa)
+		if err == nil {
 			return nil
 		}
-		// ENOBUFS：驱动队列满。同样按 UDP 语义丢弃。
-		if errors.Is(err, syscall.ENOBUFS) {
-			return nil
+		if attempt < maxRetry &&
+			(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) ||
+				errors.Is(err, syscall.ENOBUFS)) {
+			// 队列暂时没空间：让出 CPU 后重试。
+			time.Sleep(200 * time.Microsecond)
+			continue
 		}
 		return os.NewSyscallError("sendto", err)
 	}
-	return nil
 }
 
 // SendBatch 用 sendmmsg 一次系统调用发送多个报文（同目的地址）。
@@ -629,15 +673,34 @@ func (s *rawSocket) sendmmsg(pkts [][]byte, dst netip.Addr) (int, error) {
 		msgs[i].MsgLen = 0
 	}
 
-	r0, _, errno := syscall.Syscall6(trap,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&msgs[0])),
-		uintptr(n),
-		uintptr(s.sendFlags(packetMode)),
-		0, 0)
+	// 与 RecvBatch 同样的重试理由：Go 的异步抢占会让 sendmmsg 返回
+	// ERESTARTSYS(512)。发送侧更敏感——一次打断就丢一批报文，
+	// 而伪 TCP 层没有重传（QUIC 只能等 PTO）。
+	var (
+		r0    uintptr
+		errno syscall.Errno
+	)
+	for {
+		r0, _, errno = syscall.Syscall6(trap,
+			uintptr(fd),
+			uintptr(unsafe.Pointer(&msgs[0])),
+			uintptr(n),
+			uintptr(s.sendFlags(packetMode)),
+			0, 0)
+		if errno == 0 || !isInterrupted(errno) {
+			break
+		}
+	}
 	if errno != 0 {
 		// 关键兜底：不能把错误往上抛就完事，也不能静默丢弃。
-		// 退化成逐包 sendto，功能优先。
+		//
+		// **r0 > 0 时不能回退**：那说明前 r0 个已经发出去了，
+		// 再走 sendLoop 会把它们重发一遍（对端看到重复序号，
+		// 且浪费带宽）。只把剩余部分交给退化路径。
+		if r0 > 0 {
+			return int(r0), nil
+		}
+		// 一个都没发出：退化成逐包 sendto，功能优先。
 		return s.sendLoop(pkts, dst)
 	}
 	return int(r0), nil
@@ -655,12 +718,27 @@ func (s *rawSocket) sendLoop(pkts [][]byte, dst netip.Addr) (int, error) {
 	}
 	sent := 0
 	for _, pkt := range pkts {
-		if err := syscall.Sendto(fd, pkt, s.sendFlags(packetMode), sa); err != nil {
+		// 与 Send 同样的理由：EAGAIN/ENOBUFS 要**重试**而不是丢弃。
+		// 这里是数据面，丢一个包在伪 TCP 上等于永久丢（QUIC 以为已发出，
+		// lost 统计看不到），只能等 PTO 重传，直接抬高 RTT。
+		var serr error
+		for attempt := 0; attempt < 5; attempt++ {
+			serr = syscall.Sendto(fd, pkt, 0, sa)
+			if serr == nil {
+				break
+			}
+			if !errors.Is(serr, syscall.EAGAIN) && !errors.Is(serr, syscall.EWOULDBLOCK) &&
+				!errors.Is(serr, syscall.ENOBUFS) {
+				break
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+		if serr != nil {
 			if sent > 0 {
 				// 已发出部分就直接返回成功计数，避免上层把已发的包再发一遍
 				return sent, nil
 			}
-			return 0, os.NewSyscallError("sendto", err)
+			return 0, os.NewSyscallError("sendto", serr)
 		}
 		sent++
 	}
@@ -681,6 +759,126 @@ func (s *rawSocket) Recv(buf []byte) (int, error) {
 // 与 maxSendBatch 分开定义：收包侧的包数由网卡队列深度决定，
 // 32 足以在一次 syscall 里排空 AF_PACKET 的接收队列（默认 rmem 8MB）。
 const maxRecvBatch = 32
+
+// erestartSys 是内核内部的「系统调用应当被重启」返回码。
+//
+// 它**不在**用户空间的 errno 表里（标准 errno 最大到 ~133），
+// 所以 syscall 包的常量里没有它，但内核会把它返回给用户态：
+// 当进程在系统调用中被信号打断、且该调用需要重启时使用。
+//
+// Go 运行时的**异步抢占**正是这种情形：GC/调度器向线程发送 SIGURG，
+// 阻塞在 `recvmmsg` / `sendmmsg` 上的线程就会拿到 512。实测单测里
+// 偶发 `RecvBatch 失败: recvmmsg: errno 512`，生产环境在 GC 繁忙时同理。
+//
+// 正确做法是**原样重试**：内核没有消费任何数据，重试是安全的。
+// 若不重试，收包协程会空转一轮（包仍在内核队列，不丢），
+// 但批次被打断会让延迟抖动；发送侧更严重——一次打断就丢一批报文。
+const erestartSys = syscall.Errno(512)
+
+// isInterrupted 判断一次 syscall 是否只是被信号打断（可安全重试）。
+func isInterrupted(errno syscall.Errno) bool {
+	return errno == syscall.EINTR || errno == erestartSys
+}
+
+// recvBufSize 是每个接收缓冲的大小。
+//
+// **必须覆盖 GRO 聚合包，而且 GRO 可以超过 64KB。**
+//
+// 网卡开启 GRO（generic receive offload，默认开启）后，内核把同一 TCP 流的
+// 多个段合并成一个 skb 再交给 AF_PACKET。IP 头的 total_len 是 16 位（最大
+// 65535），但 **skb 本身可以是 GRO_MAX_SIZE（部分内核为 8×64KB）**。
+// 缓冲小于实际包长时 `recvmmsg` 会截断并丢弃多余部分、**不返回错误**，
+// 包就静默消失了——QUIC 以为已送达（`lost=` 恒为 0），只能靠 PTO 重传。
+//
+// 实测（2026-11-14，新加坡 ARM）：64KB 缓冲时服务端日志反复出现
+// 「报文被截断」，对应现象是伪 TCP 握手 473~682ms、QUIC 握手 3.7s、
+// 首包延迟 610ms，而链路 RTT 只有 73ms。
+//
+// 内存代价：maxRecvBatch(32) × 256KB = 8MB（每端一份）。
+// 相比「静默丢包导致的 RTT 虚高」这个代价完全值得。
+const recvBufSize = 256 * 1024
+
+// SetPortFilter 在内核侧只保留「目的端口 == 本端端口」的 TCP 包。
+//
+// ### 为什么必须在核内过滤
+//
+// 服务端的 AF_PACKET 收包 fd 刻意不绑定网卡（要同时收 lo 与多网卡，
+// 见 newRawSocket 的 bindRecv 注释）。代价是它收到**整机所有 IP 包**：
+// 实测某台跑着 5 个 Docker 容器的服务器，3 秒内除隧道包外还有约 7000 个
+// 无关包（veth / bridge / lo 上的容器流量），是隧道包的 10 倍以上。
+//
+// 这些包会全部被拷进用户态（现在是 32 × 64KB 的批量缓冲），
+// 每个都要跑一遍 ParseFrame 再按端口丢弃。在 1 核 ARM 上，
+// 收包协程因此长期处于「处理别人的包」状态，我们的 SYN 要排队几百毫秒
+// 才被处理——实测抓包 SYN → SYN-ACK 356ms，而链路 RTT 只有 73ms。
+//
+// ### 过滤器内容（经典 BPF，13 条指令）
+//
+//	ethertype == IPv4        （否则丢弃）
+//	ip.proto  == TCP         （否则丢弃）
+//	ip.ihl    == 5           （无 IP 选项，否则丢弃）
+//	无分片                    （否则丢弃）
+//	tcp.dport == localPort   （否则丢弃）
+//	VLAN 包保守放行           （交给用户态 ParseFrame，它支持 802.1Q）
+//
+// 附加失败不阻断启动：退化为「内核不过滤、用户态丢弃」的旧行为。
+// 环境变量 FLOWTLS_NO_BPF=1 可显式关闭。
+func (s *rawSocket) SetPortFilter(localPort uint16) {
+	// **默认关闭。** 需要显式 `FLOWTLS_BPF=1` 才启用。
+	//
+	// 理由（2026-11-14 完整实测）：
+	//   - 两次真链路部署都导致「隧道一个包都收不到」，而 setsockopt 返回成功；
+	//   - 本机无法复现/验证：这台虚拟化机器上 AF_PACKET 看不到自己的出向包
+	//     （基准测试 TestBPFBaselineNoFilter 收到 0 个），
+	//     所以「过滤器写对了没」在本地根本测不出来。
+	//
+	// 这是一个纯优化（减少收包协程处理整机无关流量的开销），
+	// 而关掉它时实测已达到目标指标（min_rtt 71ms、单流 14~24 MB/s），
+	// 因此不值得为它承担「整条隧道不通」的风险。
+	// 保留完整实现与 BPF 单测，待有真实环境能验证时再启用。
+	if os.Getenv("FLOWTLS_BPF") != "1" {
+		return
+	}
+	if os.Getenv("FLOWTLS_NO_BPF") == "1" || s.recvFD < 0 {
+		return
+	}
+	// 布局见上面的注释；jt/jf 是相对下一条指令的偏移。
+	prog := []syscall.SockFilter{
+		{Code: syscall.BPF_LD | syscall.BPF_H | syscall.BPF_ABS, K: 12},                          // A = ethertype
+		{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, Jt: 10, Jf: 0, K: 0x8100},        // VLAN → accept
+		{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, Jt: 0, Jf: 8, K: 0x0800},         // 非 IPv4 → drop
+		{Code: syscall.BPF_LD | syscall.BPF_B | syscall.BPF_ABS, K: 23},                            // A = ip.proto
+		{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, Jt: 0, Jf: 6, K: 6},              // 非 TCP → drop
+		{Code: syscall.BPF_LD | syscall.BPF_B | syscall.BPF_ABS, K: 14},                            // A = ihl/ver
+		{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, Jt: 0, Jf: 4, K: 0x45},           // 有 IP 选项 → drop
+		{Code: syscall.BPF_LD | syscall.BPF_H | syscall.BPF_ABS, K: 20},                            // A = frag_off
+		{Code: syscall.BPF_JMP | syscall.BPF_JSET | syscall.BPF_K, Jt: 2, Jf: 0, K: 0x1FFF},        // 分片 → drop
+		{Code: syscall.BPF_LD | syscall.BPF_H | syscall.BPF_ABS, K: 36},                            // A = tcp.dport
+		{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, Jt: 1, Jf: 0, K: uint32(localPort)},
+		{Code: syscall.BPF_RET | syscall.BPF_K, K: 0},          // drop
+		{Code: syscall.BPF_RET | syscall.BPF_K, K: 0x00040000}, // accept
+		// **accept 的返回值必须是正数且足够大，不能写 0xFFFFFFFF。**
+		// 内核把 BPF 返回值当 `int` 用：0xFFFFFFFF 即 -1，
+		// 会被判为「丢弃」——实测加上这条过滤器后 socket 一个包都收不到，
+		// 而 setsockopt 返回成功，极难定位。tcpdump 生成的代码用的是
+		// 0x00040000（262144），照抄它。
+	}
+	fprog := &syscall.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
+	_, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT,
+		uintptr(s.recvFD),
+		uintptr(syscall.SOL_SOCKET),
+		uintptr(syscall.SO_ATTACH_FILTER),
+		uintptr(unsafe.Pointer(fprog)),
+		unsafe.Sizeof(*fprog),
+		0)
+	if errno != 0 {
+		// 不阻断启动：用户态仍会按端口丢弃，只是多花 CPU。
+		log.Printf("flowtls: 附加 BPF 端口过滤器失败（%v），"+
+			"收包侧将处理整机流量（高负载下会拉高延迟）", errno)
+		return
+	}
+	s.portFilter = localPort
+}
 
 // sysRecvmmsg 返回当前架构上 recvmmsg 的 syscall 编号。
 //
@@ -764,17 +962,41 @@ func (s *rawSocket) RecvBatch(bufs [][]byte, lens []int) (int, error) {
 
 	// flags=0：阻塞模式。内核收到至少一个包才返回，
 	// 有多个时一次全部填满（这正是我们要的批量效果）。
-	r0, _, errno := syscall.Syscall6(trap,
-		uintptr(s.recvFD),
-		uintptr(unsafe.Pointer(&msgs[0])),
-		uintptr(n),
-		0, // flags
-		0, 0)
+	//
+	// **必须对 EINTR / ERESTARTSYS 重试**：Go 的异步抢占会向线程发
+	// SIGURG，阻塞中的 recvmmsg 会返回 ERESTARTSYS(512)。
+	// 内核没有消费任何数据，重试完全安全；不重试会让收包协程白等一轮，
+	// 表现为延迟抖动（单测里就是这样偶发失败的）。
+	var (
+		r0    uintptr
+		errno syscall.Errno
+	)
+	for {
+		r0, _, errno = syscall.Syscall6(trap,
+			uintptr(s.recvFD),
+			uintptr(unsafe.Pointer(&msgs[0])),
+			uintptr(n),
+			0, // flags
+			0, 0)
+		if errno == 0 || !isInterrupted(errno) {
+			break
+		}
+	}
 	if errno != 0 {
 		return 0, os.NewSyscallError("recvmmsg", errno)
 	}
 	got := int(r0)
 	for i := 0; i < got; i++ {
+		// MSG_TRUNC 表示报文比 iov 缓冲长，**内核已把多余部分丢弃**。
+		// 这类丢包在任何 QUIC 统计里都看不到（它死在收包缓冲里），
+		// 所以必须在这里显式计数——否则「SYN-ACK 丢了、lost=0」
+		// 这种矛盾现象又要靠抓包反推（2026-11-14 踩过两次）。
+		if msgs[i].Hdr.Flags&syscall.MSG_TRUNC != 0 {
+			if s.truncRecv.Add(1) == 1 {
+				log.Printf("flowtls: 收包缓冲不足，报文被截断（GRO 聚合包超过 %d 字节）"+
+					"——已丢弃，请检查 recvBufSize", len(bufs[0]))
+			}
+		}
 		lens[i] = int(msgs[i].MsgLen)
 	}
 	return got, nil

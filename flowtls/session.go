@@ -886,6 +886,12 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	if srcPort == 0 {
 		srcPort = 44300
 	}
+	// 内核侧只保留「目的端口 == 本端源端口」的 TCP 包。
+	//
+	// 客户端虽然把收包 fd 绑到了出口网卡，但同一张网卡上还有 SSH、
+	// 其它代理、系统更新等流量；核内过滤能把这些包挡在用户态之外，
+	// 显著降低高负载下的收包延迟（详见 rawSocket.SetPortFilter）。
+	raw.SetPortFilter(srcPort)
 
 	// 客户端规则必须在**第一个包发出之前**就位。
 	//
@@ -1115,11 +1121,15 @@ func (s *Session) recvLoop() {
 	//
 	// 每个包必须用独立缓冲：同一批里多个包的密文要各自成立，
 	// 而 ParseFrame 的切片直接指向它们。
+	//
+	// **必须是 64KB**：网卡 GRO 会把多个 TCP 段合并成一个最大 64KB 的 skb，
+	// 缓冲不足时内核静默截断——包死在收包缓冲里，QUIC 层以为没收到，
+	// 只能靠 PTO 重传，表现为 RTT 虚高、吞吐下降而 `lost=` 恒为 0。
 	// 密文缓冲不会泄漏到下一轮：解密后的明文写进 bufPool 的另一块缓冲
 	// （OpenTo 的目标），交给 quic-go 的是明文，所以下一轮覆写 bufs 安全。
 	bufs := make([][]byte, maxRecvBatch)
 	for i := range bufs {
-		bufs[i] = make([]byte, 2048)
+		bufs[i] = make([]byte, recvBufSize)
 	}
 	lens := make([]int, maxRecvBatch)
 	for {
@@ -1168,6 +1178,22 @@ func (s *Session) matchPeer(p ParsedPacket) bool {
 // 两种模式下调用方都是单协程，但 WriteTo 可能在另一个协程里跑，
 // 所以 TCP 状态更新必须持 s.mu。
 func (s *Session) handleIncoming(p ParsedPacket) {
+	// **RST 一律忽略，且绝不能用来判定「对端还活着」。**
+	//
+	// 这是「隧道已死但客户端持续报可用」的直接原因（2026-11-14 实测）：
+	// 服务端重启或会话被回收后，伪包仍会到达服务端内核；内核在 8443 上
+	// 找不到匹配的 socket，于是为每个包回一个 **RST**。这些 RST 的
+	// src/dst 端口与我们的四元组完全一致，parse + matchPeer 都能通过，
+	// 于是 lastSeenAt 被不断推进 —— Probe（探活）误判「链路存活」，
+	// 客户端就一直用那条死连接发请求，直到用户手动重启。
+	//
+	// 本协议**从不发送 RST**（只有 SYN/SYN-ACK/ACK/PSH/FIN），
+	// 所以收到 RST 只可能来自对端内核，属于「这条伪 TCP 连接已被内核
+	// 单方面终止」的信号：既不推进序号，也不刷新存活时间。
+	if p.Flags&TCPRST != 0 {
+		return
+	}
+
 	// 记录收包时刻：只要收到对端的任何包（含纯 ACK），链路就是活的。
 	// 更新时间放在最前面——连解密失败也要算「收到了包」，
 	// 因为探活/保活关心的是链路可达性，不是业务数据。

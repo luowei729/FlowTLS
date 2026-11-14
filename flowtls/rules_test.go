@@ -83,39 +83,65 @@ func TestU32IgnoresIPIDLowByte(t *testing.T) {
 	}
 }
 
-// 服务端规则的关键要素：raw 表、PREROUTING、目标端口、u32、DROP。
+// 服务端规则的关键要素：目标端口、u32/DROP。
+//
+// 现在是 4 条（wscale SYN / conntrack INPUT / RST OUTPUT / IP ID 辅助），
+// 每一条都对应一个实测故障，见 rules.go 的注释。
 func TestServerRuleShape(t *testing.T) {
 	rules := ServerRules(8443, 0xF107)
-	if len(rules) != 2 {
-		t.Fatalf("服务端需要 2 条规则（wscale + IP ID），得到 %d", len(rules))
+	if len(rules) != 4 {
+		t.Fatalf("服务端需要 4 条规则，得到 %d", len(rules))
 	}
+	// IHL=5 的包：IP 头 20 + TCP 基础头 20 = 40，
+	// raw PREROUTING 看到的偏移在此基础上加。
 	for _, r := range rules {
-		assertServerRuleShape(t, r)
+		if r.Table != "raw" && r.Table != "" {
+			t.Fatalf("服务端规则必须在 raw 或 filter 表，实际 %q", r.Table)
+		}
+		add := strings.Join(r.Command("-A"), " ")
+		del := strings.Join(r.Command("-D"), " ")
+		if add == del {
+			t.Fatal("-A 与 -D 不能相同")
+		}
+		if strings.Replace(add, "-A ", "-D ", 1) != del {
+			t.Fatalf("增删命令除动作外必须完全一致：\nadd=%s\ndel=%s", add, del)
+		}
+		if !strings.HasSuffix(add, "-j DROP") {
+			t.Fatalf("规则应以 -j DROP 结束：%s", add)
+		}
+		if !strings.Contains(add, "8443") {
+			t.Fatalf("规则应匹配监听端口：%s", add)
+		}
 	}
 }
 
-func assertServerRuleShape(t *testing.T, r Rule) {
-	t.Helper()
-	if r.Table != "raw" {
-		t.Fatalf("服务端规则必须在 raw 表，实际 %q", r.Table)
+// 数据包的拦截必须靠连接状态机，不能靠 IP ID：
+// 客户端 NAT 会改写 IP ID（实测 IP ID 规则命中计数恒为 0）。
+func TestServerRuleDropsNonSynNew(t *testing.T) {
+	var found bool
+	for _, r := range ServerRules(8443, 0xF107) {
+		joined := strings.Join(r.Spec, " ")
+		if r.Chain == "INPUT" && strings.Contains(joined, "! --syn") &&
+			strings.Contains(joined, "--ctstate NEW") {
+			found = true
+		}
 	}
-	if r.Chain != "PREROUTING" {
-		t.Fatalf("服务端规则必须在 PREROUTING，实际 %q", r.Chain)
+	if !found {
+		t.Fatal("服务端必须有「非 SYN + ctstate NEW → DROP」规则来拦伪数据包")
 	}
-	// -A 与 -D 必须只差一个动作词，否则卸载会失败
-	add := strings.Join(r.Command("-A"), " ")
-	del := strings.Join(r.Command("-D"), " ")
-	if add == del {
-		t.Fatal("-A 与 -D 不能相同")
+}
+
+// 内核为伪数据包回的 RST 必须被挡住：每个下行包一个 RST 等于包量翻倍。
+func TestServerRuleDropsOutboundRST(t *testing.T) {
+	var found bool
+	for _, r := range ServerRules(8443, 0xF107) {
+		joined := strings.Join(r.Spec, " ")
+		if r.Chain == "OUTPUT" && strings.Contains(joined, "--tcp-flags RST RST") {
+			found = true
+		}
 	}
-	if strings.Replace(add, " -A ", " -D ", 1) != del {
-		t.Fatalf("增删命令除动作外必须完全一致：\nadd=%s\ndel=%s", add, del)
-	}
-	if !strings.HasSuffix(add, "-j DROP") {
-		t.Fatalf("规则应以 -j DROP 结束：%s", add)
-	}
-	if !strings.Contains(add, "--dport 8443") {
-		t.Fatalf("规则应匹配目标端口：%s", add)
+	if !found {
+		t.Fatal("服务端必须在 OUTPUT 链丢弃本端发出的 RST")
 	}
 }
 

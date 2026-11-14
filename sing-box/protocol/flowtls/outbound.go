@@ -108,10 +108,10 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	// 建连失败不阻断 sing-box 启动：链路抖动、服务器临时不可达很常见。
 	// 让请求来时再重试，比整体启动失败更符合代理软件的预期。
+	//
+	// 成功时的 Info 日志在 connect() 里打（那里才能区分「首次建立」与「重建」）。
 	if _, err := o.channel(o.ctx); err != nil {
 		o.logger.Error("flowtls 初始建连失败，将在首个请求时重试: ", err)
-	} else {
-		o.logger.Info("flowtls 通道已建立")
 	}
 	scope.Add(o.Close)
 	return nil
@@ -220,26 +220,44 @@ func (o *Outbound) connect() error {
 	// （源地址被替换成网卡地址意味着配置里写的是 NAT 公网地址）。
 	o.logger.Debug("flowtls 发送路径: ", c.SendMode())
 	o.mu.Lock()
+	// 已经被替换过说明这是重建（旧通道失效）：必须留 Info。
+	// 重建是低频但关键的事件，运维需要能从事后日志里看出
+	// 「什么时刻重新握过手」——否则只能看到「请求突然快了一下」。
+	rebuild := o.client != nil
 	o.client = c
 	o.mu.Unlock()
+	if rebuild {
+		o.logger.Info("flowtls 通道已重建（旧通道失效）")
+	} else {
+		o.logger.Info("flowtls 通道已建立")
+	}
 	return nil
 }
 
 // idleProbeThreshold 是触发探活的空闲阈值。
 //
-// 取值贴近保活周期（5s）：误判的代价只有一个 RTT（多探一次），
-// 漏判的代价是首个请求卡 15~30s。取舍偏向「多探」。
-const idleProbeThreshold = 5 * time.Second
+// 取 2s（比保活周期 10s 小得多）是实测取舍：
+//   - 误判代价 = 一次探活（1 个 RTT，约 73ms），可忽略；
+//   - 漏判代价 = 用户请求卡在死连接上，直到 idle 超时（实测 11.4s）。
+// 用户操作间隔通常 ≥ 数秒，因此几乎每次都会先探活——那 73ms 远小于
+// 「卡十几秒」的体验差异。
+const idleProbeThreshold = 2 * time.Second
 
-// probeTimeout 是单次探活的等待上限。1 个 RTT 就够，跨境 200ms 留 1.5s 很宽松。
-const probeTimeout = 1500 * time.Millisecond
+// probeTimeout 是单次探活的等待上限。
+//
+// 400ms = 链路 RTT（73ms）的 5 倍，足以完成一次往返 + 调度抖动。
+// 旧值 1s 在「服务端重启」这类场景下直接变成用户可感知的卡顿：
+// 实测重建链路的耗时由 probeTimeout + openStreamTimeout 叠加而成，
+// 各降一半后首个请求从 6.9s 降到约 3s。
+const probeTimeout = 400 * time.Millisecond
 
 // openStreamTimeout 是开一条流的超时上限。
 //
 // 健康连接开流只需微秒级（等的是流控额度，不是网络往返）。
-// 8 秒还没开出来，几乎必然是「连接已死但 quic-go 尚未检测到」——
-// 此时不要耗光调用方的全部预算，留给重建后的第二次尝试。
-const openStreamTimeout = 8 * time.Second
+// 取 1s：这个超时只在「连接已死但 quic-go 尚未检测到」时触发，
+// 而触发后还要加一次重建（实测 ~1.5s）。旧值 8s 让用户首个请求等 11.4s。
+// 1s 对真实慢链路（流控额度等待）仍有 13 倍于 RTT 的余量。
+const openStreamTimeout = time.Second
 
 // channel 返回可用的 QUIC 通道，必要时建连。**这是唯一的获取入口。**
 //
@@ -266,7 +284,8 @@ func (o *Outbound) channel(ctx context.Context) (*ftquic.Client, error) {
 			default:
 			}
 			if c.IdleFor() > idleProbeThreshold && !c.Probe(ctx, probeTimeout) {
-				o.logger.Debug("flowtls 探活失败，重建通道")
+				o.logger.Info("flowtls 探活失败（空闲 ", c.IdleFor().Round(time.Millisecond),
+					"），重建通道")
 				o.drop(c)
 				continue
 			}

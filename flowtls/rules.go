@@ -136,20 +136,29 @@ func U32WScaleExpr() string {
 	return fmt.Sprintf("0x%02x&0xffffffff=0x010303%02x", 56, WScale)
 }
 
-// ServerRules 返回服务端需要的规则：把发往监听端口的伪包在内核 TCP 栈之前 DROP。
+// ServerRules 返回服务端需要的规则。
 //
-// **两条规则按 wscale 匹配**（主，顺序即优先级）：
-//  1. 纯 SYN：偏移 56 的 4 字节 = NOP + wscale(12)，见 U32WScaleExpr；
-//  2. 带载荷的数据包：没有 wscale 选项，靠 IP ID 高字节匹配（辅助）。
+// 四条规则，各解决一个具体问题（顺序即优先级）：
 //
-// 为什么把 wscale 放在前面：同端口可能开着伪装网站（内核 listener），
-// 一旦内核收到伪 SYN 就会回自己的 SYN-ACK，与 flowtls 的 SYN-ACK 抢同一个
-// 四元组。实测客户端会同时收到两个不同 ISN 的 SYN-ACK，表现为
-// 「偶发 3×RTT 握手延迟 + 连接状态抖动」。IP ID 规则在这条链路上不可靠
-// （见 U32IPIDExpr 注释），必须有一条不依赖它的规则兜住 SYN。
+//  1. raw/PREROUTING：伪 **SYN** 在内核建 socket 之前丢弃。
+//     匹配依据是 wscale=12 —— 唯一不会被 NAT 改写的分流特征。
+//     （IP ID 会被客户端 NAT 改写，实测该规则的命中计数恒为 0。）
 //
-// 数据包（带载荷）用 IP ID 匹配仍然可靠：那是**反方向**流量，
-// 由本机发出、不经过运营商 NAT，IP ID 完整保留。
+//  2. filter/INPUT：伪 **数据包** 丢弃。
+//     数据包没有稳定静态特征（TCP 选项、窗口、TTL 都与真实浏览器重合），
+//     但它们有一个**状态机特征**：真实浏览器完成过三次握手，
+//     conntrack 里是 ESTABLISHED；伪连接的 SYN 已在第 1 步被丢弃，
+//     所以数据包到达时 conntrack 视其为 NEW。
+//     因此 `! --syn + ctstate NEW` 精确命中伪数据包，且不影响真实流量。
+//
+//  3. filter/OUTPUT：内核为伪数据包回的 RST **不出网卡**。
+//     即使前两条有漏网，RST 也会被这条拦住——每个下行包引出一个 RST
+//     等于把包量翻倍，还会让云网关的反 DDoS 把小包限速。
+//
+//  4. raw/PREROUTING：按 IP ID 高字节匹配（辅助，仅当链路不改写 IP ID 时有效）。
+//
+// **不要删除第 2、3 条**：它们不依赖任何可被中间设备改写的字段，
+// 是「分流在真实链路上成立」的最后保证。
 func ServerRules(port, magic uint16) []Rule {
 	portStr := strconv.Itoa(int(port))
 	return []Rule{
@@ -162,6 +171,26 @@ func ServerRules(port, magic uint16) []Rule {
 				"--tcp-flags", "SYN,ACK", "SYN",
 				"-m", "u32",
 				"--u32", U32WScaleExpr(),
+				"-j", "DROP",
+			},
+		},
+		{
+			Chain: "INPUT",
+			Spec: []string{
+				"-p", "tcp",
+				"--dport", portStr,
+				"!", "--syn",
+				"-m", "conntrack",
+				"--ctstate", "NEW",
+				"-j", "DROP",
+			},
+		},
+		{
+			Chain: "OUTPUT",
+			Spec: []string{
+				"-p", "tcp",
+				"--sport", portStr,
+				"--tcp-flags", "RST", "RST",
 				"-j", "DROP",
 			},
 		},
