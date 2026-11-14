@@ -20,37 +20,26 @@ name: Build
 
 on:
   push:
-    branches: [main, legacy-rust]
     tags: ["v*"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - ".github/**"
-      - "!.github/workflows/build.yml"
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
   workflow_dispatch:
     inputs:
       version:
         description: "版本名（留空则用 VERSION 文件）"
         required: false
         type: string
+      publish:
+        description: "所有架构构建通过后创建正式 GitHub Release"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  # tag 构建不取消：发布被打断比多花几分钟更糟。
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # 构建和发布均不因同一版本的重试被取消。
+  cancel-in-progress: false
 
 permissions:
   contents: read
-
-env:
-  # 必须与 sing-box/go.mod 的 go directive 完全一致，
-  # 否则 sagernet/sing 的 pseudoversion 会对不上（AGENTS.md 第 9 条）。
-  GO_VERSION: "1.25.5"
 
 jobs:
   # ------------------------------------------------------------ 版本号（唯一来源）
@@ -89,7 +78,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
           # 缓存显式接管，原因见「缓存」注释。
           cache: false
 
@@ -150,23 +139,35 @@ jobs:
 
   # ------------------------------------------------------------------ 发行版构建
   build:
-    name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.gomips && format('/{0}', matrix.gomips) }}
-    needs: calculate_version
+    name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix && format('/{0}', matrix.suffix) }}
+    needs: [calculate_version, test]
     runs-on: ubuntu-latest
     strategy:
       # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
       fail-fast: false
       matrix:
-        # 平台清单对着上游 sing-box 的发行矩阵裁掉不需要的：
-        # 保留主流架构，去掉 s390x / ppc64le / riscv64 / loong64
-        # （上游有，但 FlowTLS 没有这类部署场景，多一个平台就多一份维护）。
+        # Linux 架构覆盖 sing-box 的主要服务器、软路由和 NAS 目标；
+        # 非 Linux 目标保留现有可交叉编译平台。Android 不发布：FakeTCP 需要 Linux raw socket。
         include:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
-          - { goos: linux, goarch: arm, goarm: "7" }
+          - { goos: linux, goarch: arm, goarm: "5", suffix: "v5" }
+          - { goos: linux, goarch: arm, goarm: "6", suffix: "v6" }
+          - { goos: linux, goarch: arm, goarm: "7", suffix: "v7" }
           - { goos: linux, goarch: "386", go386: sse2 }
-          - { goos: linux, goarch: mipsle, gomips: softfloat }
-          - { goos: linux, goarch: mips64le, gomips: hardfloat }
+          - { goos: linux, goarch: "386", go386: softfloat, suffix: "softfloat" }
+          - { goos: linux, goarch: mips, gomips: hardfloat, suffix: "hardfloat" }
+          - { goos: linux, goarch: mips, gomips: softfloat, suffix: "softfloat" }
+          - { goos: linux, goarch: mipsle, gomips: hardfloat, suffix: "hardfloat" }
+          - { goos: linux, goarch: mipsle, gomips: softfloat, suffix: "softfloat" }
+          - { goos: linux, goarch: mips64, gomips64: hardfloat, suffix: "hardfloat" }
+          - { goos: linux, goarch: mips64, gomips64: softfloat, suffix: "softfloat" }
+          - { goos: linux, goarch: mips64le, gomips64: hardfloat, suffix: "hardfloat" }
+          - { goos: linux, goarch: mips64le, gomips64: softfloat, suffix: "softfloat" }
+          - { goos: linux, goarch: ppc64le }
+          - { goos: linux, goarch: s390x }
+          - { goos: linux, goarch: riscv64 }
+          - { goos: linux, goarch: loong64 }
 
           - { goos: windows, goarch: amd64 }
           - { goos: windows, goarch: "386" }
@@ -181,7 +182,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
           cache: false
 
       - name: 恢复 Go 缓存
@@ -217,7 +218,7 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GO386: ${{ matrix.go386 }}
           GOMIPS: ${{ matrix.gomips }}
-          GOMIPS64: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips64 }}
         run: |
           set -xeuo pipefail
           mkdir -p ../dist
@@ -250,12 +251,11 @@ jobs:
         run: |
           set -xeuo pipefail
           DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ -n "${{ matrix.goarm }}" ]; then
-            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
-          elif [ -n "${{ matrix.go386 }}" ] && [ "${{ matrix.go386 }}" != "sse2" ]; then
-            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
-          elif [ -n "${{ matrix.gomips }}" ] && [ "${{ matrix.gomips }}" != "hardfloat" ]; then
-            DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
+          if [ -n "${{ matrix.suffix }}" ]; then
+            case "${{ matrix.goarch }}" in
+              arm) DIR_NAME="${DIR_NAME}${{ matrix.suffix }}" ;;
+              *) DIR_NAME="${DIR_NAME}-${{ matrix.suffix }}" ;;
+            esac
           fi
           echo "DIR_NAME=${DIR_NAME}" >> "$GITHUB_ENV"
 
@@ -280,7 +280,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.gomips && format('-{0}', matrix.gomips) }}
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix && format('-{0}', matrix.suffix) }}
           # 用多行 block scalar 而不是压成一行：upload-artifact 的 path
           # 每行一个 glob，这里是两个。别写成 "a b"——那会被当成一个路径。
           path: |
@@ -292,9 +292,9 @@ jobs:
   # ---------------------------------------------------------------------- 发布
   release:
     name: 发布 Release
-    needs: [calculate_version, build]
-    # 只在 tag 上跑：push 到 main 只产出 artifact，不建 Release。
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [calculate_version, test, build]
+    # tag push 和上游同步后的显式 dispatch 都在全部矩阵成功后正式发布。
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -320,6 +320,8 @@ jobs:
       - name: 生成 Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', needs.calculate_version.outputs.version) }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip

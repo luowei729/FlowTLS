@@ -6,8 +6,8 @@ name: CI
 # 分层原则：按「能不能在没有特权的情况下跑」划分
 #
 #   verify / test  —— 普通 runner，几十秒到几分钟，是每次 push 的必过关卡
-#   build (matrix) —— 多架构发行版，产物直接上传供下载
-#   release        —— 打 tag 时把 matrix 的产物汇总成一个 Release
+#   build (matrix) —— 分支/PR 多架构编译检查，产物仅作为短期 Actions artifact
+#   release        —— 由 build.yml 独立负责正式 tag Release
 #   e2e            —— 需要 CAP_NET_RAW，只能自托管，靠标签 opt-in
 #
 # 缓存为什么不用 setup-go 自带的（cache: false）
@@ -21,7 +21,6 @@ name: CI
 on:
   push:
     branches: [main, legacy-rust]
-    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -35,11 +34,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # 版本必须与 sing-box 的 go.mod 完全一致，
-  # 否则 sagernet/sing 的 pseudoversion 会对不上（见 AGENTS.md 第 9 条）。
-  GO_VERSION: "1.25.5"
-
 jobs:
   # ---------------------------------------------------------------- 快速关卡
   verify:
@@ -52,7 +46,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
           cache: false
 
       - name: 恢复 Go 缓存
@@ -120,7 +114,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
           cache: false
 
       - name: 恢复 Go 缓存
@@ -190,7 +184,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
           cache: false
 
       - name: 恢复 Go 缓存
@@ -229,55 +223,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # -------------------------------------------------------------------- 发布
-  release:
-    name: 发布 Release
-    needs: [verify, build]
-    # 只在 tag 上跑：push 到 main 只产出 artifact，不建 Release。
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 下载全部产物
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          # 每个 artifact 单独一个目录，展开时不会互相覆盖。
-          merge-multiple: false
-
-      - name: 展平并生成校验和
-        run: |
-          mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
-          cd release
-          ls -lh
-          # sha256 是发布物的最低要求：用户下载后要能自己验证完整性。
-          sha256sum sing-box-* > sha256sum.txt
-          cat sha256sum.txt
-
-      - name: 生成 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/sing-box-*
-            release/sha256sum.txt
-          draft: false
-          prerelease: false
-          body: |
-            `sing-box $(cat VERSION)` — FlowTLS rev 发行版。
-
-            与官方版的唯一区别是版本号后缀 `-rev.N` 与内置的 `with_flowtls` 协议；
-            二进制名保持 `sing-box`，配置格式完全兼容。
-
-            校验完整性：
-
-            ```
-            sha256sum -c sha256sum.txt
-            ```
-
   # ------------------------------------------------------- 真链路（自托管）
   e2e:
     name: 真链路矩阵（自托管，需 CAP_NET_RAW）
@@ -290,7 +235,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: sing-box/go.mod
 
       - name: 真链路矩阵
         run: bash docs/e2e_matrix.sh

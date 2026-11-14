@@ -4,9 +4,12 @@
 > 面向跨境高丢包链路的 TCP 伪装代理。
 
 **实现状态**：主分支只维护 Go 实现，形态是 **sing-box 的一个独立协议库**
-（与 hysteria2 / anytls 平级），发行版为 `sing-box 1.14.4-rev.N`。
+（与 hysteria2 / anytls 平级），发行版为 `sing-box <上游版本>-rev.N`。
 最早验证协议的 Rust 实现已冻结在 `legacy-rust` 分支，仅作参考实现与历史记录
 （详见 [`docs/EVOLUTION.md`](docs/EVOLUTION.md)）。
+
+正式版由 GitHub Actions 自动打包发布，并每 6 小时检查 sing-box `stable`
+分支与最新正式 Release；上游更新后会同步源码、对齐关键依赖并发布全架构产物。
 
 ## 它解决什么问题
 

@@ -3456,3 +3456,19 @@ connection download closed: stream N canceled by remote with error code 0
 
 只有出现 `by remote` 但客户端没有对应的 `by local`、或者错误码不是 0、
 或者同时有握手失败，才值得再查。
+
+## 115. sing-box 上游自动同步与正式发布（2026-11-14 20:00）
+
+`.github/workflows/upstream-sync.yml` 每 6 小时检查上游 `stable` 分支和最新正式
+Release。源码变化同步 subtree；版本按 `<上游版本>-rev.N` 递增，新上游正式版本从
+`rev.1` 开始。同步后同时更新 Go directive 和三个必须与 sing-box 对齐的依赖。
+
+上游 subtree 使用三方合并：不冲突的本项目定制会保留；同一代码块冲突时命令失败，
+workflow 不会推送或发布，需人工解决后重跑。只有已推送到 `main` 的本地定制才会
+出现在 Actions runner 上。不要用强制覆盖或 `git checkout` 丢弃冲突文件。
+
+同步 workflow 通过 `GITHUB_TOKEN` 推送 main 后，GitHub 不会因该 push 自动触发
+其他 workflow，所以它显式 dispatch `build.yml`。Build 先跑测试和全架构矩阵，
+全部成功后才创建 tag 和正式（非 prerelease）Release。轮询检查无源码更新时，
+已有 Release 就退出；当前版本尚无 Release（首次发布或上次失败）则再次派发构建。
+Android 不纳入矩阵：FakeTCP 需要 Linux raw socket。

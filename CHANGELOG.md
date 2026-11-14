@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-11-14 20:00 (北京时间)
+
+### 新增：自动跟随 sing-box stable 并发布全架构正式版
+
+新增 `upstream-sync.yml`，每 6 小时轮询 sing-box `stable` 与最新正式 Release。
+检测到源码或正式版本变化后同步 subtree、按 `<上游版本>-rev.N` 更新版本、
+对齐 Go 版本及 `quic-go` / `sing` / `sing-quic` 依赖，再派发 Build workflow。
+
+Build workflow 覆盖 Linux 主流服务器/软路由架构及现有 Windows、macOS、FreeBSD
+目标。全部测试与架构构建通过后才创建 tag 和非 prerelease GitHub Release，
+附带 LICENSE、压缩包和 SHA-256。CI 不再重复创建 Release。
+本地定制通过 subtree 三方合并保留；同一位置冲突时自动同步停止，不覆盖、不发布。
+
 ## 2026-11-14 19:16 (北京时间)
 
 ### 核对：测速期间两端日志里的 ERROR 不是故障

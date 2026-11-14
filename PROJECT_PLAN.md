@@ -301,3 +301,14 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 
 不再把「Go 稳定慢一倍」当成未解决项。30 分钟长稳定性仍未单独跑过，
 上面这三段各 90 秒不能替代它。
+
+### 正式发行自动化（2026-11-14 20:00）
+
+- `Sync sing-box stable` 每 6 小时检查上游 `stable` 分支和最新正式 Release。
+- 源码有变化时用 subtree 三方合并；项目定制不冲突时保留，冲突时失败关闭并等待人工处理。
+- 按 `<上游版本>-rev.N` 递增发行版本，并把 `flowtls/go.mod` 的 Go、`quic-go`、
+  `sing`、`sing-quic` 对齐到 vendored sing-box。
+- `Build` 在测试通过后构建完整架构矩阵，矩阵全绿后才创建 Git tag 和正式 Release。
+- 只有推送到 `main` 的提交会进入 Actions；未提交的本地修改不会被自动同步。
+- Linux 覆盖 amd64、arm、386、MIPS/MIPS64、PPC64LE、s390x、riscv64、loong64；
+  另保留 Windows、macOS、FreeBSD 的现有目标。Android 不发布，因为 FakeTCP 依赖 Linux raw socket。
