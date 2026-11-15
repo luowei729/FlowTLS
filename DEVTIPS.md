@@ -3518,9 +3518,12 @@ git push --force --all && git push --force --tags
 
 1. **`git grep -I` 会把二进制当「无匹配」跳过**。第一次扫私钥时带了 `-I`，
    结果是假阴性；换 `grep -a` 才看到内容。扫「有没有私钥」时不能用 `-I`。
-2. **纯数字参数不能裸替换**。`7687` / `44312` 在 commit、tree、blob 的 SHA 和
-   `go.mod` 的伪版本校验和里到处都是，直接 `7687==>30583` 会把依赖哈希改坏。
-   只能用锚定正则：`regex:ip_id_mark:\s*7687`、`regex:source_port:\s*44312`。
+2. **纯数字参数不能裸替换**。`ip_id_mark` 与 `source_port` 的值都是纯数字，
+   而同样的数字在 commit/tree/blob 的 SHA 和 `go.mod` 的伪版本校验和里到处都是，
+   直接裸替换会把依赖哈希改坏。只能用锚定正则：
+   `regex:ip_id_mark:\s*<旧值>`、`regex:source_port:\s*<旧值>`。
+   （本节刻意不再写出真实旧值——讲脱敏的文档自己写回真实值，
+   等于换个地方泄露。）
 3. **commit message 也会泄露**。本次有一条 message 写着「CloudFlare Origin CA
    真证书（通配真实域名）」，blob 全干净了它还在，必须配 `--message-callback`。
 4. **强推后旧对象仍可读**。`raw.githubusercontent.com/<owner>/<repo>/<旧SHA>/…`

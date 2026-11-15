@@ -23,6 +23,15 @@ var (
 	benchDstIP = netip.MustParseAddr("198.51.100.20")
 )
 
+// benchSrcPort / benchDstPort 是基准用的占位端口。
+//
+// **不能用真实部署的 source_port**：客户端的固定源端口是 5 元组指纹的
+// 一部分（AGENTS 约束 18），文档与测试统一用 44333（占位值）。
+const (
+	benchSrcPort = 44333
+	benchDstPort = 8443
+)
+
 // BenchmarkBuildPacketInto 是最小构包：数据包（带 TS 选项）。
 func BenchmarkBuildPacketInto(b *testing.B) {
 	payload := make([]byte, benchPayloadSize)
@@ -43,7 +52,7 @@ func BenchmarkBuildPacketInto(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// 模拟热路径：seq 每包推进，其余不变
 		seg.Seq += uint32(benchPayloadSize)
-		out = BuildPacketInto(out[:0], benchSrcIP, benchDstIP, 44312, 8443, seg)
+		out = BuildPacketInto(out[:0], benchSrcIP, benchDstIP, benchSrcPort, benchDstPort, seg)
 	}
 	_ = out
 }
@@ -66,7 +75,7 @@ func BenchmarkBuildPacketIntoSmall(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out = BuildPacketInto(out[:0], benchSrcIP, benchDstIP, 44312, 8443, seg)
+		out = BuildPacketInto(out[:0], benchSrcIP, benchDstIP, benchSrcPort, benchDstPort, seg)
 	}
 	_ = out
 }
