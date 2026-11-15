@@ -157,7 +157,7 @@ net:
     {
       "type": "mixed",
       "tag": "mixed-in",
-      "listen": "127.0.0.1",
+      "listen": "0.0.0.0",
       "listen_port": 1080,
       "users": [{ "username": "admin", "password": "abcd1234" }]
     }

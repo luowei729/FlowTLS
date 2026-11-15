@@ -257,7 +257,7 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
     {
       "type": "mixed",
       "tag": "mixed-in",
-      "listen": "127.0.0.1",
+      "listen": "0.0.0.0",
       "listen_port": 1080,
       "users": [{ "username": "admin", "password": "abcd1234" }]
     }
@@ -284,6 +284,13 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json
 curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
 curl -x http://admin:abcd1234@127.0.0.1:1080 https://www.google.com
 ```
+
+> **入口必须监听 `0.0.0.0`，不要写 `127.0.0.1`。**
+> 写回环时只有本机能连，局域网里的手机/平板/另一台电脑、Docker 容器、
+> WSL、虚拟机统统连不上——而现象只是「连接被拒」，`sing-box check`
+> 不会报任何问题，很容易误判成隧道坏了。
+> 代价是入口对整个局域网可达，所以上面 `users` 的口令**必须改掉示例值**；
+> 只需要本机用时，用防火墙把 1080 限到可信网段，而不是改回 `127.0.0.1`。
 
 `mixed` 是 sing-box 自带的入口，还能直接换成 `tun`（全局代理）、
 `redirect`、`tproxy` 等，不需要改 flowtls 任何代码。

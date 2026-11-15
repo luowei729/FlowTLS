@@ -3787,3 +3787,32 @@ var allowedQdiscBypassDrivers = map[string]bool{"virtio_net": true}
 3. **绕开内核拷贝**——`AF_PACKET` 的 TX_RING（mmap 零拷贝环），
    能省掉每包一次 skb 分配 + 用户态→内核拷贝，但工程量与风险都大得多，
    且 TX_RING 满了会直接丢包，需要自己处理背压。
+
+## 128. 本地入口一律 `0.0.0.0`，写回环 = 只有本机能连（2026-11-15 14:35）
+
+这条是**部署要求**，不是风格偏好，写进 `AGENTS.md` 约束 19。
+
+写 `"listen": "127.0.0.1"` 的后果：
+
+| 使用场景 | 结果 |
+|---|---|
+| 本机浏览器 / curl | ✅ 正常 |
+| 局域网里的手机、平板、另一台电脑 | ❌ 连不上 |
+| Docker 容器（`host.docker.internal` / 网桥 IP） | ❌ 连不上 |
+| WSL2 / Hyper-V 虚机 | ❌ 连不上 |
+| 手机热点共享给本机再用 | ❌ 连不上 |
+
+**为什么容易被误判**：现象只有「Connection refused」，`sing-box check`
+完全通过，客户端日志里隧道看起来一切正常（`通道已建立`）。于是第一反应
+是「隧道坏了」或「服务端挂了」，实际只是入口没监听在可达地址上。
+
+代价必须讲清：绑 `0.0.0.0` 等于把带口令的 SOCKS5/HTTP 入口开放给整个
+局域网。所以两条一起做：
+
+1. `users` 里的口令**必须改掉示例值**（它与外层 AEAD 的 `password`
+   是两套东西：前者是本地入口凭据，后者是隧道密钥）；
+2. 只需要本机时，用防火墙限网段（`iptables -A INPUT -p tcp --dport 1080
+   ! -s 192.168.0.0/16 -j DROP`），**不要**改回 `127.0.0.1`。
+
+已同步：`deploy.example/client.json`、`README.md`、`docs/MIGRATION.md`、
+`AGENTS.md` 约束 19。
