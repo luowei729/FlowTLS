@@ -1,5 +1,67 @@
 # CHANGELOG
 
+## 2026-11-15 22:45 (北京时间)
+
+### 发布：v1.14.4-rev.5（Windows 自动放行防火墙，用户零配置）
+
+**wire format 未改动**（仍是 v3），与 rev.3 / rev.4 双向兼容，Linux 侧行为未变。
+
+#### 新增：启动时自动放行入站代理端口
+
+之前文档写着「Windows 不需要任何防火墙规则」，那句话**只对伪包分流成立**
+（WinDivert 挂在 WFP 入站 IP 包层，子层权重最高，在防火墙过滤之前）。
+但 inbound 是真正的内核 TCP socket，从局域网连进来会被防火墙**静默丢弃**——
+而手机、电视、另一台电脑共享代理正是最常见的用法。
+
+现在启动时自动写一条入站放行规则：
+
+- 按**程序**放行（不是按端口），所以 mixed / socks / http 各种 inbound、
+  以及用户改端口都不用重建规则；
+- 覆盖域 / 专用 / 公用三种网络（`profile=any`），换到酒店或咖啡馆 Wi-Fi 也
+  不用重新配置；
+- 每次启动先删后建（幂等），可执行文件换目录后规则自动指向新路径；
+- **不会弹「是否允许访问网络」的框**，用户什么都不用点。能这么做是因为加载
+  WinDivert 驱动本就要求管理员，进程一定有权写规则，只要规则在任何 `listen()`
+  之前就存在。
+
+失败不致命：伪包隧道不依赖它，只打一条告警。
+
+#### 位置约束（重要）
+
+放行调用必须在 `box.start()` 里、inbound 启动之前：
+
+- 放构造函数里会让 `sing-box check` 也要求管理员权限（它只走 `New()` + `Close()`，
+  不走 `Start()`）；真机验证 `check` 后规则数为 0，约束保住；
+- 放 inbound 启动之后就晚了，Windows 已经弹过框。
+
+#### 真机验证
+
+| 场景 | 结果 |
+|---|---|
+| 删光规则 → 启动 | 规则自动出现（1 条，`profile=Any`，指向本 exe） |
+| 从局域网 `10.0.0.2:1099` 连 | 无规则时超时；有规则时 `http=200`，0.46s |
+| 连续启动两次 | 始终 1 条规则，不重复累积 |
+| 安装在 `C:\Program Files\FlowTLS Test\`（含空格） | 规则创建成功，局域网 200 |
+| `sing-box check` | exit 0，创建 0 条规则（不需要管理员） |
+
+详见 `DEVTIPS.md` 第 143、144 条。
+
+#### 新增文件
+
+| 文件 | 说明 |
+|---|---|
+| `flowtls/firewall_windows.go` | netsh 写规则（域/专用/公用全覆盖） |
+| `flowtls/firewall_stub.go` | 非 Windows 空实现（签名逐字对齐） |
+| `sing-box/common/flowtlsfw/flowtlsfw.go` | 适配层入口（`with_flowtls`） |
+| `sing-box/common/flowtlsfw/flowtlsfw_stub.go` | 未编入 flowtls 时为空操作 |
+
+#### 补丁点
+
+`sing-box/box.go` 两处：import 一行、`start()` 里一行调用。**不能用 `include`
+包**——`include/registry.go` 反过来 import 了根包，从 `box.go` 引 `include` 会
+构成 import cycle。所以放在 `common/flowtlsfw` 这个只依赖 flowtls core 与 log
+的独立小包里。
+
 ## 2026-11-15 22:00 (北京时间)
 
 ### 发布：v1.14.4-rev.4（Windows 客户端真机可用）

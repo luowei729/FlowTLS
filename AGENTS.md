@@ -75,7 +75,8 @@ flowtls/                    独立 Go 模块 github.com/luowei729/flowtls
   windivert_filter_test.go  9 个字节级单测（在 Linux 上就能跑）
   windivert_windows.go      驱动句柄 / IOCTL / 驱动安装
   windivert_assets/         随二进制内嵌的 WinDivert 驱动（LGPLv3）
-  rules_windows.go          Windows 不需要防火墙规则（扣留语义的副产品）
+  rules_windows.go          Windows 不需要 iptables（扣留语义的副产品，仅指伪包分流）
+  firewall_windows.go       ← 自动放行入站代理端口（netsh，域/专用/公用全覆盖）
   session.go                单条会话，net.PacketConn 语义
   listener.go               服务端：共享 raw socket + 单收包协程 + 四元组分发
   rules.go                  iptables 规则构造（u32 匹配 IP ID 标记）+ auto/none

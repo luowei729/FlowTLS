@@ -298,6 +298,22 @@ try {
         Write-Skip 'WinDivert driver registered' 'no WinDivert* entry in Win32_SystemDriver yet'
     }
 
+    # The program writes its own inbound allow rule at startup, so a LAN client
+    # (phone, TV, another PC) can use the proxy without the user touching the
+    # firewall. Note this is separate from packet capture: WinDivert sits before
+    # the firewall, so the tunnel itself never needed a rule.
+    $fw = @(Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq 'FlowTLS' })
+    if ($fw.Count -gt 0) {
+        $names = @()
+        foreach ($r in $fw) {
+            $names += ('enabled=' + [string]$r.Enabled + ' profile=' + [string]$r.Profile + ' action=' + [string]$r.Action)
+        }
+        Write-Result 'Inbound firewall rule' ($fw[0].Enabled -eq 'True') ($names -join '; ')
+    } else {
+        Write-Result 'Inbound firewall rule' $false 'no rule named FlowTLS; LAN clients will be blocked (silently)'
+    }
+
     # ------------------------------------------------------------- end to end
 
     Write-Section 'end to end'

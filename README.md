@@ -343,7 +343,7 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    | 平台 | 状态 | 收发路径 |
    |---|---|---|
    | Linux | ✅ 完整验证 | `AF_PACKET` 收 + `IPPROTO_RAW` 发，需 iptables |
-   | Windows amd64/386（客户端） | ✅ 真机验证 | WinDivert 驱动，无需规则 |
+   | Windows amd64/386（客户端） | ✅ 真机验证 | WinDivert 驱动，无需 iptables |
    | Windows（服务端） | ⚠️ 代码完成，未真机验证 | 同上；伪装站依赖重新注入路径 |
    | macOS / FreeBSD | ❌ 只能编译 | 无等价能力，构造即失败 |
 
@@ -351,6 +351,18 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    下载实测约 12 MB/s（同链路 Linux 客户端同一量级）。
    **Windows 服务端未验证**——它比客户端多一条「把非本协议包还给内核」的路径
    （伪装站共存），那段代码没有在真机上执行过。
+
+   **防火墙不用管**：启动时程序自己写一条入站放行规则（`netsh`，按程序而不是
+   按端口，覆盖域/专用/公用三种网络），因此**不会弹「是否允许访问网络」的框**，
+   也不需要用户去开端口。能这么做是因为加载 WinDivert 驱动本来就要求管理员，
+   进程一定有权写规则。
+
+   规则在每次启动时先删后建（幂等），所以可执行文件换目录后不需要手工清理旧规则。
+   卸载时删掉：
+
+   ```powershell
+   netsh advfirewall firewall delete rule name=FlowTLS
+   ```
 
    部署前用脚本自检：
 
@@ -373,6 +385,7 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
 5. **需要 root / 管理员权限**
    Linux：raw socket、`AF_PACKET` 需要 root 或 `CAP_NET_RAW`，iptables 同理。
    Windows：加载 WinDivert 驱动需要管理员（`ERROR_ACCESS_DENIED`）。
+   同一个权限也被用来写防火墙放行规则（见上一条），所以用户不需要额外操作。
 
 6. **默认避开 443 端口**
    国内出口设备对 443 的伪造 TCP 检查更严，建议 8443 / 9443。

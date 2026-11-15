@@ -13,6 +13,7 @@ import (
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/certificate"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/flowtlsfw"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/netns"
 	"github.com/sagernet/sing-box/common/taskmonitor"
@@ -603,6 +604,12 @@ func (s *Box) start() error {
 		}
 		s.scope.Add(s.ntpService.Close)
 	}
+	// Modified by FlowTLS: 在任何 inbound 开始 listen 之前放行 Windows 防火墙
+	// （2026-11-15）。必须在这个位置：
+	//   - 放在 New() 里会让 `sing-box check` 也要管理员权限；
+	//   - 放在 inbound 启动之后就晚了，Windows 已经弹过「是否允许访问」的框。
+	// 非 Windows 平台、以及未编入 flowtls 的构建都是空操作。
+	flowtlsfw.EnsureWindowsInboundAllowed(s.logger)
 	err = s.startComponents(adapter.StartStateStart,
 		boxComponent{"endpoint", s.endpoint},
 		boxComponent{"certificate-provider", s.certificateProvider},
