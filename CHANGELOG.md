@@ -1,5 +1,86 @@
 # CHANGELOG
 
+## 2026-11-15 17:45 (北京时间)
+
+### 发布 v1.14.4-rev.3 —— **破坏性变更：wire format v3，两端必须同时升级**
+
+`VERSION` 升到 `1.14.4-rev.3`。相对 rev.2 的全部改动（也是 rev.3 的发行说明）：
+
+#### ⚠️ 破坏性：wire format v2 → v3
+
+外层 AEAD 从 **ChaCha20-Poly1305 换成 AES-128-GCM**，密钥 32→16 字节，
+HKDF 的 salt/info 同步改为 v3（`flowtls-faketcp-v3`）。
+nonce(12)/tag(16) 长度不变，**记录布局一字未改**。
+
+**rev.2 与 rev.3 不能互通**，服务端与客户端必须同时升级。
+升级顺序建议：先升客户端（会连不上），或先升服务端（老客户端连不上）——
+没有平滑过渡，只能同时切。
+
+理由（`codec_bench_test.go`，1332B 一 Seal + 一 Open）：
+
+| 算法 | amd64 | 1 核 ARM（有 aes+pmull） |
+|---|---:|---:|
+| ChaCha20-Poly1305 | 1959 ns | 6753 ns |
+| **AES-128-GCM** | **828 ns** | **1305 ns** |
+
+#### 性能（同端口 ABAB 交替，服务端 1 核 ARM）
+
+| 项 | rev.2 | rev.3 | 变化 |
+|---|---|---:|---:|
+| 单流 100MB | 12.3 MB/s | **16.8 MB/s** | **+36%** |
+| 4 并发合计 | 12.7 MB/s | **17.0 MB/s** | **+34%** |
+| 服务端 CPU | 71.8% | **63.1%** | −8.7pp |
+| 　内核态 | 52.9% | **46.6%** | −6.3pp |
+| 每 MB/s 的 CPU | 5.49 %/(MB/s) | **3.78 %/(MB/s)** | **−31%** |
+| QUIC RTT | 78~80ms | 80~82ms | 无恶化 |
+| 客户端建连 | ~514ms+ | **220~241ms** | −294ms |
+
+三项来源：
+
+1. **AES-128-GCM**（见上表）
+2. **服务端发送默认 AF_PACKET**：`arpLookup` 照抄 Rust 的
+   `from_str_radix("0x2", 16)` 让 AF_PACKET 发送 fd **从未被创建**，
+   一直实际走 IPPROTO_RAW。启用它需要三个前提（源地址必须是本机网卡地址、
+   本机/回环目标强制 RAW、QDISC_BYPASS 保持关闭），全部已实现。
+3. **PACKET_QDISC_BYPASS 按驱动白名单开启**：只在 `virtio_net` 上默认开
+   （实测 −13% CPU/字节）；e1000/QEMU 会静默丢包，故按驱动判断。
+
+#### 其它
+
+- **日志全部纳入 sing-box 的 `log.level`**：新增 `flowtls/log.go`，
+  `Logger` 接口签名与 `log.ContextLogger` 逐字一致，适配层零适配器注入。
+  11 处标准库 `log.Printf` 清零；`nil` 语义为静默。
+- **建连省掉 514ms**：ARP 只在真要 AF_PACKET 时才查，
+  IPPROTO_RAW 路径完全不碰 `/proc/net/arp`。
+- **本地入口监听 `0.0.0.0`** 提升为硬约束（`AGENTS.md` 第 19 条）。
+
+#### 已评估但**未采纳**的优化（都有实测数据）
+
+| 项 | 结论 |
+|---|---|
+| recvmmsg 批量收包 | 0.0388 vs 基线 0.0402，噪声内；理论上限本就只有 2% |
+| AF_PACKET TX_RING | **0.0426，慢 16%**；SOCK_DGRAM 下无法指定目的 MAC，必须 SOCK_RAW 多写以太网头 |
+| 每包自建 IP/TCP 头 | 1001 ns/包 ≈ 1% 单核，不是瓶颈 |
+| 缩小包数（提 MTU） | 受路径 MTU ≥1428 限制，上限 +1% |
+
+recvmmsg 实现保留但默认关闭（`FLOWTLS_RECVMMSG=1`）；
+TX_RING 生产代码已删除，只留 `flowtls/txring_probe_test.go` 作证据。
+
+#### 升级检查清单
+
+```bash
+# 1. 两端都换二进制（rev.3）
+./dist/sing-box-1.14.4-rev.3-linux-amd64 check -c server.json
+./dist/sing-box-1.14.4-rev.3-linux-amd64 check -c client.json
+
+# 2. 确认发送路径
+grep "发送路径" /var/log/sing-box.log | tail -1
+#   服务端期望：af_packet+qdisc_bypass（virtio_net）或 af_packet（其它驱动）
+#   客户端期望：ipproto_raw
+
+# 3. 对比建连时间：应从 ~514ms 降到 ~230ms
+```
+
 ## 2026-11-15 17:35 (北京时间)
 
 ### 调研：quic-go 用户态路径的可动范围（ACK / 发送调度 / BBR）
