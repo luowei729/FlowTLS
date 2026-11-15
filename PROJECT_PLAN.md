@@ -622,7 +622,7 @@ sing-box/common/tlsspoof/raw_windows.go    ← 生产用例：伪造 TCP 包注�
 说明这条路径在 Windows 上是被验证过的。
 
 **部署代价为零**：驱动 `.sys` 用 `go:embed` 嵌进二进制，首次 `Open()`
-自动落盘到 `%LocalAppData%\sing-box\windivert\v2.2.2\` 并注册服务。
+自动落盘到 `%LocalAppData%\flowtls\windivert\v2.2.2\` 并注册服务。
 用户只需要 `sing-box.exe` 一个文件。
 
 ## W2. 语义差异：Linux 与 Windows 的模型根本不同
@@ -775,7 +775,23 @@ success:16`、24 字节、小端）是纯字节操作，写错的概率远高于
 直接跑现有 linux-amd64 二进制，性能与 Linux 一致。仅在需要「真正 Windows 原生
 进程 + 不需要 WSL」时才用 B 路线。
 
-## W9. 首次部署的手工验证清单（未验证项）
+## W9. 首次部署的验证（未验证项）
+
+**已经脚本化**：`docs/windows_smoke.ps1`。管理员 PowerShell 里一条命令跑完全部
+检查并输出报告：
+
+```powershell
+$env:FLOWTLS_SERVER = '203.0.113.10:8443'   # 从环境变量取，不写进仓库
+$env:FLOWTLS_SOCKS  = '127.0.0.1:1080'
+.\docs\windows_smoke.ps1 -Bin .\sing-box.exe -Config .\client.json
+```
+
+覆盖：管理员权限 / CPU 架构 / 端口占用 / 启动与「发送路径」断言 /
+驱动落盘 / 服务注册 / SOCKS5 出口 / 8MB 下载 / **同端口伪装站可达**
+（专验重新注入）/ CPU 与内存采样 / 进程退出。失败时直接把
+`ACCESS_DENIED`、`1275 DRIVER_BLOCKED`、`577 INVALID_IMAGE_HASH` 翻译成结论。
+
+下面的原始清单保留，供脚本无法覆盖的场景手工核对：
 
 ```powershell
 # 1. 以管理员身份运行，确认驱动能装
@@ -784,8 +800,8 @@ success:16`、24 字节、小端）是纯字节操作，写错的概率远高于
 #    失败 ERROR_ACCESS_DENIED  → 不是管理员
 #    失败 1275 (ERROR_DRIVER_BLOCKED) → 杀软拦截，需加白名单
 
-# 2. 确认驱动落盘
-dir %LocalAppData%\sing-box\windivert\v2.2.2\
+# 2. 确认驱动落盘（我们自己的目录，不与官方 sing-box 共用）
+dir %LocalAppData%\flowtls\windivert\v2.2.2\
 
 # 3. 确认服务注册
 sc query WinDivert
@@ -798,7 +814,7 @@ curl -x http://admin:PASSWORD@127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/
 curl -k https://<server>:8443/
 #    期望真证书站点正常响应（验证 §W4 的重新注入生效）
 
-# 6. 卸载：删 .sys 或 sc stop WinDivert && sc delete WinDivert
+# 6. 卸载：`sc stop WinDivert ; sc delete WinDivert`（服务名不带版本后缀）
 ```
 
 ## W10. 实施顺序（状态）

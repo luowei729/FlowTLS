@@ -346,9 +346,15 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    | Windows amd64/386 | ⚠️ 已实现，**未在真机跑过** | WinDivert 驱动，无需规则 |
    | macOS / FreeBSD | ❌ 只能编译 | 无等价能力，构造即失败 |
 
-   Windows 侧只有交叉编译和过滤器编码的字节级单测通过（9 个），
-   **没有一行在 Windows 上执行过**。首次部署按 `PROJECT_PLAN.md` §W9 的手工
-   清单逐项验证。已知风险：杀软拦截 WinDivert 驱动（360/Defender/火绒都拦）、
+   Windows 侧只有交叉编译和字节级单测通过（9 个过滤器 + 3 个注入决策），
+   **没有一行在 Windows 上执行过**。首次部署用脚本验证：
+
+   ```powershell
+   $env:FLOWTLS_SERVER = '203.0.113.10:8443'
+   $env:FLOWTLS_SOCKS  = '127.0.0.1:1080'
+   .\docs\windows_smoke.ps1 -Bin .\sing-box.exe -Config .\client.json
+   ```
+已知风险：杀软拦截 WinDivert 驱动（360/Defender/火绒都拦）、
    必须管理员运行、性能预期低于 Linux、无 arm64 驱动。
 
    **不想折腾驱动就用 WSL2**：完整 Linux 内核，直接跑 linux-amd64 二进制，
