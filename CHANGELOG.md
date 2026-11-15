@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## 2026-11-15 22:00 (北京时间)
+
+### 发布：v1.14.4-rev.4（Windows 客户端真机可用）
+
+**wire format 未改动**（仍是 v3），与 rev.3 双向兼容，Linux 侧代码未动。
+这是 Windows 移植第一次在真机上跑通，修了三个只在真机上暴露的问题：
+
+1. **注入包的校验和位留 0**。置 1 会让 WinDivert 跳过重算，网卡校验和卸载
+   把 IP 校验和清成 0 再发出去，中间设备直接丢，服务端一个 SYN 都收不到。
+2. **收包补以太网头**。WinDivert 给的是裸 IP 包，`ParseFrame` 按以太网帧解析，
+   原样送进去会被当成非法帧丢弃，表现为 SYN-ACK 到了却完不成握手。
+   重新注入给驱动时再剥掉这 14 字节。
+3. **客户端过滤器加 `tcp.SrcPort == serverPort`**。只按目的端口过滤会把本机
+   其它连接的回包一并扣下（目的端口撞上固定的 `source_port` 时），混进本会话。
+
+验证：Windows 10 客户端经 SOCKS5 走新加坡服务端，`cdn-cgi/trace` 出口为服务器
+公网地址、`colo=SIN`。同一链路多次下载 30MB：2.79 秒（约 10.8 MB/s），
+另一次 20MB 用 6.4 秒（3.1 MB/s）——差额来自公网侧波动，与本实现无关。
+服务端为 1 核 ARM，下载期间 CPU 占用约 1%，不是瓶颈。
+详见 `DEVTIPS.md` 第 140、141、142 条。
+
+### 同时修正
+
+- 去掉 WinDivert 热路径上的 `os.Getenv`：`ioctl` / `Recv` 原来**每收发一个
+  报文**都读一次调试开关，在 Windows 上是次 syscall。10MB/s 下约 7000 次/秒，
+  白烧 syscall 预算。改在进程启动时读一次。
+- 客户端过滤器合并为单一函数，强制要求服务端端口参数，避免以后漏掉
+  `tcp.SrcPort` 条件重现真机故障。
+- `docs/windows_smoke.ps1`：内核驱动改用 `Win32_SystemDriver` 查询
+  （`Get-Service` 看不到驱动，原来必然假失败）；下载检查改看 curl 的
+  `http_code` 与 `size_download`（原来只看耗时，隧道断了也可能假通过）。
+
 ## 2026-11-15 18:30 (北京时间)
 
 ### 新增：Windows 原生支持（WinDivert），以及全平台编译门禁
