@@ -83,6 +83,11 @@ type rawSocket struct {
 	// sendIsPacket 表示 sendFD 是否为 AF_PACKET 模式
 	// （决定 sendto 用 sockaddr_ll 还是 sockaddr_in）
 	sendIsPacket bool
+	// qdiscBypass 表示发送 fd 是否真的开了 PACKET_QDISC_BYPASS。
+	//
+	// 它只用于 SendMode 的如实报告：这个开关在错误驱动上会静默丢包，
+	// 所以「以为开了/以为没开」是排查时必须能立刻看清的信息。
+	qdiscBypass bool
 	// ifindex 是出口网卡索引，AF_PACKET 发送必须指定
 	ifindex int
 	// nextHopMAC 是下一跳 MAC。
@@ -154,9 +159,12 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 	// IPPROTO_RAW 根本不需要 MAC，就不该付这笔钱。
 	ifindex := 0
 	var nextHop [6]byte
+	// ifname 只用于 qdisc bypass 的驱动白名单判断。
+	var ifname string
 	if afPacketWanted(wantAFPacket) {
 		if route, err := defaultRoute(); err == nil {
 			ifindex = route.ifindex
+			ifname = route.ifname
 			if mac, ok := resolveNeighborMAC(route.gateway, dst, route.ifname); ok {
 				nextHop = mac
 			}
@@ -165,6 +173,8 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 
 	sendFD := -1
 	sendIsPacket := false
+	// qdiscBypass 仅用于向启动日志如实报告实际生效的设置。
+	qdiscBypass := false
 	// 没有下一跳 MAC 时不能用 AF_PACKET：内核补的以太网头目的地址会是全 0。
 	//
 	// 另外**本机/回环目标必须继续走 IPPROTO_RAW**：AF_PACKET 的下一跳是从
@@ -182,10 +192,12 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 			}
 			if err = syscall.Bind(fd, sll); err == nil {
 				// 绕过 qdisc：少一次入队/出队和软中断唤醒。
-				// **默认关闭**——e1000/QEMU 上会静默丢包（DEVTIPS 84），
-				// 本机客户端正是 e1000，开了就再也收不到 SYN-ACK。
-				if qdiscBypassEnabled() {
-					_ = syscall.SetsockoptInt(fd, syscall.SOL_PACKET, packetQdiscBypass, 1)
+				// **不是无条件开**：它在 e1000/QEMU 上会静默丢包（DEVTIPS 84），
+				// 所以走驱动白名单（见 qdiscBypassEnabled 的注释）。
+				if qdiscBypassEnabled(ifname) {
+					if err := syscall.SetsockoptInt(fd, syscall.SOL_PACKET, packetQdiscBypass, 1); err == nil {
+						qdiscBypass = true
+					}
 				}
 				// 发送缓冲调大，减少突发时的 ENOBUFS
 				_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
@@ -235,7 +247,8 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 		recvFD:       recvFD,
 		localIP:      localIP,
 		// logger 已在函数开头归一，这里直接复用。
-		logger: logger,
+		logger:      logger,
+		qdiscBypass: qdiscBypass,
 	}, nil
 }
 
@@ -250,6 +263,9 @@ func (s *rawSocket) SendMode() string {
 	mode := "ipproto_raw"
 	if s.sendIsPacket {
 		mode = "af_packet"
+		if s.qdiscBypass {
+			mode += "+qdisc_bypass"
+		}
 	}
 	return fmt.Sprintf("%s; 源 IP=%s", mode, s.localIP)
 }
@@ -856,11 +872,54 @@ func afPacketWanted(want bool) bool {
 
 // qdiscBypassEnabled 决定 AF_PACKET 发送是否开 PACKET_QDISC_BYPASS。
 //
-// 默认关闭：e1000/QEMU 虚拟网卡上 sendto 会返回成功但包不上线，
-// 而伪 TCP 层没有重传，现象是「握手永远超时」且毫无错误日志（DEVTIPS 84）。
-func qdiscBypassEnabled() bool {
-	v, ok := os.LookupEnv("FLOWTLS_QDISC_BYPASS")
-	return ok && v != "0" && v != "false"
+// # 为什么不是简单的开关
+//
+// 它省掉 qdisc 的入队/出队与软中断唤醒，实测有效：生产服务端（virtio_net，
+// 1 核 ARM）传 100MB 的 CPU 成本从 0.044 降到 0.039 CPU秒/MB（约 −10%）。
+//
+// 但它在**某些驱动上会让 sendto 返回成功、包却不上线**（e1000/QEMU，
+// DEVTIPS 84）。那种失败是完全静默的：伪 TCP 层没有重传，现象只是
+// 「握手永远超时」，日志里一个字都没有——排查代价极高。
+//
+// 所以这里用**驱动白名单**而不是默认开启：只有经过实测验证的驱动才开。
+// 目前只有 virtio_net。将来验证了别的驱动就往 allowedQdiscBypassDrivers 里加，
+// 而不是把默认值改成 true。
+//
+// 环境变量仍然优先，用于现场 A/B 与回退：
+//
+//	FLOWTLS_QDISC_BYPASS=1  强制开（自担风险）
+//	FLOWTLS_QDISC_BYPASS=0  强制关
+func qdiscBypassEnabled(ifname string) bool {
+	if v, ok := os.LookupEnv("FLOWTLS_QDISC_BYPASS"); ok {
+		return v != "0" && v != "false"
+	}
+	return allowedQdiscBypassDrivers[interfaceDriver(ifname)]
+}
+
+// allowedQdiscBypassDrivers 是已验证 PACKET_QDISC_BYPASS 可用的网卡驱动。
+//
+// virtio_net：生产服务端（Oracle Cloud，1 核 ARM）实测 0.044 → 0.039 CPU秒/MB，
+// 且吞吐与 RTT 均无异常。
+var allowedQdiscBypassDrivers = map[string]bool{
+	"virtio_net": true,
+}
+
+// interfaceDriver 返回网卡的内核驱动名（读 /sys/class/net/<if>/device/driver
+// 的符号链接名）。读不到时返回空串——空串不在白名单里，等同「不开 bypass」，
+// 这是安全的默认方向。
+func interfaceDriver(ifname string) string {
+	if ifname == "" {
+		return ""
+	}
+	link, err := os.Readlink("/sys/class/net/" + ifname + "/device/driver")
+	if err != nil {
+		return ""
+	}
+	// link 形如 "../../../bus/pci/drivers/virtio_net"
+	if i := strings.LastIndexByte(link, '/'); i >= 0 {
+		return link[i+1:]
+	}
+	return link
 }
 
 // triggerARP 用 UDP 包触发内核做一次 ARP 解析（不关心是否送达）。

@@ -315,10 +315,7 @@ func (l *Listener) recvLoop() {
 //
 // 与 Session.drainAvailable 同构；服务端是共享 socket，
 // 一轮里可能触达多个会话，所以把 session 收集在外层。
-//
-// **必须逐帧收，不能改成 recvmmsg 批量**（理由同 Session.drainAvailable：
-// 批量会让主循环长时间不回 select，5ms 心跳被拉长，延迟确认退化成「等下一个包」，
-// 实测 RTT 79→220ms）。
+// 保持逐帧收（不用 recvmmsg）的理由见 Session.drainAvailable。
 func (l *Listener) drainAvailable(buf []byte, touched []*Session) []*Session {
 	for i := 1; i < maxRecvBatch; i++ {
 		if l.ctx.Err() != nil {

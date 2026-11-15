@@ -625,15 +625,15 @@ func (s *Session) recvLoop() {
 
 // drainAvailable 非阻塞地把已到达的帧取干并处理（每轮最多 maxRecvBatch 帧）。
 //
-// **必须逐帧收，不能改成 recvmmsg 批量**。2026-11-15 试过改成
-// `recvmmsg` 一次 8 帧，吞吐确实涨了，但 **RTT 从 79ms 恶化到 220ms**：
-// 批量收包后主循环一次会在 `drainAvailable` 里连续转很多轮，
-// 回到 select 等那 5ms 定时器的机会被拉长，
-// 而无新包时的 5ms 心跳正是延迟确认能及时发出的唯一机会
-// （2026-11-14 19:05 修的同一个问题，只是载体从「等下一个包」变成了「等批量结束」）。
+// 保持逐帧 recvfrom，**不改成 recvmmsg 批量**。
 //
-// 单帧 recvfrom 看起来慢，但它在**每帧之后**都会返回主循环，
-// 定时器与延迟确认的机会密度反而更高。省下的 syscall 不值一个往返。
+// 2026-11-15 试过 recvmmsg（一次 8 帧）并完整实现过，当时看到吞吐涨了、
+// 但「RTT 从 79ms 恶化到 220ms」。后来用「同一份旧二进制换端口」做对照
+// 才发现那个 220ms 是**跨境链路的流级别两态**，与代码无关
+// （见 DEVTIPS 125）。所以那条 RTT 归因是错的。
+//
+// 既然两个版本在 CPU 与吞吐上都没有可复现的差异，就保留最简单的逐帧收：
+// 少一层手写的 mmsghdr/iovec 布局、少 1MB 槽位缓冲，排查成本最低。
 func (s *Session) drainAvailable(buf []byte) {
 	for i := 1; i < maxRecvBatch; i++ {
 		if s.closed.Load() {
