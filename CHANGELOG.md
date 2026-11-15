@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-11-15 17:10 (北京时间)
+
+### 安全：测量脚本里写死了真实跳板与服务端 IP（CI 门禁抓到）
+
+新增的 `docs/ab_kernel.sh` / `docs/ab_recvmmsg.sh` 为了省事直接写死
+`ssh -J root@<跳板> root@<服务端>`，CI 的 `docs/leak_check.sh` 报出两个
+可疑公网 IPv4 并失败。
+
+**为什么没被本地拦住**：脚本写完就直接提交了，而当时的 `make verify`
+**不含** leak_check（只校验版本号与 tags），leak_check 只在 CI 里跑。
+
+修正：
+
+1. 两个脚本改为从环境变量取连接信息，仓库里不再有任何真实地址：
+   ```bash
+   : "${FLOWTLS_SERVER:?请设置 FLOWTLS_SERVER（例如 root@203.0.113.10）}"
+   SSH="ssh ${FLOWTLS_SSH_OPTS:-} -o ConnectTimeout=15 ${FLOWTLS_SERVER}"
+   ```
+2. **leak_check 接进 `make verify`**，并新增 `make leak` 单独入口
+   （不需要 build，提交前随时跑）。本地能拦的事不该等 CI。
+3. `AGENTS.md` 约束 18 补充：测量/运维脚本连接哪台机器必须从环境变量取。
+
+**暴露面评估**：这两个 IP 在 2026-11-15 01:10 的条目里已被判定为
+「已泄露、应按泄露处置」（当时已公开约 5 天），所以本次复发**没有扩大暴露面**。
+但仍在 `d77c0c67` 的历史里，处置建议见下。
+
+**未做（需决策）**：是否用 `git-filter-repo` 重写 `d77c0c67` 并强推。
+考虑到这两个地址本来就要按已泄露处理（应更换 `ip_id_mark`、
+伪装域名与证书），重写历史的收益有限；若决定做，步骤与 DEVTIPS 119 相同。
+
 ## 2026-11-15 16:00 (北京时间)
 
 ### 内核态优化实测：recvmmsg 无可测收益、TX_RING 负收益（两者都不启用）

@@ -62,7 +62,11 @@ release-musl:
 		go build $(GOFLAGS_COMMON) -o ../$(PREFIX)/sing-box-$(VERSION)-linux-amd64-musl ./cmd/sing-box
 	@echo "built: $(PREFIX)/sing-box-$(VERSION)-linux-amd64-musl"
 
-# 验收：版本号里必须带 rev，tags 里必须带 with_flowtls
+# 验收：版本号里必须带 rev，tags 里必须带 with_flowtls，且不含真实地址/凭据
+#
+# leak_check 必须在这里，不能只放 CI：2026-11-15 有一次先写了测量脚本、
+# 忘了跑门禁就提交，真实跳板与服务端 IP 直接进了远端。
+# 本地验收入口能拦住的事，不该等 CI。
 .PHONY: verify
 verify: build
 	@echo "=== version ==="
@@ -72,7 +76,14 @@ verify: build
 		|| { echo "FAIL: version name mismatch"; exit 1; }
 	@./$(BIN) version | grep -q 'with_flowtls' \
 		|| { echo "FAIL: with_flowtls tag missing"; exit 1; }
+	@echo "=== leak check ==="
+	@bash docs/leak_check.sh
 	@echo "OK"
+
+# 单独的泄露检查（不需要 build，提交前随时跑）
+.PHONY: leak
+leak:
+	bash docs/leak_check.sh
 
 # 配置校验（不需要 root，这是硬要求）
 .PHONY: check

@@ -23,7 +23,22 @@ ROUNDS="${1:-3}"
 CYCLES="${2:-2}"
 SRC="http://127.0.0.1:18090/100MB.bin"
 AUTH="admin:abcd1234"
-SSH="ssh -J root@198.51.100.11 -o ConnectTimeout=15 root@203.0.113.10"
+# ---- 服务端连接方式：**从环境变量取，绝不写死在仓库里** ----
+#
+# 真实 IP 属于部署指纹（AGENTS.md 约束 18 / DEVTIPS 119）：
+# FakeTCP 的抗探测能力依赖「IP + ip_id_mark + SNI 都不公开」。
+# 本脚本早先版本直接写死了跳板与服务端 IP，被 CI 的 docs/leak_check.sh 抓到，
+# 已改为参数化——这也是它存在的意义：门禁真的会拦。
+#
+#   FLOWTLS_SERVER    必填，ssh 目标，形如 root@203.0.113.10
+#   FLOWTLS_SSH_OPTS  可选，额外 ssh 参数，例如 "-J root@198.51.100.11"
+#
+# 示例：
+#   FLOWTLS_SERVER=root@203.0.113.10 \
+#   FLOWTLS_SSH_OPTS="-J root@198.51.100.11" \
+#   bash docs/ab_kernel.sh 3 3
+: "${FLOWTLS_SERVER:?请设置 FLOWTLS_SERVER（例如 root@203.0.113.10）；真实地址不要写进仓库}"
+SSH="ssh ${FLOWTLS_SSH_OPTS:-} -o ConnectTimeout=15 ${FLOWTLS_SERVER}"
 
 # 档位组合。TX_RING 已在实测中被否掉（见 DEVTIPS 131），
 # 所以默认只对比 base / recvmmsg；要看 txring 把那两行取消注释。

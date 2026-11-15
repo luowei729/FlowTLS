@@ -184,7 +184,9 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
     `example.com`；真实值只放在被忽略的 `deploy/` 与 `DEPLOY_CREDENTIALS.md`。
     FakeTCP 的抗探测能力全靠「IP + ip_id_mark + SNI 都不公开」，三者同时
     泄露等于把部署指纹交出去。`docs/leak_check.sh` 用白名单扫描被跟踪文件，
-    CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
+    `make verify` 与 CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
+    **测量/运维脚本连接哪台机器必须从环境变量取**（如 `FLOWTLS_SERVER`），
+    不许写死地址或 `ssh -J 跳板`（`DEVTIPS.md` 第 131 条）。
 19. **本地客户端入口必须 `listen: "0.0.0.0"`**，不能写 `127.0.0.1`。
     这是部署要求，不是偏好：写回环时只有本机能连，局域网设备、Docker 容器、
     WSL、另一台虚机、手机热点共享全部连不上，而现象只是「连接被拒」，
