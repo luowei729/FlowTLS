@@ -33,7 +33,8 @@ flowtls/quic（quic-go：单连接多流，BBR）
         │  QUIC 数据报（TCP 走双向流，UDP 走 RFC 9221 DATAGRAM）
         ▼
 flowtls 传输层
-  - 伪 TLS 记录外观：17 03 03 len + nonce + ChaCha20-Poly1305(QUIC)
+  - 伪 TLS 记录外观：17 03 03 len + nonce + AES-128-GCM(QUIC)
+    （wire format v3；v2 是 ChaCha20-Poly1305，在 ARM 上慢 5.2 倍而废弃）
   - 标准三次握手：SYN → SYN-ACK → ACK，之后才发数据
     （严格 NAT 会丢弃握手完成前的数据包；零等待版本已废弃）
   - AEAD 密钥 = HKDF-SHA256(password)，解密成功即鉴权

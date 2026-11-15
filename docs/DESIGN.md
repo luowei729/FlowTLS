@@ -7,19 +7,23 @@
 **首包**（每条连接的第一条 ApplicationData，仅客户端→服务端）：
 
 ```
-IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | ver(1) | authID(16) | nonce(12) | ChaCha20-Poly1305(QUIC 数据报 + 16B tag)
+IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | ver(1) | authID(16) | nonce(12) | AES-128-GCM(QUIC 数据报 + 16B tag)
 ```
 
 **后续包**：
 
 ```
-IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | nonce(12) | ChaCha20-Poly1305(QUIC 数据报 + 16B tag)
+IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | nonce(12) | AES-128-GCM(QUIC 数据报 + 16B tag)
 ```
 
 - TLS 记录头 `17 03 03` 只是外观，载荷是 AEAD 密文。
+- **AEAD 是 AES-128-GCM**（v3）。v2 用的是 ChaCha20-Poly1305，但在有 ARMv8
+  Crypto Extension 的服务器上慢 5.2 倍（6753ns vs 1305ns/包，见
+  `flowtls/codec_bench_test.go`）。nonce(12)/tag(16) 长度两者相同，
+  所以从 v2 到 v3 **只换了算法与密钥长度（32→16 字节），布局一字未变**。
 - TCP flags 使用 PSH+ACK，窗口固定 65535，seq/ack 按字节数推进。
 - IP ID 在 `0xF100~0xF1FF` 内递增（**仅作外观**，真实链路上会被运营商 NAT 改写为 0，不能用于分流）。
-- 后续包每包额外开销 37 字节，首包 54 字节；QUIC 初始 MTU 1340，加上外层后总包约 1417/1434，仍不分片。
+- 后续包每包额外开销 37 字节，首包 54 字节；QUIC 初始 MTU 1332，加上外层后总包约 1417/1434，仍不分片。
 - **首包头只在鉴权完成前携带**：客户端在收到服务端第一个能解开的包之前，每个包都带
   `ver + authID`（QUIC Initial 丢包重传时仍能被服务端识别）；确认可达后不再携带。
   服务端方向从不携带。
@@ -45,14 +49,18 @@ IP 头(20) | TCP 头(20) | 17 03 03 | len(2) | nonce(12) | ChaCha20-Poly1305(QUI
 `name + password`，`name` 只用于日志，线上传的是 password 派生出的不透明标识**。
 
 ```
-authID  = HKDF-SHA256(salt="flowtls-faketcp-v2", ikm=password,
-                      info="flowtls faketcp auth id v2")[0..16]
-aeadKey = HKDF-SHA256(salt="flowtls-faketcp-v2", ikm=password,
-                      info="flowtls faketcp aead key v2")[0..32]
+authID  = HKDF-SHA256(salt="flowtls-faketcp-v3", ikm=password,
+                      info="flowtls faketcp auth id v3")[0..16]
+aeadKey = HKDF-SHA256(salt="flowtls-faketcp-v3", ikm=password,
+                      info="flowtls faketcp aead key v3")[0..16]   ← AES-128 密钥
 ```
 
 两个派生值用**不同的 info**，密码学上互不可推导：抓包拿到 authID 既推不出
 密码，也无法解密任何数据。
+
+salt 与 info 里的 `v3` 是刻意跟着协议版本走的：换算法时**不该**让新旧实现
+共用同一份派生上下文（即便密钥长度不同也不行——那会让「派生可兼容」成为
+一个无人验证的假设）。
 
 服务端流程：
 
@@ -67,7 +75,12 @@ aeadKey = HKDF-SHA256(salt="flowtls-faketcp-v2", ikm=password,
 ### 1.3 为什么不兼容旧格式
 
 v1（无版本位、单密码、解密成功即鉴权）**从未发布过**，因此直接废弃。
-Rust 与 Go 两端同步升级，不做双版本共存。
+v2（ChaCha20-Poly1305）同样没有对外发布过正式版，v3 换代时一并废弃——
+开发阶段只维护一个版本，不做双算法共存。
+
+冻结向量（`flowtls/testdata/wire_v3_golden.bin`）钉住 v3 的绝对字节；
+它由 `TestWriteFrozenVector` 用固定 nonce 生成，任何改动 HKDF 参数 /
+AEAD 算法 / AAD 组成 / nonce 布局 / 记录头格式都会让门禁变红。
 
 ## 2. 伪包识别（重要）
 

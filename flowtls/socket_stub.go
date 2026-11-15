@@ -16,7 +16,10 @@ import "net/netip"
 type rawSocket struct{}
 
 // newRawSocket 与 Linux 侧保持同一签名。
-func newRawSocket(dst netip.Addr, local netip.Addr) (*rawSocket, error) {
+//
+// logger 与 wantAFPacket 在非 Linux 上无意义（构造必然失败），
+// 保留参数只为对齐签名，避免调用点出现 `//go:build` 分叉。
+func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket bool) (*rawSocket, error) {
 	return nil, ErrPlatformUnsupported
 }
 

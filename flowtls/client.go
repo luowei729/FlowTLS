@@ -10,7 +10,6 @@ package flowtls
 
 import (
 	"context"
-	"log"
 	"net/netip"
 	"time"
 )
@@ -34,14 +33,18 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{})
+	// 日志出口先归一：rawSocket 与 Session 都要用同一个实例。
+	logger := loggerOr(cfg.Logger)
+	// 客户端传 false：下载方向客户端只发 ACK，发送量极小，
+	// 用 AF_PACKET 无收益却要付 ARP 探测与 NAT 风险（见 socket_linux.go 文件头）。
+	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{}, logger, false)
 	if err != nil {
 		return nil, err
 	}
 	// 与 Rust `tracing::info!(%server_ip, %server_port, %local_ip, ...)` 对位：
 	// 这两行是排查「包发到哪去了」的第一现场证据。
-	log.Printf("flowtls: FakeTCP 通道已就绪 server=%s local=%s 模式=%s",
-		cfg.Server, raw.LocalIP(), raw.SendMode())
+	logger.Info("FakeTCP 通道已就绪 server=", cfg.Server,
+		" local=", raw.LocalIP(), " 模式=", raw.SendMode())
 
 	// 客户端规则必须在**第一个包发出之前**就位。
 	//
@@ -69,6 +72,8 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	s := &Session{
 		raw:   raw,
 		codec: codec,
+		// logger 恒非 nil：收包/发送路径的错误日志直接调，不需判空。
+		logger: logger,
 		// **必须显式设为 true**：零值 false 表示「共享 socket，绝不关闭」，
 		// 那是服务端的语义。漏设会让每次重连泄漏 3 个 fd。
 		ownsRaw:    true,
@@ -146,7 +151,7 @@ func (s *Session) exchangeSYN(ctx context.Context) error {
 		case <-s.closeCh:
 			return ErrSessionClosed
 		case <-deadline.C:
-			log.Printf("flowtls: 握手超时（SYN-ACK 未到达），放弃本次连接")
+			s.logger.Error("握手超时（SYN-ACK 未到达），放弃本次连接")
 			return ErrHandshakeTimeout
 		case <-retry.C:
 			// 重传 SYN：序号不变、选项不变，只有 TSval 推进、IP ID 递增。

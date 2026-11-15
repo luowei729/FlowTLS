@@ -317,3 +317,60 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 - 省略 `site_dir` 时直接使用嵌入二进制的 `protocol/flowtls/web/index.html`，不再返回硬编码 “It works”。
 - 显式 `site_dir` 仍优先；目录中缺少请求文件或首页时回退到嵌入页。
 - 默认页回归测试及适配层 race 测试通过；需重新构建并部署二进制才会更新运行中的网站。
+
+### 日志统一与加密开销基准（2026-11-15 12:05）
+
+**日志**：`flowtls` 主包原有 11 处标准库 `log.Printf`，绕过 sing-box 的
+`log.level`——配置成 `"level": "error"` 也无法安静。新增 `flowtls/log.go`
+定义 `Logger` 接口（方法签名与 sing-box `log.ContextLogger` 逐字一致），
+由适配层注入，**不新增任何配置项**。`nil` 语义为静默。
+
+产物：`ClientConfig.Logger` / `ServerConfig.Logger`、`Session`/`Listener`/
+`rawSocket` 的 logger 字段、`flowtls.StdLogger()`（仅联调工具）。
+实测 `level: info` 时 20 次请求 0 条路径统计；`level: debug` 时每 2 秒 1 条。
+
+**加密开销**：新增 `flowtls/codec_bench_test.go`，两端各跑一次。结论：
+
+| 算法 | amd64 | 新加坡 ARM（1 核） |
+|---|---:|---:|
+| ChaCha20-Poly1305（线上） | 1959 ns | 6753 ns |
+| AES-128-GCM | 828 ns | 1305 ns |
+
+ARM 上 AES-GCM 快 5.2 倍，但 6753ns × 9400pps ≈ **6.3% 单核**，
+不是「带宽跑不高」的根因。客户端 `utime/stime = 141930/180387`
+说明瓶颈在 syscall（**内核态占 56%**），不在用户态加密。
+
+待办（按收益排序）：
+1. 查 AF_PACKET 收发的 syscall 批量效率（sendmmsg/recvmmsg 每批包数）；
+2. 评估 AES-GCM 切换（收益约 5% 单核，且需处理密码派生与 wire format 兼容）；
+3. 「只混淆不加密」不建议：ChaCha20 XOR 在 ARM 上 1742ns，
+   相比完整 AEAD 的 6753ns 只省 74%，却完全失去鉴权与抗篡改。
+
+### v3：AEAD 换 AES-128-GCM + 服务端 AF_PACKET 默认（2026-11-15 13:20）
+
+**破坏性变更**：wire format v2 → v3，两端必须同时升级。
+
+1. **AEAD**：ChaCha20-Poly1305 → AES-128-GCM，密钥 32→16 字节，salt/info 同步改 v3。
+   记录布局不变（nonce 12 / tag 16 两者相同）。
+2. **服务端发送**：默认 AF_PACKET（此前因 ARP 解析 bug 一直实际走 IPPROTO_RAW）。
+   客户端默认保持 IPPROTO_RAW（下载方向只发 ACK，实测无收益）。
+3. **ARP**：`parseARPFlags` 剥 `0x` 前缀；且只在真要 AF_PACKET 时才查表 →
+   IPPROTO_RAW 路径不再白等 514ms。
+4. **recvmmsg 批量收包：已回退**。它把 RTT 从 79ms 抬到 220ms（延迟确认心跳被拉长）。
+
+实测（本地 100MB 文件源，交替 A/B，服务端 1 核 ARM）：
+
+| 项 | 旧 | 新 | 变化 |
+|---|---|---:|---:|
+| 单流 100MB | 12.3 MB/s | 16.8 MB/s | +36% |
+| 4 并发合计 | 12.7 MB/s | 17.0 MB/s | +34% |
+| 服务端 CPU | 71.8% | 63.1% | −8.7pp |
+| 　内核态 | 52.9% | 46.6% | −6.3pp |
+| 每 MB/s 的 CPU | 5.49 %/(MB/s) | 3.78 %/(MB/s) | −31% |
+| QUIC RTT | 78~80ms | 80~82ms | 无恶化 |
+| 客户端建连 | ~514ms+ | 220~241ms | −294ms |
+
+**下一步（按收益排序）**：
+1. 内核态仍占 46.6%，是最大项。可动的是 `PACKET_QDISC_BYPASS`
+   （本机 e1000 会静默丢包，需真机验证）与每包自建 IP/TCP 头的开销。
+2. 加密已经不是瓶颈（ChaCha→AES 已把这一层吃干净），不要再从算法上找收益。

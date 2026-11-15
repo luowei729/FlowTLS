@@ -51,6 +51,12 @@ type ClientConfig struct {
 	Handshake string
 	// NetMode 是 iptables 规则模式（ModeAuto / ModeNone）。
 	NetMode string
+	// Logger 是诊断日志出口；nil 表示静默（见 log.go 的说明）。
+	//
+	// 适配层直接传 sing-box 的 logger，日志级别因此完全由 `log.level` 控制，
+	// flowtls 不需要自己的开关。**不要在 Validate 里给它赋默认值**：
+	// 静默是刻意的默认行为，回退到标准库会让「不注入」等于「照样吵」。
+	Logger Logger
 }
 
 // Validate 校验客户端配置（对应 Rust check.rs 的客户端分支）。
@@ -126,6 +132,11 @@ type ServerConfig struct {
 	UDPMaxSessions int
 	// UDPTimeoutSecs 是 UDP 会话空闲回收秒数。
 	UDPTimeoutSecs int
+	// Logger 是诊断日志出口；nil 表示静默（语义与 ClientConfig.Logger 相同）。
+	//
+	// 服务端所有会话共享 Listener 的 logger：伪造 TCP 的收包路径是
+	// 单协程共享 socket，按会话注入只会让同一份日志被重复打出来。
+	Logger Logger
 }
 
 // UDPOn 返回 UDP 是否启用（默认 true，与 Rust `default_udp_enabled` 一致）。

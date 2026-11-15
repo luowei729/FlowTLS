@@ -60,6 +60,8 @@ func main() {
 		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,
 		UDPMaxSessions: 256,
+		// 联调工具不接 sing-box，显式用标准库输出。
+		Logger: flowtls.StdLogger(),
 	}
 
 	var onStats func(ftquic.PathStats)

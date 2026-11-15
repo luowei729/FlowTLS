@@ -82,6 +82,9 @@ func main() {
 			IPIDMark:   uint16(*ipidMark),
 			Handshake:  flowtls.HandshakeSymbolic,
 			NetMode:    mode,
+			// 联调工具不接 sing-box，显式用标准库输出。
+			// 生产路径由适配层注入 sing-box logger（受 log.level 控制）。
+			Logger: flowtls.StdLogger(),
 		},
 		DialTimeout: *timeout,
 		OnStats:     onStats,

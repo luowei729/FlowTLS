@@ -1,17 +1,31 @@
 package flowtls
 
-// 冻结向量门禁：验证 Go 实现能解开 Rust 实现的绝对字节。
+// 冻结向量门禁：验证 Go 实现能还原**绝对字节**的 wire format v3。
 //
-// 向量由 legacy-rust 的单测导出（src/faketcp/codec.rs 的
-// `interop_vector::export_vector`），格式为：
+// # 这份向量钉什么
+//
+// 向量由本文件末尾的 TestWriteFrozenVector 生成（固定 nonce 前缀 + 固定计数器），
+// 格式为：
 //
 //	[len u32 BE][第一条记录][len u32 BE][第二条记录]
 //
-// 密码固定为 "interop-password"；第一条是客户端 seal（带 ver+authID 首包头），
-// 第二条是 mark_established 之后 seal（不带首包头）。
+// 密码固定为 "interop-password"；第一条带 ver+authID 首包头，
+// 第二条是 MarkEstablished 之后（不带首包头）。
 //
-// 这份向量钉的是**绝对字节**：任何改动 HKDF 参数 / AAD 组成 / nonce 布局 /
-// 记录头格式都会让它立刻变红，不存在「两端同时改错一起通过」的盲区。
+// 任何改动下面任一项都会让门禁立刻变红：
+//
+//	HKDF 的 salt / info / 输出长度（换密钥 = 换算法）
+//	AEAD 算法本身（AES-128-GCM 与 ChaCha20-Poly1305 的密文不同）
+//	AAD 组成（ver / ver+authID）
+//	nonce 布局（4 字节前缀 + 8 字节大端计数器）
+//	TLS 记录头与首包头布局
+//
+// # 为什么删掉了 Rust 向量
+//
+// v2 时代的向量是 Rust（ChaCha20-Poly1305）导出的，换成 AES-128-GCM 后
+// 它在密码学上就不可能再被解开——保留它只会变成一条永远红的门禁。
+// v3 起向量由 Go 自己生成并入库：它仍然钉住绝对字节，
+// 只是「两端同时改错一起通过」的盲区要靠人审 + CHANGELOG 记录来兜。
 
 import (
 	"encoding/binary"
@@ -23,10 +37,28 @@ import (
 
 const interopPassword = "interop-password"
 
-// loadRustVector 读取并切分冻结向量。
-func loadRustVector(t *testing.T) (first, second []byte) {
+// vectorNoncePrefix 是生成冻结向量时强制使用的 nonce 前缀。
+//
+// 线上 codec 的前缀是 crypto/rand 出来的随机值；固定它是为了让向量可重现——
+// 否则同一份代码每次产生的密文都不同，向量就没有意义了。
+var vectorNoncePrefix = [4]byte{0xA1, 0xB2, 0xC3, 0xD4}
+
+// newVectorCodec 构造一个 nonce 可重现的客户端 codec（仅测试与向量生成用）。
+func newVectorCodec(t *testing.T, password string) *Codec {
 	t.Helper()
-	blob, err := os.ReadFile("testdata/wire_v2_rust.bin")
+	c, err := NewClientCodec(password)
+	if err != nil {
+		t.Fatalf("构造 codec 失败: %v", err)
+	}
+	c.noncePrefix = vectorNoncePrefix
+	c.sendCtr.Store(0)
+	return c
+}
+
+// loadFrozenVector 读取并切分冻结向量。
+func loadFrozenVector(t *testing.T) (first, second []byte) {
+	t.Helper()
+	blob, err := os.ReadFile("testdata/wire_v3_golden.bin")
 	if err != nil {
 		t.Fatalf("读取冻结向量失败（它必须随仓库分发）: %v", err)
 	}
@@ -48,14 +80,14 @@ func loadRustVector(t *testing.T) (first, second []byte) {
 	return first, second
 }
 
-// TestInteropRustToGo 用 Rust 导出的字节验证 Go 的解密路径。
+// TestFrozenVectorV3 用入库的绝对字节验证编解码结构。
 //
 // 这是 docs/interop_check.sh 调用的门禁函数，名字不能改。
-func TestInteropRustToGo(t *testing.T) {
-	first, second := loadRustVector(t)
+func TestFrozenVectorV3(t *testing.T) {
+	first, second := loadFrozenVector(t)
 
-	// ---- authID 必须与 Rust 导出的 hex 完全一致 ----
-	wantHex, err := os.ReadFile("testdata/wire_v2_rust_authid.txt")
+	// ---- authID 必须与入库值完全一致（钉住 HKDF 参数）----
+	wantHex, err := os.ReadFile("testdata/wire_v3_golden_authid.txt")
 	if err != nil {
 		t.Fatalf("读取 authID 向量失败: %v", err)
 	}
@@ -65,7 +97,7 @@ func TestInteropRustToGo(t *testing.T) {
 	}
 	gotHex := hex.EncodeToString(c.authID[:])
 	if gotHex != strings.TrimSpace(string(wantHex)) {
-		t.Fatalf("authID 派生结果与 Rust 不一致：\n got=%s\nwant=%s",
+		t.Fatalf("authID 派生结果与冻结值不一致：\n got=%s\nwant=%s",
 			gotHex, strings.TrimSpace(string(wantHex)))
 	}
 
@@ -89,7 +121,7 @@ func TestInteropRustToGo(t *testing.T) {
 	}
 	plain, ok := c.OpenFirst(recs[0].Payload)
 	if !ok {
-		t.Fatal("首包解密失败——HKDF/AAD/nonce 布局与 Rust 已不一致")
+		t.Fatal("首包解密失败——HKDF/AAD/nonce 布局/算法已与冻结向量不一致")
 	}
 	if string(plain) != "first-datagram" {
 		t.Fatalf("首包明文不符：%q", plain)
@@ -122,6 +154,37 @@ func TestInteropRustToGo(t *testing.T) {
 	if string(plain2) != "second-datagram" {
 		t.Fatalf("后续包明文不符：%q", plain2)
 	}
+}
+
+// TestWriteFrozenVector 重建冻结向量。**只在明确要求时运行**：
+//
+//	FLOWTLS_WRITE_VECTOR=1 go test -run TestWriteFrozenVector -v .
+//
+// 重建后必须同批更新 docs/DESIGN.md 并在 CHANGELOG 记为破坏性变更
+// （AGENTS.md 约束 1）——向量变红是设计意图，不是要随手刷新的噪声。
+func TestWriteFrozenVector(t *testing.T) {
+	if os.Getenv("FLOWTLS_WRITE_VECTOR") != "1" {
+		t.Skip("仅在重建冻结向量时运行：FLOWTLS_WRITE_VECTOR=1 go test -run TestWriteFrozenVector")
+	}
+	c := newVectorCodec(t, interopPassword)
+	first := c.Seal([]byte("first-datagram"))
+	// 与线上一致：确认对端可达之后不再带首包头
+	c.MarkEstablished()
+	second := c.Seal([]byte("second-datagram"))
+
+	var buf []byte
+	for _, rec := range [][]byte{first, second} {
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(rec)))
+		buf = append(buf, rec...)
+	}
+	if err := os.WriteFile("testdata/wire_v3_golden.bin", buf, 0o644); err != nil {
+		t.Fatalf("写入向量失败: %v", err)
+	}
+	authHex := hex.EncodeToString(c.authID[:]) + "\n"
+	if err := os.WriteFile("testdata/wire_v3_golden_authid.txt", []byte(authHex), 0o644); err != nil {
+		t.Fatalf("写入 authID 向量失败: %v", err)
+	}
+	t.Logf("已重建冻结向量：%d 字节，authID=%s", len(buf), strings.TrimSpace(authHex))
 }
 
 // TestSealRoundTrip 验证 Go 自己的加解密与「首包头只带一次」语义。

@@ -19,12 +19,12 @@ package flowtls
 // ClientHello / ServerHello 的构造在 handshake.go（对应 codec.rs 后半）。
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
 	"sync/atomic"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // TLS 记录类型常量
@@ -40,7 +40,18 @@ const (
 // v2 引入两个变化：
 //  1. 每条连接的首包明文携带版本号与用户标识（支持多用户）；
 //  2. 版本号参与 AAD，跨版本重放/混淆解不开。
-const ProtocolVersion uint8 = 2
+//
+// v3 只改了一件事：**外层 AEAD 从 ChaCha20-Poly1305 换成 AES-128-GCM**。
+// 换算法的理由是可量化的（见 codec_bench_test.go 的实测）：
+//
+//	                amd64      ARM(有 aes+pmull)
+//	ChaCha20-Poly   1959ns     6753ns
+//	AES-128-GCM      828ns     1305ns      ← 快 2.4× / 5.2×
+//
+// 版本号必须跟着升：v2 的包在 v3 的密钥/算法下一定认证失败，
+// 这是设计意图（AGENTS.md 约束 1），不是兼容性事故。
+// 开发阶段只维护 v3，**不做多版本共存**。
+const ProtocolVersion uint8 = 3
 
 // AuthIDLen 是用户身份标识长度。
 //
@@ -69,7 +80,7 @@ type TlsRecord struct {
 //
 // 与 Rust `Obfs` 一一对应。并发安全：只有 atomic 字段与只读密钥。
 type Codec struct {
-	aead aeadCipher
+	aead cipher.AEAD
 
 	// authID 是该用户的明文身份标识，服务端靠它查表选密钥。
 	//
@@ -98,12 +109,17 @@ type Codec struct {
 	established atomic.Bool
 }
 
-// aeadCipher 是 chacha20poly1305 的最小使用面（便于测试替换）。
-type aeadCipher interface {
-	Seal(dst, nonce, plaintext, additionalData []byte) []byte
-	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
-	Overhead() int
-}
+// Codec.aead 的类型是标准库 cipher.AEAD，它恰好只用到三个方法：
+//
+//	Seal(dst, nonce, plaintext, additionalData) []byte
+//	Open(dst, nonce, ciphertext, additionalData) ([]byte, error)
+//	Overhead() int
+//
+// 不自定义最小接口了：线上只有 AES-128-GCM 一种实现（wire v3），
+// 自定义接口只会多一层「有没有别的实现」的误导。
+//
+// Go 1.24+ 的 AES-GCM 在 amd64 走 AES-NI+PCLMUL、在 ARMv8 走 aes+pmull
+// 硬件指令，无需任何第三方实现。
 
 // NewClientCodec 构建客户端侧编解码器。
 //
@@ -128,24 +144,33 @@ func NewServerCodec(password string) (*Codec, error) {
 // deriveCodec 由用户密码派生 AEAD 密钥与身份标识。
 //
 // 两个派生值用不同的 info 标签，保证互不可推导：
-//   - aead key：真正的加密密钥
+//   - aead key：真正的加密密钥（AES-128，16 字节）
 //   - auth id ：明文身份标识，只用于服务端查表
 func deriveCodec(password string) *Codec {
-	// HKDF-SHA256，salt = "flowtls-faketcp-v2"
-	key, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v2"),
-		"flowtls faketcp aead key v2", 32)
+	// HKDF-SHA256，salt = "flowtls-faketcp-v3"
+	//
+	// v3 同时改了 salt 与 info 标签：既然版本号已经变了，
+	// 就没有任何理由让新旧实现共用同一份派生上下文。
+	key, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v3"),
+		"flowtls faketcp aead key v3", 16)
 	if err != nil {
-		// hkdf.Key 只在参数非法时失败；长度固定 32，实际不可能触发。
+		// hkdf.Key 只在参数非法时失败；长度固定 16，实际不可能触发。
 		panic("flowtls: hkdf aead key: " + err.Error())
 	}
-	authID, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v2"),
-		"flowtls faketcp auth id v2", AuthIDLen)
+	authID, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v3"),
+		"flowtls faketcp auth id v3", AuthIDLen)
 	if err != nil {
 		panic("flowtls: hkdf auth id: " + err.Error())
 	}
-	aead, err := chacha20poly1305.New(key)
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		panic("flowtls: chacha20poly1305: " + err.Error())
+		panic("flowtls: aes.NewCipher: " + err.Error())
+	}
+	// 标准库 NewGCM 用 12 字节 nonce、16 字节 tag，
+	// 与 v2 的 nonce/tag 长度完全一致，因此记录布局不变。
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("flowtls: cipher.NewGCM: " + err.Error())
 	}
 	c := &Codec{aead: aead}
 	copy(c.authID[:], authID)

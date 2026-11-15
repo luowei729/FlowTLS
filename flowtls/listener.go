@@ -18,7 +18,6 @@ package flowtls
 import (
 	"context"
 	"errors"
-	"log"
 	"net/netip"
 	"sync"
 	"time"
@@ -59,6 +58,11 @@ type Listener struct {
 	users *userTable
 	port  uint16
 	mark  uint16
+	// logger 是诊断日志出口，恒非 nil（构造时经 loggerOr 归一）。
+	//
+	// 服务端所有会话共享它：收包路径是单协程共享 socket，
+	// 按会话注入只会让同一份日志被重复打出来。
+	logger Logger
 
 	idleTimeout      time.Duration
 	handshakeTimeout time.Duration
@@ -101,13 +105,17 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 日志出口先归一：后面 newRawSocket 与收包协程都要用。
+	logger := loggerOr(cfg.Logger)
 
 	// 探测用的目的地址**不能是监听地址**。
 	//
 	// 服务端 listen 通常是 0.0.0.0，拿它去查路由/网关 MAC 必然失败：
 	// 0.0.0.0 没有下一跳。与 Rust 一致：固定用 8.8.8.8（必然走默认路由）。
 	dst := netip.MustParseAddr("8.8.8.8")
-	raw, err := newRawSocket(dst, cfg.LocalIP)
+	// 服务端传 true：下载方向的服务端要发全部数据，
+	// AF_PACKET 在 1 核 ARM 上比 IPPROTO_RAW 快 3~4 倍（见 socket_linux.go 文件头）。
+	raw, err := newRawSocket(dst, cfg.LocalIP, logger, true)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +135,7 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		users:            users,
 		port:             cfg.Listen.Port(),
 		mark:             IPIDMarkOf(cfg.IPIDMark),
+		logger:           logger,
 		idleTimeout:      opts.IdleTimeout,
 		handshakeTimeout: opts.HandshakeTimeout,
 		byAddr:           make(map[netip.AddrPort]*Session),
@@ -286,7 +295,7 @@ func (l *Listener) recvLoop() {
 			if l.ctx.Err() != nil {
 				return
 			}
-			log.Printf("flowtls: raw recv 失败: %v", err)
+			l.logger.Error("raw recv 失败: ", err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -306,6 +315,10 @@ func (l *Listener) recvLoop() {
 //
 // 与 Session.drainAvailable 同构；服务端是共享 socket，
 // 一轮里可能触达多个会话，所以把 session 收集在外层。
+//
+// **必须逐帧收，不能改成 recvmmsg 批量**（理由同 Session.drainAvailable：
+// 批量会让主循环长时间不回 select，5ms 心跳被拉长，延迟确认退化成「等下一个包」，
+// 实测 RTT 79→220ms）。
 func (l *Listener) drainAvailable(buf []byte, touched []*Session) []*Session {
 	for i := 1; i < maxRecvBatch; i++ {
 		if l.ctx.Err() != nil {
@@ -314,7 +327,7 @@ func (l *Listener) drainAvailable(buf []byte, touched []*Session) []*Session {
 		n, ok, err := l.raw.recvAvailable(buf)
 		if err != nil {
 			if l.ctx.Err() == nil {
-				log.Printf("flowtls: raw recv 失败: %v", err)
+				l.logger.Error("raw recv 失败: ", err)
 			}
 			return touched
 		}
@@ -437,7 +450,7 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
 
 	// 关闭旧会话必须放在锁外：Close 会等待收包协程退出。
 	if stale != nil {
-		log.Printf("flowtls: 清理同一客户端的旧会话 %s（四元组复用）", client)
+		l.logger.Info("清理同一客户端的旧会话 ", client, "（四元组复用）")
 		_ = stale.Close()
 	}
 
@@ -459,7 +472,7 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
 		Options: opts[:],
 	})
 	if err := l.raw.Send(pkt, client.Addr()); err != nil {
-		log.Printf("flowtls: 发送 SYN-ACK 失败: %v", err)
+		l.logger.Error("发送 SYN-ACK 失败: ", err)
 	}
 }
 
@@ -526,7 +539,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 	clock := NewTcpClockAt(ts + 2)
 	clock.Observe(p.TSVal, p.HasTS)
 
-	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, l.mark)
+	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, l.mark, l.logger)
 
 	// ---- 发伪 ServerHello（与 Rust 一致）----
 	//
@@ -544,7 +557,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 	err := sess.raw.Send(helloPkt, sess.peer.Addr())
 	sess.mu.Unlock()
 	if err != nil {
-		log.Printf("flowtls: 发送 ServerHello 失败: %v", err)
+		l.logger.Error("发送 ServerHello 失败: ", err)
 	}
 
 	l.mu.Lock()
@@ -567,11 +580,16 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 }
 
 // newServerSession 构造服务端方向的会话。
+//
+// logger 由 Listener 传入而不是从 ServerConfig 重新取：
+// 同一进程里可能有多个 inbound，从配置取会让日志打错 tag。
 func newServerSession(raw *rawSocket, codec *Codec, peer netip.AddrPort,
-	localPort uint16, seq, peerSeq uint32, clock *TcpClock, mark uint16) *Session {
+	localPort uint16, seq, peerSeq uint32, clock *TcpClock, mark uint16, logger Logger) *Session {
 	s := &Session{
 		raw:   raw,
 		codec: codec,
+		// logger 恒非 nil：收包/发送路径的错误日志直接调，不需判空。
+		logger: loggerOr(logger),
 		// 服务端所有会话共享 Listener 的 socket，绝不能在这里关。
 		ownsRaw:    false,
 		peer:       peer,

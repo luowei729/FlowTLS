@@ -20,6 +20,9 @@ func newTestListener() *Listener {
 		mark:    IPIDMarkOf(0xF107),
 		byAddr:  make(map[netip.AddrPort]*Session),
 		pending: make(map[netip.AddrPort]*synState),
+		// 手工构造会绕过 NewListener 的 loggerOr 归一，
+		// 必须显式给个实现：nil 接口调方法会 panic。
+		logger: nopLogger{},
 	}
 }
 
@@ -29,6 +32,7 @@ func newTestRawSocket() *rawSocket {
 		sendFD:  -1,
 		recvFD:  -1,
 		localIP: netip.MustParseAddr("10.0.0.10"),
+		logger:  nopLogger{},
 	}
 }
 
@@ -44,6 +48,8 @@ func newTestSession(peer netip.AddrPort, peerISN uint32) *Session {
 		clock:      NewTcpClock(),
 		rx:         make(chan []byte, 1),
 		closeCh:    make(chan struct{}),
+		// 同上：手工构造必须显式填，否则错误路径会 panic。
+		logger: nopLogger{},
 	}
 }
 

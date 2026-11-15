@@ -18,7 +18,6 @@ package flowtls
 
 import (
 	"errors"
-	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -36,6 +35,11 @@ const rxQueueDepth = 8192
 type Session struct {
 	raw   *rawSocket
 	codec *Codec
+	// logger 是诊断日志出口，恒非 nil（构造时经 loggerOr 归一）。
+	//
+	// 它来自 ClientConfig/ServerConfig.Logger，也就是 sing-box 的 logger，
+	// 因此这里的每一行日志都受 `log.level` 控制。
+	logger Logger
 	// ownsRaw 表示本会话是否拥有 raw socket 的生命周期。
 	//
 	// **客户端必须显式设为 true**：Go 的 bool 零值是 false，而 false 的语义
@@ -351,7 +355,7 @@ func (s *Session) noteSendError(err error) {
 	}
 	n := s.txErr.Add(1)
 	if n == 1 || n%1000 == 0 {
-		log.Printf("flowtls: 发送失败（累计 %d 次）: %v", n, err)
+		s.logger.Error("发送失败（累计 ", n, " 次）: ", err)
 	}
 }
 
@@ -606,7 +610,7 @@ func (s *Session) recvLoop() {
 				return
 			}
 			// 与 Rust 一致：读失败告警后退避 10ms，避免空转刷 CPU。
-			log.Printf("flowtls: raw recv 失败: %v", err)
+			s.logger.Error("raw recv 失败: ", err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -621,8 +625,15 @@ func (s *Session) recvLoop() {
 
 // drainAvailable 非阻塞地把已到达的帧取干并处理（每轮最多 maxRecvBatch 帧）。
 //
-// 共用同一块接收缓冲是安全的：recvFrame → handleIncoming → deliver 会在
-// 返回前把明文拷贝进 rx 队列，不会让引用逃出本轮。
+// **必须逐帧收，不能改成 recvmmsg 批量**。2026-11-15 试过改成
+// `recvmmsg` 一次 8 帧，吞吐确实涨了，但 **RTT 从 79ms 恶化到 220ms**：
+// 批量收包后主循环一次会在 `drainAvailable` 里连续转很多轮，
+// 回到 select 等那 5ms 定时器的机会被拉长，
+// 而无新包时的 5ms 心跳正是延迟确认能及时发出的唯一机会
+// （2026-11-14 19:05 修的同一个问题，只是载体从「等下一个包」变成了「等批量结束」）。
+//
+// 单帧 recvfrom 看起来慢，但它在**每帧之后**都会返回主循环，
+// 定时器与延迟确认的机会密度反而更高。省下的 syscall 不值一个往返。
 func (s *Session) drainAvailable(buf []byte) {
 	for i := 1; i < maxRecvBatch; i++ {
 		if s.closed.Load() {
@@ -631,7 +642,7 @@ func (s *Session) drainAvailable(buf []byte) {
 		n, ok, err := s.raw.recvAvailable(buf)
 		if err != nil {
 			if !s.closed.Load() {
-				log.Printf("flowtls: raw recv 失败: %v", err)
+				s.logger.Error("raw recv 失败: ", err)
 			}
 			return
 		}

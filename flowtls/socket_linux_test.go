@@ -30,7 +30,7 @@ func TestSendmmsgAcceptsKernelLayout(t *testing.T) {
 	// 目的地址用 8.8.8.8：它必然走默认路由，与生产环境的
 	// 「发往服务器公网 IP」是同一条路径。
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{})
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
 	if err != nil {
 		t.Skipf("无法创建 raw socket（可能缺 CAP_NET_RAW）: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestSendRejectsIPv6(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{})
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestRawSocketCloseIdempotent(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{})
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestRecvActuallyReceives(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{})
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}

@@ -21,27 +21,39 @@ package flowtls
 // 只用标准库 syscall：sing-box 锁定的 x/sys 版本里 Sendmmsg 等符号已变动，
 // 且它的 go 指令会顶高整个模块的 Go 版本。标准库足够覆盖本层所需。
 //
-// ## 一个必须知道的既有行为：本实现（与 Rust 一致）实际走 IPPROTO_RAW
+// ## 发送路径：服务端 AF_PACKET，客户端 IPPROTO_RAW（默认）
 //
-// Rust 的 `arp_lookup` 用 `u32::from_str_radix(flags, 16)` 解析
-// `/proc/net/arp` 的 Flags 列，而该列的实际内容是 **"0x2"（带前缀）**，
-// 解析必然失败 → `next_hop_mac` 恒为全零 → `ifindex > 0 && next_hop_mac != [0;6]`
-// 不成立 → **AF_PACKET 发送 fd 从未被创建**，所有发送都走 IPPROTO_RAW。
+// v1 起这份代码一直**实际上走 IPPROTO_RAW**：`arpLookup` 照抄 Rust 的
+// `u32::from_str_radix("0x2", 16)`，而 `/proc/net/arp` 的 Flags 列带 "0x" 前缀，
+// 解析必然失败 → `next_hop_mac` 恒为全零 → AF_PACKET 发送 fd 从未被创建。
 //
-// 这解释了为什么 NAT 云主机在配置里写公网 IP 也能工作：IPPROTO_RAW 走内核
-// 路由，内核会用出接口地址回填 `iph->saddr`，把公网地址换成了内网地址。
+// 代价是一笔已经量到的建连开销：`resolveNeighborMAC` 在 ARP 查不到时会
+// triggerARP + 25×20ms 轮询，而查表本身永远失败 → 每次建连白等 ~514ms
+// （DEVTIPS 108）。现在 ARP 只在**真要 AF_PACKET 时**才查，
+// IPPROTO_RAW 路径完全不碰 /proc/net/arp，这笔等待直接消失。
 //
-// 本移植**保留这个行为**（arpLookup 同样不剥 "0x" 前缀），原因：
-//   1. 这是唯一在真实链路上验证过的路径；
-//   2. 若启用 AF_PACKET，包里的源地址会保持配置值，在 NAT 云主机上会被
-//      网关反欺骗静默丢弃（需要同时做「源地址必须在本机网卡上」的纠正）。
-// 详见 PROJECT_PLAN.md §7 的说明。
+// 两端默认值**不同**，因为收益不同：
+//
+//	服务端  AF_PACKET   下载方向的服务端要发全部数据。同一台 1 核 ARM 实测
+//	                    IPPROTO_RAW 5 MB/s vs AF_PACKET 15~23 MB/s（DEVTIPS 96）。
+//	客户端  IPPROTO_RAW 客户端在下载方向只发 ACK，发送量极小。
+//	                    实测把客户端换成 AF_PACKET 后吞吐**无差别**
+//	                    （19.8 vs 18.4 MB/s，在链路漂移范围内），
+//	                    却要付上面那笔 ARP 钱与旁路 conntrack 的风险（DEVTIPS 86）。
+//
+// 两个环境变量用于 A/B 与现场回退（都不进配置文件，属于排查旋钮）：
+//
+//	FLOWTLS_AF_PACKET=1     强制开启（客户端也开）
+//	FLOWTLS_AF_PACKET=0     强制关闭（服务端也回退 IPPROTO_RAW）
+//	FLOWTLS_QDISC_BYPASS=1  给 AF_PACKET 发送开 PACKET_QDISC_BYPASS
+//
+// **PACKET_QDISC_BYPASS 默认关闭**：在 e1000/QEMU 虚拟网卡上它会让 sendto
+// 返回成功但包不上线（DEVTIPS 84），本机客户端正是 e1000。
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -64,7 +76,8 @@ const packetQdiscBypass = 20
 // 这些包 DROP 掉（不让内核协议栈处理），我们依然能收到。
 //
 // 发送优先 AF_PACKET/SOCK_DGRAM（跳过 IP 层路由、netfilter、qdisc），
-// 不可用时回退 IPPROTO_RAW（见文件头说明：目前实际总是走回退路径）。
+// 不可用时回退 IPPROTO_RAW。两条路径的取舍与服务端/客户端的默认值
+// 见文件头「发送路径」那一节。
 type rawSocket struct {
 	sendFD int
 	// sendIsPacket 表示 sendFD 是否为 AF_PACKET 模式
@@ -90,22 +103,42 @@ type rawSocket struct {
 	// 必须靠 MSG_TRUNC 把真实长度拿回来才能发现。
 	truncated atomic.Uint64
 	truncLog  atomic.Bool
+	// logger 是诊断日志出口，恒非 nil（由 newRawSocket 经 loggerOr 归一）。
+	//
+	// 收包截断告警是本层唯一的日志点，级别为 Warn：
+	// 它意味着吞吐异常，但连接仍然可用，不应计入 Error。
+	logger Logger
 }
 
 // newRawSocket 创建收发 socket（对应 Rust `RawSocket::new_with_local`）。
 //
-// dst 用于探测出口 IP 与出口网卡；服务端可传任意外部地址。
+// dst 用于探测出口 IP 与（需要时）出口网卡；服务端可传任意外部地址。
 // local 是配置里显式指定的源 IP（为空时按路由探测）。
-func newRawSocket(dst netip.Addr, local netip.Addr) (*rawSocket, error) {
+// wantAFPacket 是**调用方对该方向的发送路径偏好**：服务端传 true，客户端传 false
+// （理由见文件头）。FLOWTLS_AF_PACKET 环境变量可以覆盖它。
+// logger 可为 nil，语义为静默。
+func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket bool) (*rawSocket, error) {
 	if !dst.Is4() {
 		return nil, ErrPlatformUnsupported
 	}
+	logger = loggerOr(logger)
 	// 优先用配置指定的源 IP，未指定时回退到路由探测。
 	//
-	// 注意：这里**不校验**该地址是否真的配在本机网卡上——与 Rust 一致。
-	// 走 IPPROTO_RAW 时内核会用出接口地址回填 saddr，所以配置公网地址也能
-	// 正常工作（见文件头说明）。
+	// 关键：配置值**不在本机任何网卡上**时必须换成探测值。
+	// 走 IPPROTO_RAW 时内核会用出接口地址回填 saddr，所以配错了也能跑；
+	// 但走 AF_PACKET 时包里就是配置值本身，NAT 云主机填公网地址会被网关
+	// 反欺骗静默丢弃（现象：本端抓包看得到 SYN-ACK 发出，对端一个包都收不到）。
+	// 这条纠正是启用 AF_PACKET 的前提条件，不能省（DEVTIPS 87）。
 	localIP := local
+	if localIP.IsValid() && !addrOnHost(localIP) {
+		probed, err := localIPFor(dst)
+		if err != nil {
+			return nil, err
+		}
+		logger.Warn("配置的源 IP ", localIP, " 不在本机网卡上，改用出口地址 ", probed,
+			"（AF_PACKET 不会自动回填源地址）")
+		localIP = probed
+	}
 	if !localIP.IsValid() {
 		probed, err := localIPFor(dst)
 		if err != nil {
@@ -114,22 +147,32 @@ func newRawSocket(dst netip.Addr, local netip.Addr) (*rawSocket, error) {
 		localIP = probed
 	}
 
-	// AF_PACKET 发送必须知道出口网卡；取默认路由那一块
+	// 只有真要 AF_PACKET 时才去读路由表 / 查 ARP。
+	//
+	// 这不是微优化：`resolveNeighborMAC` 在查不到时会 triggerARP + 25×20ms
+	// 轮询，是**每次建连**的固定开销（DEVTIPS 108 量到 514ms）。
+	// IPPROTO_RAW 根本不需要 MAC，就不该付这笔钱。
 	ifindex := 0
 	var nextHop [6]byte
-	if route, err := defaultRoute(); err == nil {
-		ifindex = route.ifindex
-		if mac, ok := resolveNeighborMAC(route.gateway, dst, route.ifname); ok {
-			nextHop = mac
+	if afPacketWanted(wantAFPacket) {
+		if route, err := defaultRoute(); err == nil {
+			ifindex = route.ifindex
+			if mac, ok := resolveNeighborMAC(route.gateway, dst, route.ifname); ok {
+				nextHop = mac
+			}
 		}
 	}
 
 	sendFD := -1
 	sendIsPacket := false
-	// 没有下一跳 MAC 时不能用 SOCK_DGRAM：内核补的以太网头目的地址会是全 0。
+	// 没有下一跳 MAC 时不能用 AF_PACKET：内核补的以太网头目的地址会是全 0。
 	//
-	// （当前 ARP 解析必然失败，因此这个分支不会进入；保留以与 Rust 一致。）
-	if ifindex > 0 && nextHop != ([6]byte{}) {
+	// 另外**本机/回环目标必须继续走 IPPROTO_RAW**：AF_PACKET 的下一跳是从
+	// 默认路由算出来的（网关 MAC + 物理网卡），把发往 127.0.0.1 或本机网卡
+	// 地址的包按这个下一跳送出去，包会跑到网关而不是 lo——本机联调直接断。
+	// 这条判断只在「本机既是客户端又是服务端」时生效，生产（跨境）不受影响。
+	afPacketUsable := ifindex > 0 && nextHop != ([6]byte{}) && !isLocalDst(dst)
+	if afPacketUsable {
 		fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM,
 			int(htons(syscall.ETH_P_IP)))
 		if err == nil {
@@ -138,8 +181,12 @@ func newRawSocket(dst netip.Addr, local netip.Addr) (*rawSocket, error) {
 				Ifindex:  ifindex,
 			}
 			if err = syscall.Bind(fd, sll); err == nil {
-				// 绕过 qdisc：少一次入队/出队和软中断唤醒
-				_ = syscall.SetsockoptInt(fd, syscall.SOL_PACKET, packetQdiscBypass, 1)
+				// 绕过 qdisc：少一次入队/出队和软中断唤醒。
+				// **默认关闭**——e1000/QEMU 上会静默丢包（DEVTIPS 84），
+				// 本机客户端正是 e1000，开了就再也收不到 SYN-ACK。
+				if qdiscBypassEnabled() {
+					_ = syscall.SetsockoptInt(fd, syscall.SOL_PACKET, packetQdiscBypass, 1)
+				}
 				// 发送缓冲调大，减少突发时的 ENOBUFS
 				_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
 				sendFD = fd
@@ -187,6 +234,8 @@ func newRawSocket(dst netip.Addr, local netip.Addr) (*rawSocket, error) {
 		nextHopMAC:   nextHop,
 		recvFD:       recvFD,
 		localIP:      localIP,
+		// logger 已在函数开头归一，这里直接复用。
+		logger: logger,
 	}, nil
 }
 
@@ -273,8 +322,13 @@ func (s *rawSocket) destSockaddr(dst netip.Addr) syscall.Sockaddr {
 
 // maxSendBatch 是一次 sendmmsg 最多带多少个报文（对应 Rust `MAX_BATCH`）。
 //
-// 32 是折中：太小收益不明显，太大在突发时会一次性占满 qdisc 队列反而增加丢包。
-const maxSendBatch = 32
+// 从 32 提到 64：单次 sendto 在 1 核 ARM 上实测 ~34µs，而 syscall 入口/出口
+// 本身就占相当比例（spectre 缓解的 clear_bhb_loop 在 perf 里能排到 2%）。
+// 64 个报文 = 一次 syscall 交 90KB 载荷，栈上 iovec+mmsghdr 共 5KB，无分配。
+//
+// 不取更大值的原因：发送队列深度只有 64（`txQueueDepth`），
+// 一次排空就够；再大只是把栈用量推高而不会减少 syscall。
+const maxSendBatch = 64
 
 // SendBatch 批量发送多个完整 IPv4 报文（同目的 IP），一次系统调用。
 //
@@ -416,8 +470,8 @@ func (s *rawSocket) recvOnce(buf []byte, flags int) (int, bool, error) {
 				// 计数并丢弃，不返回错误（否则上层会刷日志）。
 				s.truncated.Add(1)
 				if s.truncLog.CompareAndSwap(false, true) {
-					log.Printf("flowtls: 收包缓冲不足（%d 字节），报文被截断；"+
-						"请把 recvBufSize 调到 ≥ 256KB", len(buf))
+					s.logger.Warn("收包缓冲不足（", len(buf), " 字节），报文被截断；",
+						"请把 recvBufSize 调到 ≥ 256KB")
 				}
 				return 0, false, nil
 			}
@@ -682,14 +736,15 @@ func resolveNeighborMAC(gateway, dst netip.Addr, ifname string) ([6]byte, bool) 
 
 // arpLookup 从 /proc/net/arp 查指定 IP 的 MAC（对应 Rust `arp_lookup`）。
 //
-// **这里的十六进制解析不剥 "0x" 前缀，是刻意与 Rust 保持一致**：
-// /proc/net/arp 的 Flags 列实际是 "0x2"，所以本函数在 Linux 上**必然返回
-// false**，进而让 newRawSocket 走 IPPROTO_RAW 回退路径。
+// **与 Rust 的唯一差异**：Flags 列用 parseARPFlags 剥掉 "0x" 前缀再解析。
 //
-// 这不是笔误，而是唯一在真实链路上验证过的行为（见文件头的详细说明）。
-// 要启用 AF_PACKET，必须同时做两件事：
-//  1. 剥前缀修正解析；
-//  2. 保证 IP 头里的源地址是本机网卡地址（NAT 云主机不能填公网地址）。
+// Rust 用 `u32::from_str_radix(flags, 16)`，而该列实际内容是 "0x2"（带前缀），
+// 解析必然失败 → 本函数在 Linux 上永远返回 false → 发送永远退化成 IPPROTO_RAW。
+// 对岸代价是每次建连白等 514ms（ARN 查不到 → 25×20ms 轮询）+ 吞吐只有 1/3~1/4。
+//
+// 启用 AF_PACKET 需要同时满足两个条件，两件都已经做了：
+//  1. 剥前缀修正解析（本函数）；
+//  2. 保证 IP 头里的源地址是本机网卡地址（newRawSocket 的自动纠正）。
 func arpLookup(ip netip.Addr, ifname string) ([6]byte, bool) {
 	var zero [6]byte
 	content, err := os.ReadFile("/proc/net/arp")
@@ -707,8 +762,7 @@ func arpLookup(ip netip.Addr, ifname string) ([6]byte, bool) {
 		if err != nil || addr != ip {
 			continue
 		}
-		// 与 Rust 等价：from_str_radix("0x2", 16) 失败 → 整体返回 None
-		flags, err := parseHexUint32(f[2])
+		flags, err := parseARPFlags(f[2])
 		if err != nil {
 			return zero, false
 		}
@@ -730,6 +784,83 @@ func arpLookup(ip netip.Addr, ifname string) ([6]byte, bool) {
 		return mac, true
 	}
 	return zero, false
+}
+
+// parseARPFlags 解析 /proc/net/arp 的 Flags 列，允许 "0x" / "0X" 前缀。
+//
+// 单独一个函数而不是改 parseHexUint32：后者还服务 /proc/net/route 的
+// Gateway 列（那列**没有**前缀），改它会连带影响路由解析。
+func parseARPFlags(s string) (uint32, error) {
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
+	if s == "" {
+		return 0, fmt.Errorf("空的 ARP flags")
+	}
+	return parseHexUint32(s)
+}
+
+// addrOnHost 判断 ip 是否配置在本机任一网卡上。
+// 只用于决定「配置的源地址能不能直接写进 IP 头」，
+// 不参与任何转发决策，因此网卡列表取一次就够（不缓存：
+// 建连频率很低，而源地址被热插拔改掉的场景更难排查）。
+func addrOnHost(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		// 拿不到网卡列表时保守返回 true：宁可保持配置值，
+		// 也不要因为一次枚举失败就把用户明确写的源地址改掉。
+		return true
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			addr, ok := netip.AddrFromSlice(ipNet.IP)
+			if ok && addr.Unmap() == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isLocalDst 判断目的地址是否属于本机（回环或本机网卡地址）。
+//
+// 这类目标必须走 IPPROTO_RAW：AF_PACKET 的下一跳是按默认路由算的
+// （网关 MAC + 物理网卡），把发往 lo 的包按那个下一跳送出去会直接断掉本机联调。
+func isLocalDst(dst netip.Addr) bool {
+	if dst.IsLoopback() {
+		return true
+	}
+	return addrOnHost(dst)
+}
+
+// afPacketWanted 决定这个方向是否尝试使用 AF_PACKET 发送。
+//
+// want 是调用方按方向给出的默认偏好（服务端 true / 客户端 false，
+// 理由见文件头）；FLOWTLS_AF_PACKET 可以强制覆盖。
+func afPacketWanted(want bool) bool {
+	v, ok := os.LookupEnv("FLOWTLS_AF_PACKET")
+	if !ok {
+		return want
+	}
+	return v != "0" && v != "false"
+}
+
+// qdiscBypassEnabled 决定 AF_PACKET 发送是否开 PACKET_QDISC_BYPASS。
+//
+// 默认关闭：e1000/QEMU 虚拟网卡上 sendto 会返回成功但包不上线，
+// 而伪 TCP 层没有重传，现象是「握手永远超时」且毫无错误日志（DEVTIPS 84）。
+func qdiscBypassEnabled() bool {
+	v, ok := os.LookupEnv("FLOWTLS_QDISC_BYPASS")
+	return ok && v != "0" && v != "false"
 }
 
 // triggerARP 用 UDP 包触发内核做一次 ARP 解析（不关心是否送达）。

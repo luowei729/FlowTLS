@@ -16,6 +16,10 @@ require (
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
 	github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4
+	// x/crypto 只被 codec_bench_test.go 用作**对照基准**（ChaCha20-Poly1305 /
+	// ChaCha20 / Poly1305）。线上 AEAD 已改成标准库的 AES-128-GCM（wire v3），
+	// 生产代码不再引用它。保留依赖是为了让「为什么换算法」这个结论
+	// 任何时候都能用一条命令复现，而不是只能相信 CHANGELOG 里的数字。
 	golang.org/x/crypto v0.54.0
 )
 

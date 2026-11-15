@@ -238,6 +238,9 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 			// 客户端规则必须在第一个包发出前就位：SYN-ACK 一回，内核就会
 			// 发现没有对应 socket 并回 RST，中间设备会立即拆掉 NAT 映射。
 			NetMode: netMode,
+			// 注入 sing-box logger：分工与入站侧相同，
+			// 传输层日志从此全部由 `log.level` 控制。
+			Logger: o.logger,
 		},
 		DialTimeout: 15 * time.Second,
 		MaxCwnd:     maxCwndOf(o.opts.MaxCwnd),

@@ -3532,3 +3532,165 @@ git push --force --all && git push --force --tags
 链路本地 / 组播 / RFC 5737 文档段 / RFC 2544 / 公共 DNS / 占位地址之外一律
 报错），CI 每次提交都跑；文档里统一写 `203.0.113.x` 和 `example.com`。
 `deploy/` 与 `DEPLOY_CREDENTIALS.md` 靠 `.gitignore` + 本门禁双重保护。
+
+## 120. 库自己往 stderr 写字 = 绕过宿主的日志级别（2026-11-15 12:05）
+
+现场「默认启动产生大量没必要日志」，第一反应是加一个 `debug: true` 开关。
+**错的**：问题不是缺开关，而是两套日志体系并存。
+
+`flowtls` 主包的 11 处诊断日志全用标准库 `log.Printf`，这些行无条件写 stderr，
+完全绕过 sing-box 的 `log.level`：
+
+```json
+{ "log": { "level": "error" } }   // 用户以为安静了
+```
+
+但「发送失败（累计 N 次）」「收包缓冲不足」照样刷；与此同时 `QUIC 路径统计`
+走的是 `logger.Debug`，于是同一份日志里一半受控、一半不受控——
+用户无法用一个开关关掉全部噪声。实测服务端 `level: debug` 攒了 15MB
+（83596 条 DEBUG，其中 35189 条路径统计）。
+
+正确做法是**注入**而不是新增参数：
+
+```go
+// flowtls/log.go —— 签名与 sing/log/logger.Logger 逐字一致
+type Logger interface {
+	Debug(args ...any)
+	Info(args ...any)
+	Warn(args ...any)
+	Error(args ...any)
+}
+```
+
+关键点：`sing-box` 的 `log.ContextLogger` **天然满足这个接口**，
+适配层写 `Logger: h.logger` 就完事，不需要适配器代码。
+级别过滤全部交给宿主，flowtls 自己不判断级别。
+
+三条设计约束：
+
+1. **nil = 静默，不回退标准库**。回退会让「不注入」等于「照样吵」，
+   注入就失去意义。回环日志只在联调工具里显式 `flowtls.StdLogger()`。
+2. **不要在 `Validate()` 里给 `Logger` 赋默认值**。静默是刻意默认。
+3. **测试手工构造对象要显式填 `nopLogger{}`**。手工构造绕过构造函数的
+   `loggerOr` 归一，nil 接口调方法会 panic——本次就有 4 个测试因此炸掉。
+
+诊断这类问题的快速判据：
+
+```bash
+# 有没有绕过宿主的日志？按 tag 前缀检查
+grep -c '^flowtls:' app.log        # 非 0 = 有日志没走宿主 logger
+```
+
+## 121. 换加密算法前先算「它到底占多少单核」（2026-11-15 12:05）
+
+「CPU 高、带宽跑不高」时，第一个怀疑对象常是 AEAD。先用基准量化，
+别猜。`flowtls/codec_bench_test.go` 在两端各跑一次（ARM 用交叉编译）：
+
+```bash
+go test -run '^$' -bench . -benchtime 2s .
+GOARCH=arm64 go test -c -o /tmp/b.test . && scp /tmp/b.test ... && /tmp/b.test -test.bench .
+```
+
+实测（1332B，一次 Seal + 一次 Open）：
+
+| 算法 | amd64 | ARM（新加坡，有 aes/pmull） |
+|---|---:|---:|
+| ChaCha20-Poly1305（线上） | 1959 ns | **6753 ns** |
+| AES-128-GCM | 828 ns | 1305 ns |
+
+AES-GCM 在 ARM 上快 5.2 倍，看起来很有吸引力。但换成「每包耗时」：
+
+```
+6753ns/包 × 9400 包/秒（100Mbps 单向）≈ 6.3% 单核
+```
+
+**6.3% 解释不了「带宽跑不高」**。换算法是确定收益的优化（能省约 5% 单核），
+但真正的瓶颈要往别处找：本机客户端 `/proc/PID/stat` 显示
+`utime=141930 / stime=180387`，**内核态占 56%**——syscall（AF_PACKET 收发与
+sendmmsg/recvmmsg）比用户态加密贵得多。
+
+教训：先看 `utime` vs `stime` 的比值，再决定优化方向。
+比值说明是 syscall 问题就调批量与缓冲，说明是用户态问题才去动算法。
+
+## 122. 批量收包会把 RTT 抬高一整个往返（2026-11-15 13:20）
+
+为了压 CPU，把收包从「一帧一次 `recvfrom`」改成「一次 `recvmmsg` 取 8 帧」。
+吞吐确实涨了，**RTT 却从 79ms 变成 220ms**，两端对称复现。
+
+分叉实验（这一步不能省）：怀疑对象有两个——换 AES、换发送路径到 AF_PACKET。
+所以起了第三个服务端实例，用 `FLOWTLS_AF_PACKET=0` 强制 raw：
+
+| 组合 | 客户端 RTT | 结论 |
+|---|---:|---|
+| v2 + raw（基线） | 78ms | — |
+| v3 + af_packet | 217ms | ✗ |
+| v3 + **raw** | 225ms | ✗ → 与发送路径无关，是 v3 代码 |
+
+排除了发送路径后只剩 recvmmsg。回退后 RTT 立刻回到 80ms。
+
+**机制**：延迟确认（RFC 1122 的「每 2 段或 40ms」）能及时发出，靠的是主循环
+每 5ms 醒一次的心跳。批量收包让 `drainAvailable` 在一次循环里连转几十轮、
+连续处理几百帧，**主循环长时间回不到 `select`**，5ms 心跳被拉长成「等这一批收完」。
+于是无新包时的 ACK 只能等到下一批——退税成一个往返。
+
+这与 2026-11-14 19:05 修的是**同一个 bug**，只是载体变了：
+那次是「只在 `Recv` 返回后判定」，这次是「批量的批变长了」。教训是：
+
+> 「省 syscall」的优化必须连带检查它有没有改变**主循环的返回频率**。
+> 心跳类机制（延迟确认、定时 flush、超时判定）全部依赖这个频率。
+
+**另外**：`session.go` 与 `listener.go` 两处 `drainAvailable` 都留了注释，
+写明「不要改成 recvmmsg」以及代价数据，避免下次有人重复这个实验。
+
+## 123. 服务端发送路径：AF_PACKET 才是默认值，RAW 只是回退（2026-11-15 13:20）
+
+`arpLookup` 里那句照抄 Rust 的 `from_str_radix("0x2", 16)` 让 AF_PACKET
+**从来没被启用过**（`/proc/net/arp` 的 Flags 是 `"0x2"`，带前缀，解析必然失败）。
+副作用有两笔，这次一起清掉：
+
+| 项 | RAW | AF_PACKET | 说明 |
+|---|---:|---:|---|
+| 单流吞吐（1 核 ARM） | 5 MB/s | 15~23 MB/s | DEVTIPS 96 早量到 |
+| 每次建连固定等待 | ~514ms | 0 | ARP 查不到时的 25×20ms 轮询 |
+
+修法不是简单「剥掉 0x 就开 AF_PACKET」，必须同时满足三个前提，否则会静默不通：
+
+1. **源地址必须是本机网卡地址**。AF_PACKET 不像 IPPROTO_RAW 那样用出接口地址
+   回填 `iph->saddr`，NAT 云主机填公网地址会被网关反欺骗静默丢弃（DEVTIPS 87）。
+   → `addrOnHost()` 检测 + 自动换成探测到的出口地址。
+2. **发往本机/回环的目标必须走 RAW**。AF_PACKET 的下一跳是从默认路由算的
+   （网关 MAC + 物理网卡），把发往 `127.0.0.1` 的包按那个下一跳送出去会跑到网关，
+   本机联调直接断。→ `isLocalDst()` 判断。
+3. **`PACKET_QDISC_BYPASS` 默认关闭**。e1000/QEMU 上它让 `sendto` 返回成功但包
+   不上线（DEVTIPS 84）。→ 只留 `FLOWTLS_QDISC_BYPASS=1` 手动开。
+
+最后一个选择：**客户端默认仍用 IPPROTO_RAW**。下载方向客户端只发 ACK，
+实测把客户端也换成 AF_PACKET 后吞吐无差别（19.8 vs 18.4 MB/s，链路漂移内），
+却要付旁路 conntrack 的风险。所以 `newRawSocket` 增加 `wantAFPacket` 参数，
+由调用方按方向决定：服务端 true、客户端 false。用 `FLOWTLS_AF_PACKET=0/1` 可强制覆盖。
+
+顺带：ARP 只在真要 AF_PACKET 时才查，**IPPROTO_RAW 路径完全不碰 `/proc/net/arp`**，
+那笔 514ms 的纯等待自然消失（实测建连 220~241ms）。
+
+## 124. 换 AEAD 算法要看目标 CPU 有没有硬件加速（2026-11-15 13:20）
+
+`codec_bench_test.go` 在两端各跑一次的结果：
+
+| 算法 | amd64 | ARM（有 aes+pmull+sha2） |
+|---|---:|---:|
+| ChaCha20-Poly1305 | 1959 ns | **6753 ns** |
+| AES-128-GCM | 828 ns | 1305 ns |
+| AES-256-GCM | 1045 ns | 1589 ns |
+
+ARM 上 AES-GCM 快 **5.2 倍**，amd64 只快 2.4 倍。差别在于：x86 的 AES-NI 与
+ARMv8 的 Crypto Extension 都是硬件指令，而 ChaCha20 两边都只有 SIMD 实现
+（NEON 的收益远小于 x86 的 AVX）。
+
+**但别把 5.2 倍当成吞吐的 5.2 倍**：6753ns/包 × 9400pps（100Mbps 单向）≈ 6.3% 单核，
+加密本来就不是主要瓶颈。实测换完之后服务端 CPU 只从 71.8% 降到 63.1%
+（−8.7pp），吞吐涨 36%——涨得比 CPU 降幅多，因为省下的用户态时间
+让包处理更快、在途数据更早被 ACK，间接把窗口利用起来了。
+
+真正的瓶颈仍然是**内核态**（46.6%）：伪 TCP 要自己构 IP/TCP 头、
+每包一次 `sendmmsg`/`recvfrom`、过 qdisc 与驱动。要再压就动这一层，
+不是继续换加密算法（ChaCha20 换成 AES 已经把这层的收益吃干净了）。

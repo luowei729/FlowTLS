@@ -148,6 +148,12 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		UDPEnabled:     &h.udpOn,
 		UDPTimeoutSecs: int(h.udpIdleTimeout / time.Second),
 		UDPMaxSessions: h.udpMaxSessions,
+		// 直接注入 sing-box 的 logger：它的 Debug/Info/Warn/Error
+		// 签名与 ft.Logger 逐字一致，因此不需要适配器。
+		//
+		// 注入之后，flowtls 传输层（握手上失败、收包失败、截断告警、
+		// 清理旧会话等）全部受 `log.level` 控制；不注入则完全静默。
+		Logger: h.logger,
 	}
 	for _, u := range h.opts.Users {
 		cfg.Users = append(cfg.Users, ft.User{Name: u.Name, Password: u.Password})

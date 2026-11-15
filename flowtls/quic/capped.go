@@ -423,7 +423,12 @@ func clampU64(v, lo, hi uint64) uint64 {
 	return v
 }
 
-// LogStats 是给适配层用的默认统计输出（对应 Rust 的 INFO 日志行）。
+// LogStats 是给**联调工具**用的默认统计输出（对应 Rust 的 INFO 日志行）。
+//
+// 它直接走标准库 log，因此**绕过宿主的 log.level**——只允许在
+// `cmd/ftdial`、`cmd/ftserver` 这类不依赖 sing-box 的工具里使用。
+// sing-box 适配层必须传自己的 OnStats（走 logger.Debug），
+// 否则即使配置 `"level": "error"` 也会每 2 秒刷一行。
 func LogStats(s PathStats) {
 	log.Printf("flowtls: QUIC 路径统计 peer=%s rtt=%v cwnd=%dB inflight=%dB "+
 		"sent=%d lost=%d loss_pct=%d win_cap=%d conns=%d",

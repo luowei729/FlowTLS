@@ -1,5 +1,134 @@
 # CHANGELOG
 
+## 2026-11-15 13:20 (北京时间)
+
+### wire format v3：外层 AEAD 换成 AES-128-GCM；服务端发送默认 AF_PACKET
+
+**破坏性变更**：协议版本 v2 → v3，两端必须同时升级。
+
+#### 1. 换成 AES-128-GCM（申请项）
+
+`codec.go` 的 AEAD 从 ChaCha20-Poly1305 换成标准库 AES-128-GCM，密钥长度 32→16 字节。
+HKDF 的 salt 与 info 同步改为 v3（`flowtls-faketcp-v3` / `... aead key v3`），
+nonce/tag 长度不变（12/16），因此**记录布局与首包头完全不变**。
+
+理由是可量化的（`codec_bench_test.go`，1332B 一 Seal + 一 Open）：
+
+| 算法 | amd64 | 新加坡 1 核 ARM（有 aes+pmull） |
+|---|---:|---:|
+| ChaCha20-Poly1305（v2） | 1959 ns | **6753 ns** |
+| AES-128-GCM（v3） | 828 ns | **1305 ns** |
+
+ARM 上快 **5.2 倍**，amd64 上快 2.4 倍。开发阶段只维护 v3，不做双算法兼容。
+
+冻结向量同步换代：`testdata/wire_v3_golden.bin` + `wire_v3_golden_authid.txt`
+（由新增的 `TestWriteFrozenVector` 用固定 nonce 生成，`FLOWTLS_WRITE_VECTOR=1` 重建）。
+v2 的 Rust 向量已删除——换算法后它在密码学上不可能再被解开，留着只会是一条永远红的门禁。
+
+#### 2. 服务端发送路径默认 AF_PACKET（此前一直是 IPPROTO_RAW）
+
+`arpLookup` 照抄了 Rust 的 `from_str_radix("0x2", 16)`，而 `/proc/net/arp` 的 Flags
+列带 `0x` 前缀，解析必然失败 → AF_PACKET 发送 fd **从未被创建**。现在：
+
+- `parseARPFlags` 剥前缀（新函数，不动 `parseHexUint32`——它还给 `/proc/net/route` 用）；
+- `newRawSocket` 新增 `wantAFPacket` 参数：**服务端 true / 客户端 false**；
+- 新增 `addrOnHost` / `isLocalDst`：配置的源 IP 不在本机网卡上时自动换成探测到的
+  出口地址（AF_PACKET 不会像 IPPROTO_RAW 那样回填 `saddr`，NAT 云主机会被反欺骗丢包）；
+  发往本机/回环的目标强制走 RAW（否则本机联调直接断）。
+
+**客户端默认仍走 IPPROTO_RAW**：下载方向客户端只发 ACK，实测换 AF_PACKET 后吞吐
+无差别（19.8 vs 18.4 MB/s，在链路漂移内），却要付旁路 conntrack 的风险（DEVTIPS 86）。
+
+叠加收益：ARP 只在真要 AF_PACKET 时才查，**建连省掉 514ms 的纯等待**
+（DEVTIPS 108 记录的那笔固定开销）。实测建连 514ms+ → **220~241ms**。
+
+#### 3. 试过 recvmmsg 批量收包，**已回退**
+
+一度把收发都改成 `recvmmsg`（一次 8 帧），吞吐实测涨了，但 **RTT 从 79ms 恶化到 220ms**，
+且两端对称复现。分叉实验定位到与发送路径无关（v3 + `ipproto_raw` 同样是 225ms），
+根因是批量收包让主循环长时间不回 `select`，**5ms 心跳被拉长，延迟确认退化成
+「等下一个包」**——与 2026-11-14 19:05 修的是同一个问题，只是载体从
+「等下一个包」变成「等批量结束」。已完整回退，并在两处 `drainAvailable` 写明原因。
+
+#### 实测（本地 100MB 文件源，交替 A/B，服务端 1 核 ARM）
+
+测量方式见新增的 `docs/ab_bench.sh`（单流 + 并发交替，同一时间窗内轮流跑）。
+
+| 项 | 旧（v2 ChaCha + raw） | 新（v3 AES + af_packet） | 变化 |
+|---|---|---:|---:|
+| 单流 100MB（中位） | 12.3 MB/s | **16.8 MB/s** | **+36%** |
+| 4 路并发合计 | 12.7 MB/s | **17.0 MB/s** | **+34%** |
+| 服务端 CPU | 71.8% | **63.1%** | −8.7pp |
+| 　其中内核态 | 52.9% | **46.6%** | −6.3pp |
+| 每 MB/s 的 CPU 成本 | 5.49 %/(MB/s) | **3.78 %/(MB/s)** | **−31%** |
+| QUIC RTT（两端一致） | 78~80ms | **80~82ms** | 无恶化 |
+| 客户端建连 | ~514ms+ | **220~241ms** | −294ms |
+
+内核态仍是最大项（46.6%），说明 AF_PACKET syscall 仍是主要瓶颈，
+但已经从「每包一次 sendto/recvfrom + 路由 + netfilter」降到「qdisc + 驱动」。
+下一步若要继续压，方向是 `PACKET_QDISC_BYPASS`（本机 e1000 会静默丢包，需真机验证）
+与减少每包的自建 IP/TCP 头开销，而不是加密。
+
+#### 门禁
+
+`make build`（amd64+arm64）/ `make verify` / `docs/interop_check.sh`（v3 向量）/
+`docs/leak_check.sh` / 双端 `sing-box check` / `go test -race` / `gofmt` 全部 PASS。
+
+## 2026-11-15 12:05 (北京时间)
+
+### 日志：flowtls 传输层日志全部纳入 sing-box 的 `log.level`
+
+现场反馈「默认启动会产生大量没必要日志」。核查后确认根因不是缺一个开关，
+而是**两套日志体系并存**：
+
+| 日志 | 改造前 | 受 `log.level` 控制 |
+|---|---|---|
+| `QUIC 路径统计` | `logger.Debug` | ✅ 是 |
+| `FakeTCP 通道已就绪`、`raw recv 失败`、`发送失败`、`收包缓冲不足`、`清理旧会话`、`握手超时` 等 11 处 | 标准库 `log.Printf` | ❌ **否** |
+
+后果：把配置改成 `"level": "error"` 也无法安静——标准库那批照样写 stderr。
+实测服务端 `level: debug` 累积 15MB 日志（83596 条 DEBUG，其中 35189 条是路径统计）。
+
+处理（**不新增任何配置项**，直接复用 sing-box 标准）：
+
+- 新增 `flowtls/log.go`：定义 `Logger` 接口，方法签名与 sing-box
+  `log.ContextLogger` 的 `Debug/Info/Warn/Error(args ...any)` **逐字一致**，
+  适配层直接把 `h.logger` / `o.logger` 赋给配置字段，**零适配器代码**。
+- `ClientConfig` / `ServerConfig` 新增 `Logger` 字段，**nil = 静默**
+  （不回退到标准库：库不该在宿主不知情时写 stderr）。
+- `Session` / `Listener` / `rawSocket` 全部改为经注入的 logger 输出，
+  11 处标准库调用清零。级别归类：收包/发包失败与握手超时→Error，
+  收包截断→Warn，建连与清理旧会话→Info。
+- 联调工具 `cmd/ftdial`、`cmd/ftserver` 显式用新增的 `flowtls.StdLogger()`，
+  保持原有可见性；`quic.LogStats` 保留标准库并加注释限定「仅联调工具」。
+- `flowtls/codec_bench_test.go`: 新增加密开销基准（见下一条）。
+
+实测验证（`rev.2` 二进制，连新加坡服务端）：
+
+| 配置 | 20 次请求 | 路径统计 | 总日志 |
+|---|---|---|---|
+| `level: info` | 20/20 成功 | **0 条** | 86 行 |
+| `level: debug` | 5/5 成功 | 每 2 秒 1 条 | 36 行（5 请求） |
+
+### 基准：加密算法开销实测（amd64 本机 + 新加坡 1 核 ARM）
+
+新增 `flowtls/codec_bench_test.go`，用途是**排除法**——先确认外层 AEAD
+是不是 CPU 热点，再决定要不要换算法。1332B 载荷，一 Seal + 一 Open：
+
+| 算法 | amd64 ns/op | ARM ns/op | ARM 吞吐 |
+|---|---:|---:|---:|
+| **ChaCha20-Poly1305（当前线上）** | 1959 | **6753** | 197 MB/s |
+| AES-128-GCM | 828 | 1305 | 1020 MB/s |
+| AES-256-GCM | 1045 | 1589 | 838 MB/s |
+| ChaCha20 XOR（不认证） | 2921 | 1742 | 765 MB/s |
+| Poly1305 tag（不加密） | 538 | 1333 | 1000 MB/s |
+
+服务端 CPU 有 `aes` / `pmull` / `sha2` 硬件加速，AES-GCM 比 ChaCha20-Poly1305
+**快 5.2 倍**；本机 amd64 快 2.4 倍。但绝对量级上 6753ns/包 × 9400pps
+（100Mbps）≈ 6.3% 单核，**不足以解释「带宽跑不高」**——
+下一步应查 AF_PACKET syscall 与 quic-go 用户态路径。换算法是收益明确的优化，
+但不是当前瓶颈。
+
 ## 2026-11-15 01:10 (北京时间)
 
 ### 安全：全历史脱敏（真实服务器 IP 与伪装域名曾进 public 仓库）
