@@ -1,5 +1,77 @@
 # CHANGELOG
 
+## 2026-11-15 18:30 (北京时间)
+
+### 新增：Windows 原生支持（WinDivert），以及全平台编译门禁
+
+`VERSION` 保持 `1.14.4-rev.3`（尚未重新发布，下次发行时一并带上）。
+**wire format 未改动**，Linux 侧行为完全不变。
+
+#### 为什么需要驱动
+
+Windows 从 Vista 起禁止用户态创建原始 TCP socket（MS 的安全策略），
+`IPPROTO_RAW` 只能发伪 UDP/TCP，**收不到任何 TCP 包**。所以「自己构 IP/TCP
+头」这条路在 Windows 上必须依赖内核包拦截驱动。选 WinDivert：sing-box 已经
+vendor 了它（`common/windivert`），驱动资产是 LGPLv3 可再分发，且 API 稳定。
+
+#### 语义差异（本次移植的核心风险点）
+
+| | Linux `AF_PACKET` | Windows `WinDivert` |
+|---|---|---|
+| 内核看到包 | **看到**（被动复制） | **看不到**（被扣留） |
+| 「不是我的包」 | 忽略即可 | **必须重新注入** |
+| 需要的防火墙规则 | iptables（服务端 DROP + 客户端 DROP RST） | **不需要** |
+
+第二条如果漏了，同端口的伪装网站会**静默失效**（包被驱动销毁）。
+`handlePacket` 因此多返回一个 `consumed`，`recvFrame` 里未消费的包在 Windows
+上重新注入。`Reinject` 在 Linux 上是语义正确的空实现。
+详见 `DEVTIPS.md` 第 133 条。
+
+#### 新增文件
+
+| 文件 | 说明 |
+|---|---|
+| `flowtls/windivert_filter.go` | 过滤器 VM 编码、批量收发包拼接/拆分、`WINDIVERT_ADDRESS` 布局。**无 build tag**，所以在 Linux 上也能单测 |
+| `flowtls/windivert_filter_test.go` | 9 个字节级单测，全部通过 |
+| `flowtls/windivert_windows.go` | 驱动句柄、IOCTL、驱动安装（从内嵌资产落盘 + 注册服务） |
+| `flowtls/windivert_assets{,_windows}.go` | 内嵌 `WinDivert64.sys` / `WinDivert32.sys` / LGPLv3 许可证 |
+| `flowtls/socket_windows.go` | `rawSocket` 的 WinDivert 实现 |
+| `flowtls/socket_common.go` | 平台共用常量（`maxSendBatch`、`socketRole`） |
+| `flowtls/rules_windows.go` | 空规则层：`init()` 把 `rulesBackendEnabled` 置 false |
+| `flowtls/socket_windows_test.go` | Windows 侧的 `newTestRawSocket` 测试辅助 |
+
+#### 修掉的既有 bug：macOS / FreeBSD 一直编译不过
+
+`socket_stub.go` 的注释写着「保证能交叉编译」，实际上层按**字段**读
+`s.raw.localIP`，而 stub 里只有 `LocalIP()` 方法。发行目标只有 Linux、CI 也只
+编 Linux，所以从未暴露。现在 `make platforms` 覆盖 8 个组合，
+是 `make verify` 与 CI 的一部分（`DEVTIPS.md` 第 135 条）。
+
+同时修正 `rules.go`：`Ensure*` / `Check*` 由 `rulesBackendEnabled` 开关控制，
+Windows 上恒为 no-op（WinDivert 扣留语义下内核不会产生 RST，本来就不需要规则）。
+
+#### 未验证事项（必须说清）
+
+- **没有一行 Windows 代码在真机上执行过**。本机无 Windows、无 wine、无 qemu。
+- 已验证：windows/amd64、windows/386 交叉编译通过；`go vet` 通过；
+  9 个过滤器/批量拼接单测通过；Linux 全部单测（含 `-race`）通过。
+- **未验证**：驱动 IOCTL 交互、驱动安装与卸载、注入时序、端到端连通性、
+  任何 Windows 性能数字。
+- 首次部署必须按 `PROJECT_PLAN.md` §W9 手工验证。最高风险是杀软拦截驱动。
+
+#### 工程改进
+
+- `Makefile` 新增 `platforms`（8 平台编译门禁）与 `windows` 目标，
+  `verify` 依赖 `platforms`。
+- `ci.yml` 新增 Windows `go vet` 与 `make platforms`。
+- `build.yml` 发行矩阵新增 `windows/amd64`、`windows/386`。
+- 平台相关测试辅助拆分：`socket_linux_test.go` / `socket_windows_test.go`
+  各一份 `newTestRawSocket`，`listener_test.go` 的断言跨平台共用。
+- `txring_probe_test.go` 补 `//go:build linux`（它直接用 Linux syscall 常量）。
+- `README.md`：修正不存在的 `iptables_mode: print`（合法值只有 `auto`/`none`）、
+  版本号示例更新到 rev.3、补平台支持表。
+
+
 ## 2026-11-15 17:45 (北京时间)
 
 ### 发布 v1.14.4-rev.3 —— **破坏性变更：wire format v3，两端必须同时升级**

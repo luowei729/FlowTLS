@@ -578,3 +578,257 @@ bytesLostMultiplier = 2
 3. **减少包数**：受路径 MTU 限制，上限约 1% → 不做。
 4. **接受现状**：内核态与用户态都已逐个量完，
    单流 16.8 MB/s / 4 并发 17.0 MB/s 已是这条链路 + 这个实现的合理水平。
+
+---
+
+# Windows 支持（B 路线：WinDivert）
+
+> 状态：**设计 + 实现完成，运行时验证被阻塞**（无 Windows 主机）。
+> 本文档记录设计依据、实现边界与验证缺口，避免后来者把「编译通过」误当成「能用」。
+
+## W0. 为什么不能走原生 socket
+
+微软自 Vista 起禁止用 raw socket 构造 TCP/UDP 包（防源地址伪造）：
+
+- `IP_HDRINCL` 只对 ICMP 生效，TCP/UDP 被内核拒绝（`WSAEINVAL`）
+- 源地址必须存在于本机网卡
+- 没有 `AF_PACKET` 的对应物
+
+所以「像 Linux 那样自己写 IP/TCP 头」在 Windows 上**系统层面封死**，
+唯一可行路径是内核层的包拦截驱动。
+
+## W1. 选型：WinDivert（复用 sing-box 已有实现）
+
+| 方案 | 结论 |
+|---|---|
+| **WinDivert** | ✅ 采用 |
+| Npcap | ❌ 需要 cgo（破坏 `CGO_ENABLED=0`）、每包跨驱动边界、仍需管理员 |
+| WFP 自研驱动 | ❌ 要签名证书，成本远超收益 |
+| WSL2 | ⚠️ 不是「Windows 原生」，但作为部署建议保留（见 §W8） |
+
+**关键发现：sing-box 上游已自带 cgo-free 的 WinDivert 绑定，并在生产中使用。**
+
+```
+sing-box/common/windivert/            纯 syscall（DeviceIoControl），无 cgo
+  ├── handle_windows.go               Open/Recv/RecvBatch/Send/SendBatch/Close
+  ├── driver_windows.go               驱动自动安装（SCM + 服务创建）
+  ├── driver_asset_windows.go         驱动落盘到 UserCacheDir + SHA256 校验
+  ├── filter.go                       过滤器 VM 指令编码（纯逻辑，无 syscall）
+  └── assets/WinDivert64.sys          已微软签名，94KB，嵌入二进制
+sing-box/common/tlsspoof/raw_windows.go    ← 生产用例：伪造 TCP 包注入
+```
+
+`tlsspoof` 做的事与本项目同构（构造伪造 TCP 包、注入、控制时序），
+说明这条路径在 Windows 上是被验证过的。
+
+**部署代价为零**：驱动 `.sys` 用 `go:embed` 嵌进二进制，首次 `Open()`
+自动落盘到 `%LocalAppData%\sing-box\windivert\v2.2.2\` 并注册服务。
+用户只需要 `sing-box.exe` 一个文件。
+
+## W2. 语义差异：Linux 与 Windows 的模型根本不同
+
+这是**最容易写错的地方**，单独成节。
+
+| | Linux (`AF_PACKET`) | Windows (`WinDivert`) |
+|---|---|---|
+| 收包 | **被动复制**，内核照常处理同一份包 | **扣留**，内核看不到，直到我们放行或丢弃 |
+| 「不是我的包」 | 忽略即可，内核已经处理了 | **必须重新注入**，否则包被销毁 |
+| 丢弃 | `iptables DROP` + AF_PACKET 照旧收到 | **不重新注入** 就是丢弃 |
+| 注入 | 自己构 IP 头 + `sendmmsg` | 同，但走 `WinDivertSend`（`Outbound` 位决定方向） |
+
+由此得到两条结论：
+
+1. **WinDivert 天然合并了「收包 + 阻断内核」两件事**，不再需要
+   `iptables` 的 raw/PREROUTING u32 规则，也不再需要客户端 OUTPUT 挡 RST 的规则
+   —— 因为内核**从未看到**这些包，不会生成 SYN-ACK / RST。
+2. **服务端必须实现「非本协议的包重新注入」**，否则伪装网站的 0.4% 连接
+   （IP ID 随机落入 mark 区间）会被静默吞掉。Linux 侧该路径是 no-op。
+
+## W3. 过滤器设计
+
+WinDivert 的过滤器在 `Open()` 时确定，无法动态修改，因此必须一次写准。
+
+字段编号取自 `windivert.h` 的 `WINDIVERT_FILTER_FIELD_*`
+（已有实现只导出了十几个，本实现补齐 `ip.Id` / `tcp.Syn` / `tcp.Rst` /
+`tcp.PayloadLength`）：
+
+| 字段 | ID | 用途 |
+|---|---:|---|
+| `inbound` / `outbound` | 1 / 2 | 方向 |
+| `ip` / `tcp` | 5 / 8 | 协议判定 |
+| `ip.Id` | 18 | **IP ID 标记**（本协议的分流特征） |
+| `tcp.SrcPort` / `tcp.DstPort` | 38 / 39 | 端口 |
+| `tcp.Rst` / `tcp.Syn` | 46 / 47 | 标志位 |
+| `tcp.PayloadLength` | 52 | 载荷长度 |
+
+### 服务端（一个共享句柄，对应 `Listener.raw`）
+
+```
+inbound and ip and tcp and tcp.DstPort == <listenPort>
+        and ip.Id >= <mark> and ip.Id <= <mark|0xFF>
+```
+
+- `mark` 来自 `ip_id_mark & 0xFF00`，IP ID 低字节是递增序号，所以区间是 256 个值。
+- **不含 outbound**：服务端发出的 SYN-ACK / 数据由我们自己注入，
+  若把 outbound 也纳入，注入的包会被再次扣留，形成自环。
+- 该过滤器会命中真实浏览器的 SYN 约 1/256（IP ID 随机），
+  由 §W4 的重新注入兜底。
+
+### 客户端（一个句柄，对应 `Session.raw`）
+
+```
+inbound and ip and tcp and tcp.SrcPort == <serverPort> and tcp.DstPort == <sourcePort>
+```
+
+- 只用 4 元组，**不加 IP ID 条件**：客户端不需要面对伪装站，
+  且 4 元组已足够精确（`source_port` 是配置里固定的）。
+- **不含 outbound**：同上，避免注入自环。
+- 该过滤器覆盖 4 元组的全部入向包，因此内核永远看不到服务端的 SYN-ACK →
+  **不会产生 RST**，Linux 那条 `OUTPUT` 规则在 Windows 上没有对应物也不需要。
+
+### 伪装站（masquerade）
+
+WinDivert 只扣留匹配的包，真实浏览器的流量不匹配就直接走内核 TCP 栈，
+**不需要** Linux 那套「iptables DROP + AF_PACKET 抢包」的配合。
+`masquerade.go` 一行都不用改。
+
+## W4. 「不是我的包」必须重新注入（新增协议语义）
+
+`handlePacket` 现在用「返回 nil」同时表示三种情况，无法区分是否已消费。
+改为显式返回 `consumed bool`：
+
+| 路径 | consumed | Windows 动作 |
+|---|---|---|
+| 纯 SYN（带 mark） | true | 不回注（丢弃内核可见性，我们自己回 SYN-ACK） |
+| 已有会话的数据包 | true | 不回注 |
+| 首包鉴权成功 | true | 不回注 |
+| 首包鉴权失败 / 无载荷非 SYN | **false** | **重新注入**（还给内核） |
+
+`rawSocket.Reinject(pkt)`：
+- Linux：no-op，注释说明「AF_PACKET 是被动复制，内核已处理」。
+- Windows：`Send` 回去，`Outbound` 保持原值（入向包要以入向身份回注）。
+
+由 `rawSocket.reinjectUnmatched` 布尔位控制，Linux 上只是一次布尔判断。
+
+## W5. 实现文件划分
+
+| 文件 | build tag | 内容 | 可在 Linux 测试 |
+|---|---|---|---|
+| `flowtls/windivert_filter.go` | 无 | Address / Filter / VM 编码 / 过滤器构造器 | ✅ **是** |
+| `flowtls/windivert_filter_test.go` | 无 | 编码字节级断言 | ✅ **是** |
+| `flowtls/windivert_windows.go` | `windows && (amd64\|\|386)` | Handle、DeviceIoControl、驱动安装 | ❌ |
+| `flowtls/windivert_assets_windows.go` | 同上 | `go:embed` 驱动 + 许可证 | ❌ |
+| `flowtls/windivert_assets/` | — | `WinDivert64.sys` / `WinDivert32.sys` / `LICENSE.txt` | — |
+| `flowtls/socket_windows.go` | `windows && (amd64\|\|386)` | `rawSocket` 实现 | ❌ |
+| `flowtls/socket_stub.go` | `!linux && !windows` | 其余平台空实现 | — |
+| `flowtls/rules_windows.go` | `windows` | 空规则（解释为什么不需要） | — |
+
+**为什么把过滤器编码单独拆成无 tag 文件**：VM 指令布局（`field:11 | test:5 |
+success:16`、24 字节、小端）是纯字节操作，写错的概率远高于 syscall 部分，
+而它**可以在 Linux 上做字节级断言**。这是本项目里唯一能真正验证的 Windows 相关逻辑。
+
+## W6. 与 Linux 的常量/行为差异
+
+| 项 | Linux | Windows | 说明 |
+|---|---|---|---|
+| 批量发送上限 | `maxSendBatch=64` | `BatchMax=255` | 取 64 保持一致 |
+| 批量接收 | 逐帧（`recvmmsg` 默认关） | 逐帧（`RecvBatch` 未启用） | 同 Linux 结论：无收益 |
+| 收包缓冲 | 256KB | `MTUMax`=40+65535 | WinDivert 按 IP 总长切分 |
+| 堆积队列 | `SO_RCVBUF 8MB` | 驱动默认（未导出调参） | 绑定未导出 `WinDivertSetParam` |
+| QDISC_BYPASS | 驱动白名单 | 无对应物 | — |
+| ARP / 下一跳 MAC | 必需 | **完全不需要** | 注入在 IP 层 |
+| 源地址纠正 | 必需（NAT 云主机） | 不需要 | 非 Linux 场景 |
+| 建连固定开销 | 0（已修 ARP 白查） | 0 | — |
+
+**白捡的好处**：`resolveNeighborMAC` / `arpLookup` / `addrOnHost` /
+`isLocalDst` / `interfaceDriver` 这一整套在 Windows 上都不需要，
+`newRawSocket` 的 Windows 版本只有约 60 行。
+
+## W7. 验证策略（如实记录能力边界）
+
+| 项目 | 状态 | 手段 |
+|---|---|---|
+| 交叉编译 windows/amd64 + 386 | ✅ 可做 | `GOOS=windows go build ./...` |
+| 过滤器 VM 编码 | ✅ 可做 | 字节级单测（无 build tag） |
+| 批量收发包拼接（back-to-back + Address 数组） | ✅ 可做 | 抽成纯函数后单测 |
+| 全平台编译门禁（含 darwin/freebsd） | ✅ 可做 | CI + `make verify` |
+| **WinDivert 驱动交互** | ❌ **阻塞** | 需要 Windows 主机 |
+| **Windows 上端到端连通** | ❌ **阻塞** | 需要 Windows 主机 + 服务端 |
+| **Windows 性能指标** | ❌ **阻塞** | 同上，且需同链路对照 |
+
+**必须说清的结论**：本轮交付的是「编译通过 + 纯逻辑单测通过」。
+**没有一行 Windows 代码在真机上跑过**。首次部署必须按 §W9 的手工清单验证。
+
+## W8. 已知限制与风险
+
+| 项 | 严重度 | 说明 |
+|---|---|---|
+| **杀软拦截驱动** | ⚠️ 高 | WinDivert 被大量恶意软件滥用，360 / Defender / 火绒常直接拦加载。这是**部署层**问题，代码无法绕过 |
+| 需要管理员权限 | ⚠️ 中 | 与 Linux root 对等，`ERROR_ACCESS_DENIED` |
+| 性能预期更差 | ⚠️ 中 | 每包一次内核↔用户拷贝 + WFP callout。Linux 侧内核态已占 46%，Windows 只会更高 |
+| 仅 amd64 / 386 | ⚠️ 中 | 上游无 arm64 驱动资产；Windows ARM64 不支持 |
+| 过滤器无法动态改 | 低 | `source_port` / `listen_port` 变更需重建连接（本来也是） |
+| 驱动落盘路径 | 低 | `%LocalAppData%\flowtls\windivert\v2.2.2\`。**不**复用官方 sing-box 的目录：两个产品的驱动版本会一起漂移。若官方 sing-box 已把 WinDivert 服务跑起来，`CreateFile` 会直接成功并复用该服务；版本不匹配时 IOCTL 的 magic/版本校验会明确报错，不会静默错配 |
+| 服务端跑在 NAT 后 | 低 | 未做源地址纠正，Windows 服务端部署属非常规场景 |
+
+**WSL2 仍然是更省事的 Windows 方案**：完整 Linux 内核，`AF_PACKET` 可用，
+直接跑现有 linux-amd64 二进制，性能与 Linux 一致。仅在需要「真正 Windows 原生
+进程 + 不需要 WSL」时才用 B 路线。
+
+## W9. 首次部署的手工验证清单（未验证项）
+
+```powershell
+# 1. 以管理员身份运行，确认驱动能装
+.\sing-box.exe run -c client.json
+#    期望：日志出现 "发送路径: windivert"
+#    失败 ERROR_ACCESS_DENIED  → 不是管理员
+#    失败 1275 (ERROR_DRIVER_BLOCKED) → 杀软拦截，需加白名单
+
+# 2. 确认驱动落盘
+dir %LocalAppData%\sing-box\windivert\v2.2.2\
+
+# 3. 确认服务注册
+sc query WinDivert
+
+# 4. 端到端
+curl -x http://admin:PASSWORD@127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace
+#    期望输出服务端 IP
+
+# 5. 服务端伪装站不受影响（服务端在 Windows 时才需要）
+curl -k https://<server>:8443/
+#    期望真证书站点正常响应（验证 §W4 的重新注入生效）
+
+# 6. 卸载：删 .sys 或 sc stop WinDivert && sc delete WinDivert
+```
+
+## W10. 实施顺序（状态）
+
+| # | 事项 | 文件 | 状态 |
+|---|---|---|---|
+| 1 | 过滤器 VM + 批量拼接 + Address 布局 + 9 个单测 | `windivert_filter.go` / `windivert_filter_test.go` | ✅ |
+| 2 | Handle + IOCTL + 驱动安装/资产 | `windivert_windows.go` / `windivert_assets*` | ✅ 编译通过，未真机运行 |
+| 3 | `rawSocket` 实现 | `socket_windows.go` | ✅ 编译通过，未真机运行 |
+| 4 | `consumed` 拆分 + `Reinject` | `listener.go` | ✅ （Linux 路径行为不变，由单测覆盖） |
+| 5 | `socket_stub.go` build tag 调整 | `socket_stub.go` | ✅ `!linux && !windows` |
+| 6 | 空规则层 | `rules_windows.go` | ✅ `init()` 关掉 `rulesBackendEnabled` |
+| 7 | Makefile / CI 门禁 | `Makefile` `platforms`，`ci.yml`，`build.yml` | ✅ 8 个平台组合 |
+| 8 | 文档 | `AGENTS.md` / `README.md` / `DEVTIPS.md` / `CHANGELOG.md` | ✅ |
+
+### 实施中修正的两个设计细节
+
+1. **不把 `IP ID` 判断写进 WinDivert 过滤器**。原计划想用 `ip.Id` 字段在驱动侧
+   过滤掉非本协议的包（省掉每包一次用户态判断）。放弃原因：`windivert.h` 没有
+   vendor 进本仓库，`ip.Id` 的字段号无法核对，而字段号错一位的后果是
+   **一个包都收不到** —— 与「链路断了」表现完全相同，排查成本极高。
+   现在 IP ID 标记仍在用户态 `handlePacket` 里判断，过滤器只按「入向 + TCP +
+   端口」粗筛。多一次用户态判断，换来可排查性。
+2. **`socketRole` 从 `socket_windows.go` 移到 `socket_common.go`**。
+   Linux 的 `newRawSocket` 也要用这个类型，留在 Windows 文件里会让 Linux 编译
+   直接失败（`_windows.go` 后缀的文件不参与 Linux 构建）。
+
+### 顺带修掉的既有 bug
+
+`socket_stub.go`（macOS/FreeBSD）**一直编译不过**：上层按**字段**读
+`s.raw.localIP`，而 stub 里只有 `LocalIP()` 方法，没有字段。这个文件自己的注释
+还写着「保证能交叉编译」。发行目标只有 Linux，CI 也没跑这些平台，所以从未被
+发现。现在 `make verify` 与 CI 都跑 8 个平台组合的编译门禁。

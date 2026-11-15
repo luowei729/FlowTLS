@@ -142,8 +142,12 @@ jobs:
       # 一个平台失败不取消其他平台：arm 挂了也该看到 amd64 能不能出。
       fail-fast: false
       matrix:
-        # FlowTLS 使用 Linux raw socket；非 Linux 的 socket_stub.go 不提供协议运行所需的字段和批量发送实现。
+        # Linux 是主力发行目标（AF_PACKET + iptables）。
+        # Windows 走 WinDivert 驱动，只支持 amd64/386（驱动资产只有这两份）。
+        # macOS / FreeBSD 不发行：没有等价的包拦截能力，能编译但跑不起来。
         include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: "386" }
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
           - { goos: linux, goarch: arm, goarm: "5", suffix: "v5" }

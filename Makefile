@@ -67,8 +67,12 @@ release-musl:
 # leak_check 必须在这里，不能只放 CI：2026-11-15 有一次先写了测量脚本、
 # 忘了跑门禁就提交，真实跳板与服务端 IP 直接进了远端。
 # 本地验收入口能拦住的事，不该等 CI。
+#
+# platforms 也在这里：它只要几秒，但能拦住「改了 rawSocket 字段名导致
+# macOS/Windows 编译不过」这类回归——历史上 socket_stub.go 漏了 localIP
+# 字段，macOS 长期编译不过而没人发现（发行目标只有 Linux）。
 .PHONY: verify
-verify: build
+verify: build platforms
 	@echo "=== version ==="
 	@./$(BIN) version
 	@echo "=== assertions ==="
@@ -79,6 +83,26 @@ verify: build
 	@echo "=== leak check ==="
 	@bash docs/leak_check.sh
 	@echo "OK"
+
+# 全平台编译门禁（只编 flowtls 模块，不编 sing-box，几秒内跑完）。
+#
+# 为什么要覆盖 darwin/freebsd：这两个平台永远不会运行，但它们**必须能编译**——
+# `sing-box check` 在 macOS 上是常事，编译不过等于适配层白写。
+# 只编不跑，因此不需要任何特权。
+PLATFORMS := linux/amd64 linux/arm64 linux/arm windows/amd64 windows/386 \
+             darwin/amd64 darwin/arm64 freebsd/amd64
+
+.PHONY: platforms
+platforms:
+	@set -e; cd flowtls; \
+	for p in $(PLATFORMS); do \
+		os=$${p%%/*}; arch=$${p##*/}; \
+		if out=$$(GOOS=$$os GOARCH=$$arch go build ./... 2>&1); then \
+			echo "  ok   $$os/$$arch"; \
+		else \
+			echo "  FAIL $$os/$$arch"; echo "$$out"; exit 1; \
+		fi; \
+	done
 
 # 单独的泄露检查（不需要 build，提交前随时跑）
 .PHONY: leak
@@ -99,6 +123,11 @@ check: build
 test:
 	cd flowtls && go test -race ./...
 	cd $(UPSTREAM_DIR) && go test -race ./protocol/flowtls/...
+
+# Windows 产物（本机交叉编译，只用于验证能编译；正式发布走 build.yml）
+.PHONY: windows
+windows:
+	$(MAKE) build GOOS=windows GOARCH=amd64
 
 # 冻结向量门禁：验证 wire format 没有漂移，不需要 root、不需要 Rust
 .PHONY: interop

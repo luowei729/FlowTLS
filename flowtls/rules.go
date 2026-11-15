@@ -172,6 +172,17 @@ func ClientRules(sourcePort, serverPort, magic uint16) []string {
 	return out
 }
 
+// rulesBackendEnabled 决定 Ensure*/Check* 是否真的操作 iptables。
+//
+// 为什么需要这个开关：本文件是平台中性的（`sing-box check` 要在所有平台
+// 都能编译），但 iptables 只在 Linux 上存在。Windows 用 WinDivert 的
+// **扣留**语义天然屏蔽了内核对伪包的处理，完全不需要任何防火墙规则
+// （详见 rules_windows.go 文件头）。
+//
+// 默认 true（Linux 行为）；rules_windows.go 在 init 里改成 false。
+// 这样调用点不必按平台分叉，避免移植走样。
+var rulesBackendEnabled = true
+
 // runIPTables 执行一条 iptables 命令，返回是否成功（对应 Rust `iptables`）。
 //
 // 规则已存在时 `-A` 会报错，这里视为成功，保证幂等。
@@ -189,6 +200,9 @@ func runIPTables(args []string) (bool, error) {
 
 // EnsureServer 幂等写入服务端规则（对应 Rust `ensure_server`）。
 func EnsureServer(port, magic uint16) error {
+	if !rulesBackendEnabled {
+		return nil // Windows：WinDivert 已扣留伪包，内核看不到（见 rules_windows.go）
+	}
 	for _, r := range serverRules(port, magic) {
 		ok, err := runIPTables(r.command("-C"))
 		if err != nil {
@@ -210,6 +224,9 @@ func EnsureServer(port, magic uint16) error {
 
 // EnsureClient 幂等写入客户端规则（对应 Rust `ensure_client`）。
 func EnsureClient(sourcePort, serverPort, magic uint16) error {
+	if !rulesBackendEnabled {
+		return nil // Windows：同 EnsureServer
+	}
 	for _, r := range clientRules(sourcePort, serverPort, magic) {
 		ok, err := runIPTables(r.command("-C"))
 		if err != nil {
@@ -231,6 +248,9 @@ func EnsureClient(sourcePort, serverPort, magic uint16) error {
 
 // CheckServer 只检查规则是否存在，不修改（对应 Rust `check_server`）。
 func CheckServer(port, magic uint16) bool {
+	if !rulesBackendEnabled {
+		return true // Windows：无需规则，状态恒为「就绪」
+	}
 	for _, r := range serverRules(port, magic) {
 		ok, _ := runIPTables(r.command("-C"))
 		if !ok {
@@ -244,6 +264,9 @@ func CheckServer(port, magic uint16) bool {
 //
 // Rust 只检查 OUTPUT 那条（`check_client` 只看 RST 规则），这里保持一致。
 func CheckClient(sourcePort uint16) bool {
+	if !rulesBackendEnabled {
+		return true // Windows：同 CheckServer
+	}
 	ok, _ := runIPTables([]string{
 		"-C", "OUTPUT",
 		"-p", "tcp",

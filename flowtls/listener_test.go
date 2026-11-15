@@ -26,15 +26,8 @@ func newTestListener() *Listener {
 	}
 }
 
-// newTestRawSocket 返回一个「有源地址但发不出去」的 rawSocket。
-func newTestRawSocket() *rawSocket {
-	return &rawSocket{
-		sendFD:  -1,
-		recvFD:  -1,
-		localIP: netip.MustParseAddr("10.0.0.10"),
-		logger:  nopLogger{},
-	}
-}
+// newTestRawSocket 由平台测试文件提供（socket_linux_test.go / socket_windows_test.go）：
+// 两边的 rawSocket 字段完全不同，无法共用一份构造。
 
 // newTestSession 构造一个可安全关闭的最小会话。
 func newTestSession(peer netip.AddrPort, peerISN uint32) *Session {

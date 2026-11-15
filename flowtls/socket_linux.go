@@ -113,6 +113,14 @@ type rawSocket struct {
 	// 收包截断告警是本层唯一的日志点，级别为 Warn：
 	// 它意味着吞吐异常，但连接仍然可用，不应计入 Error。
 	logger Logger
+
+	// reinjectUnmatched 表示「未消费的包必须还给内核」。
+	//
+	// **Linux 恒为 false**：AF_PACKET 是内核处理的**被动复制**，
+	// 我们忽略一个包不影响内核继续处理同一份包。
+	// Windows 上才是 true（WinDivert 是扣留语义），两者的差异见
+	// PROJECT_PLAN.md §W2。
+	reinjectUnmatched bool
 }
 
 // newRawSocket 创建收发 socket（对应 Rust `RawSocket::new_with_local`）。
@@ -122,7 +130,7 @@ type rawSocket struct {
 // wantAFPacket 是**调用方对该方向的发送路径偏好**：服务端传 true，客户端传 false
 // （理由见文件头）。FLOWTLS_AF_PACKET 环境变量可以覆盖它。
 // logger 可为 nil，语义为静默。
-func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket bool) (*rawSocket, error) {
+func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket bool, role socketRole) (*rawSocket, error) {
 	if !dst.Is4() {
 		return nil, ErrPlatformUnsupported
 	}
@@ -252,6 +260,13 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 	}, nil
 }
 
+// Reinject 在 Linux 上是 no-op，**这是语义正确的，不是占位**。
+//
+// AF_PACKET 拿到的是内核正在处理的同一份包的副本：我们「忽略」一个包，
+// 内核依然会把它交给协议栈（伪装站的连接因此正常工作）。
+// 只有在 WinDivert 的扣留语义下才需要真的把包还回去，见 socket_windows.go。
+func (s *rawSocket) Reinject(pkt []byte) error { return nil }
+
 // LocalIP 返回构造 IP 头时使用的源地址。
 func (s *rawSocket) LocalIP() netip.Addr { return s.localIP }
 
@@ -296,12 +311,6 @@ func (s *rawSocket) Close() error {
 // htons 把主机序的 16 位常量转成网络序（AF_PACKET 的 protocol 字段要求）。
 func htons(v uint16) uint16 { return v<<8 | v>>8 }
 
-// errSocketClosed 在 raw socket 已关闭后返回。
-//
-// 必须与真实发送失败区分：Close 与「收包协程仍在发纯 ACK」天然存在竞态，
-// 而这属于正常关闭路径，不应该被当成链路故障计数/告警。
-var errSocketClosed = errors.New("flowtls: raw socket 已关闭")
-
 // Send 发送一个完整的 IPv4 报文（不含以太网头）。
 //
 // 对应 Rust `RawSocket::send`：flags 恒为 0（阻塞语义），与 Rust 完全一致。
@@ -335,16 +344,6 @@ func (s *rawSocket) destSockaddr(dst netip.Addr) syscall.Sockaddr {
 	}
 	return &syscall.SockaddrInet4{Addr: dst.As4()}
 }
-
-// maxSendBatch 是一次 sendmmsg 最多带多少个报文（对应 Rust `MAX_BATCH`）。
-//
-// 从 32 提到 64：单次 sendto 在 1 核 ARM 上实测 ~34µs，而 syscall 入口/出口
-// 本身就占相当比例（spectre 缓解的 clear_bhb_loop 在 perf 里能排到 2%）。
-// 64 个报文 = 一次 syscall 交 90KB 载荷，栈上 iovec+mmsghdr 共 5KB，无分配。
-//
-// 不取更大值的原因：发送队列深度只有 64（`txQueueDepth`），
-// 一次排空就够；再大只是把栈用量推高而不会减少 syscall。
-const maxSendBatch = 64
 
 // SendBatch 批量发送多个完整 IPv4 报文（同目的 IP），一次系统调用。
 //

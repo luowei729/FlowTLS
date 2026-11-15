@@ -1,3 +1,5 @@
+//go:build linux
+
 package flowtls
 
 // 本文件是 **AF_PACKET TX_RING 的可行性实验与结论存档**，不是生产代码。
@@ -85,7 +87,7 @@ func TestTxRingFeasibility(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{})
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}

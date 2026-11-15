@@ -21,4 +21,18 @@ var (
 
 	// ErrSessionClosed 表示底层会话已关闭。
 	ErrSessionClosed = errors.New("flowtls: 会话已关闭")
+
+	// ErrWindivertUnsupported 表示 Windows 上 WinDivert 不可用。
+	//
+	// 三种典型原因（都来自驱动交互，无法在编译期发现）：
+	//   - 没有管理员权限（CreateFile \\.\WinDivert 返回 ACCESS_DENIED）
+	//   - 驱动被安全软件拦截（ERROR_DRIVER_BLOCKED = 1275）
+	//   - 运行在 Windows ARM64（官方没有 arm64 驱动资产）
+	//
+	// 单独给它一个错误，是为了让上层能打出一条「该怎么办」的日志，
+	// 而不是把 ACCESS_DENIED 当成隧道故障。
+	ErrWindivertUnsupported = errors.New("flowtls: Windows 需要管理员权限且允许加载 WinDivert 驱动")
+
+	// errWindivertFilterTooLong 表示过滤器指令超过驱动上限（内部错误）。
+	errWindivertFilterTooLong = errors.New("flowtls: windivert 过滤器过长")
 )

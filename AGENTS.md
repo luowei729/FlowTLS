@@ -68,7 +68,14 @@ flowtls/                    独立 Go 模块 github.com/luowei729/flowtls
   addr.go                   地址帧编解码（流首帧 / DATAGRAM 内嵌）
   udp.go                    UDP 会话帧编解码
   socket_linux.go           AF_PACKET 收包 / IPPROTO_RAW 发包 / 默认路由与 ARP
-  socket_stub.go            非 Linux 空实现（保证能交叉编译）
+  socket_windows.go         WinDivert 收发包（扣留语义，见 DEVTIPS 133）
+  socket_common.go          平台共用的常量/类型（maxSendBatch、socketRole）
+  socket_stub.go            其余平台空实现（只保证能交叉编译，运行必失败）
+  windivert_filter.go       WinDivert 过滤器 VM 编码 + 批量拼接（无 build tag，可单测）
+  windivert_filter_test.go  9 个字节级单测（在 Linux 上就能跑）
+  windivert_windows.go      驱动句柄 / IOCTL / 驱动安装
+  windivert_assets/         随二进制内嵌的 WinDivert 驱动（LGPLv3）
+  rules_windows.go          Windows 不需要防火墙规则（扣留语义的副产品）
   session.go                单条会话，net.PacketConn 语义
   listener.go               服务端：共享 raw socket + 单收包协程 + 四元组分发
   rules.go                  iptables 规则构造（u32 匹配 IP ID 标记）+ auto/none
@@ -109,7 +116,8 @@ export PATH=/usr/local/go/bin:$PATH GOPATH=/root/go GOTOOLCHAIN=local
 
 # 全量构建（唯一发行入口）
 make build
-make verify                       # 验收：版本号带 rev、tags 带 with_flowtls
+make verify                       # 验收：版本号带 rev、tags 带 with_flowtls、全平台编译、泄露检查
+make platforms                    # 8 个 GOOS/GOARCH 组合的编译门禁（几秒，无需特权）
 
 # Go 模块单测
 cd flowtls && go test -race ./...
@@ -187,7 +195,13 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
     `make verify` 与 CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
     **测量/运维脚本连接哪台机器必须从环境变量取**（如 `FLOWTLS_SERVER`），
     不许写死地址或 `ssh -J 跳板`（`DEVTIPS.md` 第 131 条）。
-19. **本地客户端入口必须 `listen: "0.0.0.0"`**，不能写 `127.0.0.1`。
+19. **平台相关文件分三类**：`.go` 平台中性（能编译到所有平台）/
+    `_linux.go`、`_windows.go` 真实实现 / `socket_stub.go` 空实现。
+    空实现的**字段与方法集合必须与真实实现对齐**——上层按字段读
+    `s.raw.localIP`，stub 里只有 `LocalIP()` 方法就会让 macOS 编译不过。
+    这类错不会在 Linux 上暴露，所以 `make platforms` 是 `make verify` 的一部分
+    （`DEVTIPS.md` 第 135 条）。
+20. **本地客户端入口必须 `listen: "0.0.0.0"`**，不能写 `127.0.0.1`。
     这是部署要求，不是偏好：写回环时只有本机能连，局域网设备、Docker 容器、
     WSL、另一台虚机、手机热点共享全部连不上，而现象只是「连接被拒」，
     `sing-box check` 不会报任何问题。
@@ -198,6 +212,12 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 ## 已知限制
 
 - FakeTCP 目前只支持 IPv4。
+- **平台支持**：Linux 是唯一「完整验证」的目标；Windows 走 WinDivert 驱动，
+  **代码从未在真机上跑过**——只有交叉编译和过滤器编码的字节级单测通过。
+  首次部署必须按 `PROJECT_PLAN.md` §W9 的手工清单验证（管理员权限、
+  `sc query WinDivert`、curl 过 1080、伪装站可达）。风险：杀软拦驱动（高）、
+  必须管理员（中）、性能预期低于 Linux（中）、仅 amd64/386（无 arm64 驱动）。
+  macOS/FreeBSD 只能编译不能运行。**WSL2 仍是更省事的 Windows 方案**。
 - **UDP 不走重传也不分片**：QUIC DATAGRAM 语义，队列满/超 MTU 即丢（对齐 hysteria2）；
   单包上限约 1200 字节，更大的 UDP 报文直接丢弃。
 - 需要 root 或 CAP_NET_RAW。

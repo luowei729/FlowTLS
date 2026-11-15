@@ -30,7 +30,7 @@ func TestSendmmsgAcceptsKernelLayout(t *testing.T) {
 	// 目的地址用 8.8.8.8：它必然走默认路由，与生产环境的
 	// 「发往服务器公网 IP」是同一条路径。
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{server: true, listenPort: 8443})
 	if err != nil {
 		t.Skipf("无法创建 raw socket（可能缺 CAP_NET_RAW）: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestSendRejectsIPv6(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{server: true, listenPort: 8443})
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestRawSocketCloseIdempotent(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{server: true, listenPort: 8443})
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestRecvActuallyReceives(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{server: true, listenPort: 8443})
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestRecvBatchActuallyReceives(t *testing.T) {
 		t.Skip("需要 raw socket")
 	}
 	dst := netip.MustParseAddr("8.8.8.8")
-	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true, socketRole{server: true, listenPort: 8443})
 	if err != nil {
 		t.Skipf("无法创建 raw socket: %v", err)
 	}
@@ -260,5 +260,19 @@ func TestRecvSlotsMemory(t *testing.T) {
 	const want = 1024 * 1024
 	if total != want {
 		t.Fatalf("槽位总内存应为 %d 字节（1MB），实际 %d", want, total)
+	}
+}
+
+// newTestRawSocket 返回一个「有源地址但发不出去」的 rawSocket。
+//
+// sendFD / recvFD = -1：Send 会返回 errSocketClosed，被 noteSendError 忽略，
+// 因此测试分流逻辑既不需要 root 也不会真的发包。
+// localIP 必须有值，否则构包时 As4() 会 panic。
+func newTestRawSocket() *rawSocket {
+	return &rawSocket{
+		sendFD:  -1,
+		recvFD:  -1,
+		localIP: netip.MustParseAddr("10.0.0.10"),
+		logger:  nopLogger{},
 	}
 }

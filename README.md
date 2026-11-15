@@ -195,7 +195,7 @@ UDP 走 QUIC 的 **DATAGRAM 扩展（RFC 9221）**，入口是 SOCKS5 的 `UDP A
 make build
 
 # 产物
-#   dist/sing-box-1.14.4-rev.1-linux-amd64
+#   dist/sing-box-1.14.4-rev.3-linux-amd64
 ```
 
 版本号由根目录 `VERSION` 文件驱动，构建期用 ldflags 注入，
@@ -236,14 +236,16 @@ make upstream-pull TO=v1.15.0  # 同步上游 sing-box
 
 ```bash
 # 先做配置校验（不需要 root，这是硬要求）
-./dist/sing-box-1.14.4-rev.1-linux-amd64 check -c server.json
+./dist/sing-box-1.14.4-rev.3-linux-amd64 check -c server.json
 
 # 再启动（需要 root 或 CAP_NET_RAW）
-sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
+sudo ./dist/sing-box-1.14.4-rev.3-linux-amd64 run -c server.json
 ```
 
 > 需要 root（raw socket + iptables），且机器必须**直接持有公网 IP**。
-> `iptables_mode` 建议先用 `print` 看清规则，确认无误后改 `auto`。
+> `iptables_mode` 只有两个合法值：`auto`（启动时幂等写入，默认）和
+> `none`（自己维护）。启动日志会打印实际执行的每条命令，
+> 想先看清楚就把日志级别开到 `info` 再看。
 
 ### 客户端
 
@@ -275,7 +277,7 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c server.json
 ```
 
 ```bash
-sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json
+sudo ./dist/sing-box-1.14.4-rev.3-linux-amd64 run -c client.json
 
 # SOCKS5 / HTTP 共用 mixed 入口
 curl --socks5-hostname admin:abcd1234@127.0.0.1:1080 https://www.google.com
@@ -336,18 +338,35 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    更大的 UDP 报文会被丢弃；5~10% 的包会在跨境链路上丢失，
    依赖应用层自己重试。
 
-4. **需要 root 权限**
-   raw socket、AF_PACKET 需要 root 或 `CAP_NET_RAW`；iptables 规则同理。
+4. **平台支持：Linux 完整可用，Windows 已实现但未在真机验证**
 
-5. **默认避开 443 端口**
+   | 平台 | 状态 | 收发路径 |
+   |---|---|---|
+   | Linux | ✅ 完整验证 | `AF_PACKET` 收 + `IPPROTO_RAW` 发，需 iptables |
+   | Windows amd64/386 | ⚠️ 已实现，**未在真机跑过** | WinDivert 驱动，无需规则 |
+   | macOS / FreeBSD | ❌ 只能编译 | 无等价能力，构造即失败 |
+
+   Windows 侧只有交叉编译和过滤器编码的字节级单测通过（9 个），
+   **没有一行在 Windows 上执行过**。首次部署按 `PROJECT_PLAN.md` §W9 的手工
+   清单逐项验证。已知风险：杀软拦截 WinDivert 驱动（360/Defender/火绒都拦）、
+   必须管理员运行、性能预期低于 Linux、无 arm64 驱动。
+
+   **不想折腾驱动就用 WSL2**：完整 Linux 内核，直接跑 linux-amd64 二进制，
+   性能与 Linux 一致。
+
+5. **需要 root / 管理员权限**
+   Linux：raw socket、`AF_PACKET` 需要 root 或 `CAP_NET_RAW`，iptables 同理。
+   Windows：加载 WinDivert 驱动需要管理员（`ERROR_ACCESS_DENIED`）。
+
+6. **默认避开 443 端口**
    国内出口设备对 443 的伪造 TCP 检查更严，建议 8443 / 9443。
 
-6. **伪装网站需要真证书**
+7. **伪装网站需要真证书**
    不配 `masquerade` 时 inbound 只做隧道，需另起进程监听同端口。
    配了则由 inbound 自己 bind 该端口（这是唯一会 bind 内核 TCP 的地方）。
    两种方式都必须用真证书：探测者能看到证书链，自签等于自报家门。
 
-7. **iptables 规则不会自动删除**
+8. **iptables 规则不会自动删除**
    `iptables_mode: auto` 会幂等写入规则，但**刻意不删除**（进程重启期间规则必须
    继续生效，否则内核会回 RST 打断正在重建的隧道）。升级/卸载后要手工清，
    卸载命令由 `iptables_mode: print` 直接打印出来。

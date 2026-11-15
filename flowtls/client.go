@@ -37,7 +37,13 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	logger := loggerOr(cfg.Logger)
 	// 客户端传 false：下载方向客户端只发 ACK，发送量极小，
 	// 用 AF_PACKET 无收益却要付 ARP 探测与 NAT 风险（见 socket_linux.go 文件头）。
-	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{}, logger, false)
+	//
+	// role 只有 Windows 用：WinDivert 的过滤器在 Open() 时固定，
+	// 必须知道本端是客户端才能按四元组端口建过滤器。
+	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{}, logger, false, socketRole{
+		serverPort: cfg.Server.Port(),
+		sourcePort: cfg.SourcePort,
+	})
 	if err != nil {
 		return nil, err
 	}

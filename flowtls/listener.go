@@ -115,7 +115,12 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	dst := netip.MustParseAddr("8.8.8.8")
 	// 服务端传 true：下载方向的服务端要发全部数据，
 	// AF_PACKET 在 1 核 ARM 上比 IPPROTO_RAW 快 3~4 倍（见 socket_linux.go 文件头）。
-	raw, err := newRawSocket(dst, cfg.LocalIP, logger, true)
+	//
+	// role 只有 Windows 用（WinDivert 过滤器在 Open() 时固定，需要监听端口）。
+	raw, err := newRawSocket(dst, cfg.LocalIP, logger, true, socketRole{
+		server:     true,
+		listenPort: cfg.Listen.Port(),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +395,17 @@ func (l *Listener) recvFrame(raw []byte) *Session {
 	if p.DstPort != l.port {
 		return nil
 	}
-	return l.handlePacket(p)
+	sess, consumed := l.handlePacket(p)
+	if !consumed && l.raw.reinjectUnmatched {
+		// Windows（WinDivert）：这个包被驱动扣留了，我们不认识它。
+		// 必须原样还给内核，否则同端口伪装站的浏览器连接会被静默吞掉
+		// ——Linux 上 reinjectUnmatched 恒为 false，因为 AF_PACKET 只是
+		// 内核处理的副本，忽略它不影响内核继续处理。
+		if err := l.raw.Reinject(raw); err != nil {
+			l.logger.Warn("重新注入未识别的包失败: ", err)
+		}
+	}
+	return sess
 }
 
 // handlePacket 是分流核心（对应 Rust `handle_packet`）。
@@ -403,8 +418,12 @@ func (l *Listener) recvFrame(raw []byte) *Session {
 // 顺序不能反：「先试首包」会让已建立会话的每个包都多跑一次 authID 查表 +
 // 首包解密（必然失败），高包速率下白烧 CPU。
 //
-// 返回值是「本帧被投递进去的会话」，供 recvLoop 在批末统一做延迟确认。
-func (l *Listener) handlePacket(p ParsedPacket) *Session {
+// 返回值：
+//   - sess：本帧被投递进去的会话，供 recvLoop 在批末统一做延迟确认。
+//   - consumed：本帧是否已归属本协议。**Windows 上未消费的包必须重新注入**，
+//     否则 WinDivert 扣留的包会被销毁（伪装站失效）。
+//     Linux 上 AF_PACKET 是被动复制，未消费即"内核照常处理"，天然正确。
+func (l *Listener) handlePacket(p ParsedPacket) (*Session, bool) {
 	client := netip.AddrPortFrom(p.Src, p.SrcPort)
 
 	// 1) 纯 SYN：标准握手第一步，立即回 SYN-ACK。
@@ -413,28 +432,36 @@ func (l *Listener) handlePacket(p ParsedPacket) *Session {
 	// `(ip_id & mark) == mark && SYN && payload.is_empty()`。
 	if p.IPID&l.mark == l.mark && p.Flags&TCPSYN != 0 && len(p.Payload) == 0 {
 		l.handleSYN(client, p)
-		return nil
+		return nil, true
 	}
 
 	// 2) 已有会话
 	if sess := l.sessionFor(client); sess != nil {
 		if sess.closed.Load() {
 			l.dropSession(client)
-			return nil
+			// **必须返回 consumed=true**：这个四元组是我们的（只是会话刚关），
+			// 还给内核会怎样？内核没有对应 socket，会回一个 RST 给对端。
+			// 中间设备看到自己跟踪的连接被 RST 就拆 NAT 映射，
+			// 而我们正在重建同一四元组（客户端源端口固定）。
+			// 所以这里是「我们认识，主动丢弃」，不是「不是我的，还回去」。
+			return nil, true
 		}
 		sess.handleIncoming(p)
 		if sess.closed.Load() {
 			l.dropSession(client)
-			return nil
+			return nil, true // 同上：认识的四元组，消费掉
 		}
-		return sess
+		return sess, true
 	}
 
 	// 3) 未知来源的数据包：可能是首包
 	if len(p.Payload) > 0 {
-		l.handleFirstPacket(client, p)
+		if l.handleFirstPacket(client, p) {
+			return nil, true
+		}
 	}
-	return nil
+	// 不认识：不消费（Windows 会重新注入给内核）。
+	return nil, false
 }
 
 // sessionFor 查已有会话。
@@ -514,7 +541,12 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
 //
 // 服务端在不知道用户是谁时必须先读明文头（ver + authID）查表选密钥，
 // 解析本身不构成信任——真正的鉴权是随后的 AEAD 认证（OpenFirst）。
-func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
+// 返回值 consumed 表示「本帧已归属本协议」。
+//
+// **这个返回值在 Windows 上是必需的**：WinDivert 扣留的包若不归还内核就等于
+// 丢弃，未消费的包必须重新注入（见 socket_windows.go 的 Reinject）。
+// Linux 上它只用于日志/正确性表达，AF_PACKET 是内核的被动复制。
+func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (consumed bool) {
 	var (
 		plain   []byte
 		entry   *userEntry
@@ -540,8 +572,9 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 		break
 	}
 	if !firstOK {
-		// 不是我们的客户端，或密钥不对：静默丢弃（公网端口每天大量探测）。
-		return
+		// 不是我们的客户端，或密钥不对：不消费本帧（Windows 会把它还给内核）。
+		// 公网端口每天大量探测，Linux 上这里等于静默丢弃。
+		return false
 	}
 
 	l.mu.Lock()
@@ -611,6 +644,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) {
 	case <-l.ctx.Done():
 		_ = sess.Close()
 	}
+	return true
 }
 
 // newServerSession 构造服务端方向的会话。

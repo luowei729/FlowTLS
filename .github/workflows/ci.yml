@@ -128,6 +128,20 @@ jobs:
         working-directory: flowtls
         run: go vet ./...
 
+      # Windows 的驱动层是 syscall 密集代码，go vet 能刷出一批
+      # 只在目标平台上才看得到的错误（未使用变量、错位的 unsafe 转换）。
+      - name: go vet（windows）
+        working-directory: flowtls
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go vet ./...
+
+      # 全平台编译门禁。历史上 socket_stub.go 漏了 localIP 字段，
+      # macOS/FreeBSD 长期编译不过而没人发现（发行目标只有 Linux）。
+      - name: 全平台编译
+        run: make platforms
+
       # wire format v2 的绝对字节基线。
       # Rust 参考实现已冻结在 legacy-rust 分支，但它导出的黄金向量在仓库里，
       # 所以这道门禁不需要 Rust 工具链。

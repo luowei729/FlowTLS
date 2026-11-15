@@ -3983,3 +3983,104 @@ quic-go/connection.go:536
 以后要探索的方向已写进 `PROJECT_PLAN`，按性价比排序：
 重写 `internal/` 常量（违反约束 9，需单独评估）> 重标定 `cappedBbr` 阈值
 （不改依赖、风险最低）> 减少包数（上限 1%，不做）。
+
+---
+
+## 133. WinDivert 是「扣留」不是「旁听」：不是我的包必须还回去（2026-11-15 18:30）
+
+移植最大的坑不是编码或 IOCTL，是**语义**。两条路径对「这个包不是我的」的处理
+完全相反：
+
+| | Linux `AF_PACKET` | Windows `WinDivert` |
+|---|---|---|
+| 内核看到这个包吗 | **看到**（我们是旁路复制） | **看不到**（包被驱动摘走） |
+| 「不是我的包」正确动作 | **忽略即可** | **必须 `Send` 回去** |
+| 忘记处理的后果 | 无（内核照旧处理） | 包被销毁：同端口真实网站静默失效 |
+
+所以 `listener.go` 的 `handlePacket` 返回了第二个值 `consumed`：
+
+```go
+// handlePacket 报告这个包是否被本协议消费。
+// 未消费的包在 Windows 上必须重新注入（AF_PACKET 上 Reinject 是空操作）。
+func (l *Listener) handlePacket(p []byte) (*Session, bool)
+```
+
+`recvFrame` 里只要 `!consumed && l.raw.reinjectUnmatched` 就调 `Reinject`。
+`Reinject` 在 Linux 上是**语义正确的空实现**（返回 nil，不是「不支持」）：
+AF_PACKET 是被动复制，内核本来就有这个包，再注入一次会发重复包。
+
+顺带一个反直觉的结论：**Windows 不需要任何 iptables 等价物**。Linux 上必须用
+`raw/PREROUTING` 把伪包 DROP 掉，否则内核会对「不存在的连接」回 RST，而 RST 会
+让中间设备拆 NAT 映射。Windows 上被扣留的包内核从没看见，RST 根本不会产生。
+Linux 需要「DROP 规则 + 旁路收包」两个机制配合，Windows 一个过滤器就同时办到了。
+（`rules_windows.go` 的 `init()` 把 `rulesBackendEnabled` 置 false 就是这个道理。）
+
+### 注入会不会形成自环
+
+不会。WinDivert 文档明确「同一优先级的包只被扣留一次」，而我们只开一个句柄。
+若为了「收发分离」拆成两个句柄，第二个句柄会收到第一个句柄注入的包 → 自环 →
+每包被复制一次，表现为 QUIC 疯狂重传。**不要拆。**
+
+---
+
+## 134. 无法核对的驱动字段号，宁可不写进过滤器（2026-11-15 18:30）
+
+原设计想在 WinDivert 过滤器里直接用 IP ID 标记筛包（省掉每包一次用户态判断）：
+
+```
+inbound and ip and tcp.DstPort == 8443 and ip.Id >= 0xf100 and ip.Id <= 0xf1ff
+```
+
+放弃原因值得单独记一条：**`windivert.h` 没有 vendor 进本仓库**，
+`ip.Id` 的字段号（18）无法在本仓库内核对。而字段号错一位的后果不是报错，是
+**一个包都收不到** —— 与「服务端没开」「防火墙挡了」「链路断了」的表现完全
+相同。这类故障在 Windows 上没有 `tcpdump` 那种一眼看穿的排查手段。
+
+最终方案：过滤器只按「入向 + IPv4 + TCP + 端口」粗筛，IP ID 标记继续在用户态
+`handlePacket` 里判断（`(ip_id & mark) == mark`）。代价是每包多一次内存读取，
+换来「出问题时能加日志看清是收不到还是判断错」。
+
+**一般化**：只把能对着仓库里源码或文档逐字核对的常量写进内核侧/驱动侧。
+核对不了的，放用户态。用户态多花的那点 CPU，永远比「静默收不到包」便宜。
+
+字段号现在只用这几个（都在 `windivert_filter.go` 里带注释）：
+`Zero=0 Inbound=1 Outbound=2 IP=5 TCP=8 TCPSrcPort=38 TCPDstPort=39`。
+
+---
+
+## 135. 全平台编译门禁：字段名不一致能让 macOS 坏半年没人发现（2026-11-15 18:30）
+
+`socket_stub.go`（macOS/FreeBSD 空实现）自己的注释写着「保证能交叉编译」，
+实际**从来没编译过**：
+
+```go
+// 上层代码（client.go:129 / listener.go:175）：
+if s.raw.localIP.IsValid() { ... }   // 按**字段**读
+// socket_stub.go 里只有：
+func (s *rawSocket) LocalIP() netip.Addr { ... }   // 方法，不是字段
+```
+
+`GOOS=darwin go build` 报的是 `s.raw.localIP undefined (type *rawSocket has no
+field or method localIP, but does have method LocalIP)`。
+
+为什么半年没人发现：发行目标只有 Linux，CI 也只编 Linux。而 macOS 上的
+`sing-box check` 是真实场景（Mac 用户写配置要先校验），编译不过等于适配层白写。
+
+修法两层：
+
+1. 空实现的**字段/方法集合必须与真实实现对齐**，不是「能过编译就行」。
+   `rawSocket` 的 `localIP` 是字段，stub 就也必须是字段。
+2. `make verify` 与 CI 都跑 `make platforms`（8 个组合，只要几秒）：
+
+```
+linux/amd64 linux/arm64 linux/arm
+windows/amd64 windows/386
+darwin/amd64 darwin/arm64 freebsd/amd64
+```
+
+只编不跑，不需要任何特权。**darwin/freebsd 永远不会运行，但必须能编译。**
+
+同一类问题的另一个来源：`listener_test.go` 曾直接 `&rawSocket{sendFD: -1, ...}`
+构造对象，而 Windows 的 `rawSocket` 没有 `sendFD` 字段。现在测试辅助按平台
+拆成 `socket_linux_test.go` / `socket_windows_test.go` 各一份 `newTestRawSocket`，
+公共断言留在 `listener_test.go`（无 build tag）。
