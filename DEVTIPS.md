@@ -3940,3 +3940,46 @@ AAA-BBB 会把漂移**全部记在 A/B 差值上**；ABAB 则把它均摊到两�
 另外：真实的跳板与服务端 IP 之前已被判定为**已泄露并应按泄露处置**
 （CHANGELOG 2026-11-15 01:10），所以这次复发没有额外扩大暴露面，
 但它仍然是错的——门禁存在的意义就是不让「反正已经泄露了」变成习惯。
+
+## 132. 「转向 quic-go 用户态路径」这个待办，三样里两样改不了（2026-11-15 17:30）
+
+上一轮在 `PROJECT_PLAN` 里留了一条「下一步应转向用户态传输层
+（ACK 策略 / 发送调度 / BBR 参数）」。逐行读完依赖后必须收回一半：
+**ACK 策略和 pacing 根本没有配置入口**。
+
+查证位置（都是硬常量，不是配置）：
+
+```
+quic-go/internal/ackhandler/received_packet_tracker.go:79
+    const packetsBeforeAck = 2
+quic-go/internal/protocol/params.go:150
+    const MaxAckDelay = 25 * time.Millisecond
+quic-go/connection.go:536
+    false, // ACK_FREQUENCY is not supported yet
+```
+
+`quic.Config` 的 30 个字段里没有一个是 ACK 或 pacing 相关。
+
+**连带结论：hy2（sing-box 版）也改不了。** 它和我们用同一份
+`sagernet/quic-go` fork，`hysteria2/client.go` 里 grep `ack` 零命中。
+所以「hy2 比我们 ACK 更激进」这个猜测不成立——两边一样。
+
+**我们比 hy2 少的**：`bbrProfile` 配置项（我们硬编码 `ProfileStandard`）
+与 Brutal 拥塞控制（Rust 版也没有，刻意不加）。
+**我们比 hy2 多的**：`cappedBbr` 窗口上限钳制 + 丢包率自适应窗口。
+
+**发送调度的差异不是设计选择**：hy2 靠内核 UDP GSO 合批（1 次 64KB），
+我们跑在 AF_PACKET 上**没有 GSO**，所以只能手写 `sendmmsg(64)`。
+换句话说 sendmmsg 不是「优化」，是「没有 GSO 的必然替代品」。
+
+顺带记一处**实现与设计文档的偏离**：`PROJECT_PLAN §3` 写的是
+「`WriteTo` 内同步 sendto（无队列、无额外协程）」，实际实现有
+`txCh`(64) + 独立 `txLoop`。历史原因是 sendmmsg 必须攒批。
+这个偏离有代价——quic-go 在调 `WriteTo` **之前**就记录了发送时刻，
+本地排队会被算成网络 RTT。v1 用 4096 深队列曾把 RTT 从 73ms 抬到 213ms，
+现在 64 深 + 醒来立即排空把影响压到 srtt 80~85ms（≈ 链路 74ms + 延迟确认）。
+**知道它是有代价的设计，比以为它免费要好。**
+
+以后要探索的方向已写进 `PROJECT_PLAN`，按性价比排序：
+重写 `internal/` 常量（违反约束 9，需单独评估）> 重标定 `cappedBbr` 阈值
+（不改依赖、风险最低）> 减少包数（上限 1%，不做）。

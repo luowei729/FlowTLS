@@ -469,3 +469,112 @@ skb 分配、设备 DMA、软中断、部分 netfilter。用户态能动的四�
 
 **下一步方向应转向用户态传输层**（quic-go 的 ACK 策略 / 发送调度 / BBR 参数）
 或**减少包数**，而不是继续在 socket 层找收益。
+
+### quic-go 用户态路径的可动范围（2026-11-15 17:30）—— 读完代码后的实测结论
+
+上一节写「下一步方向应转向用户态传输层（ACK 策略 / 发送调度 / BBR 参数）」。
+逐行读完 `sagernet/quic-go`、`sing-quic/congestion_meta2` 与
+`sing-quic/hysteria2` 之后，这个建议要**大幅下调预期**：三样里有两样改不了。
+
+#### 先明确「三方」是谁
+
+```
+quic-go 上游 (quic-go/quic-go)
+    └─ fork → sagernet/quic-go v0.61.0-sing-box-mod.12   ← 我们与 hy2 共用
+            ├─ hy2 (sing-quic/hysteria2)
+            └─ flowtls（+ 我们自己的 cappedBbr）
+```
+
+**我们和 sing-box 里的 hy2 用的是同一份 quic-go fork、同一个 BBR 库。**
+所以差异不在库，而在各自在上面叠了什么。
+
+#### 1. ACK 策略：三方都改不了
+
+| 位置 | 内容 |
+|---|---|
+| `internal/ackhandler/received_packet_tracker.go:79` | `const packetsBeforeAck = 2` |
+| `internal/protocol/params.go:150` | `const MaxAckDelay = 25 * time.Millisecond` |
+| `connection.go:536` | `false, // ACK_FREQUENCY is not supported yet` |
+
+`quic.Config` 的 30 个字段里**没有任何 ACK 或 pacing 相关项**。
+
+| 实现 | ACK 可调 |
+|---|---|
+| 原版 quic-go | ❌ 常量写死 |
+| sagernet fork | ❌ 只加了解析，不发 ACK_FREQUENCY 帧 |
+| hy2（sing-box 版） | ❌ 同一份 fork，`hysteria2/client.go` grep `ack` 零命中 |
+| **我们的 Rust 版** | ✅ quinn 有 `ack_frequency(max_ack_delay=5ms)` |
+
+这是 Go 版与 Rust 版唯一确定无法对齐的项（差异 D）。
+要改必须 fork quic-go 改 `internal/` 常量 → 违反 `AGENTS.md` 约束 9。
+
+> 实际影响比看起来小：`packetsBeforeAck=2` 意味着批量传输时每 2 包立即回 ACK，
+> 25ms 只是「凑不满 2 包」的兜底，只对稀疏流量（单次 HTTP 请求）生效。
+
+#### 2. 发送调度：差异最大，但不是设计选择
+
+| 实现 | 方式 | 每批 syscall |
+|---|---|---|
+| 原版 quic-go / hy2 | `WriteTo` 每包 `sendto`，靠内核 **UDP GSO** 合批 | 1 次发 64KB |
+| **我们** | `txCh`(64) → `txLoop` 攒批 → **`sendmmsg(64)`** | 1 次发 ~90KB |
+
+根因：**GSO 是 UDP 特性**。我们跑在 `AF_PACKET` 伪造 TCP 上，
+`Config.GSO` 无意义，内核不会帮我们 segmentation。
+所以 sendmmsg 批量化不是优化选择，是**没有 GSO 后的必然替代品**。
+
+**已知偏离**：`§3` 写的是「`WriteTo` 内同步 sendto（无队列、无额外协程）」，
+当前实现是排队的。历史原因是 sendmmsg 必须攒批。
+风险有记录（DEVTIPS：v1 用 4096 深队列曾把 RTT 从 73ms 抬到 213ms），
+现在 `txQueueDepth=64` + 醒来立即排空把影响压住了（实测 srtt 80~85ms），
+**但这个设计是有代价的，不是免费的**。
+
+#### 3. BBR 参数：同库，我们少了两个旋钮
+
+BBR 本体同源（`congestion_meta2` 移植自 quiche `bbr_sender.cc`）。
+`ProfileStandard` 实际参数：
+
+```
+highGain = 2.885 (2/ln2)   highCwndGain = 2.0
+congestionWindowGainConstant = 2.0   numStartupRtts = 3
+bytesLostMultiplier = 2
+```
+
+| 能力 | hy2 | 我们 |
+|---|---|---|
+| 选 Profile | ✅ `bbrProfile` 配置项 | ❌ 硬编码 `ProfileStandard` |
+| Brutal 拥塞控制 | ✅ | ❌（Rust 也没有，刻意不加） |
+| **窗口上限钳制** | ❌ | ✅ **`cappedBbr`** |
+| 按丢包率自适应窗口 | ❌ | ✅ 每 2s ×0.9 / ×1.2 |
+
+`cappedBbr` 是我们独有的一层，也是唯一能防止 BBR 把窗口打到虚高的机制。
+
+#### 4. 传输参数差异
+
+| 参数 | 我们 | hy2 | 原因 |
+|---|---|---|---|
+| `InitialPacketSize` | **1332** | 默认 1280 | 外层封装固定 33 字节算出来的 |
+| `DisablePathMTUDiscovery` | **true** | false（Linux 开） | 跨境丢包被 BlackHoleDetector 误判打回 1200 |
+| `StreamReceiveWindow` | 4MB | 8MB | quinn 组装器 `MAX_CHUNKS=1024` 约束 |
+| `ConnReceiveWindow` | 16MB | 20MB | 同上 |
+| `MaxIdleTimeout` | 30s | 30s | 一致 |
+
+#### 结论：能动的只剩常量微调
+
+| 分类 | 项 | 处置 |
+|---|---|---|
+| ✅ 已动 | 加密算法（AES）、AF_PACKET+QDISC_BYPASS、cappedBbr | 完成 |
+| ⚠️ 可尝试 | 换 `ProfileConservative` | **已测失败**：同时改坏三个增益参数，突发丢包下 <0.12 MB/s |
+| ⚠️ 可尝试 | 调 `cappedBbr` 自适应阈值 | lossHighMark/LowMark 已调过（15%/0.85 太激进） |
+| ⚠️ 可尝试 | 调 `StreamReceiveWindow` | 4MB 是组装器算出的安全值 |
+| ⚠️ 可尝试 | 缩短 `txCh` 排队 | 已 64，再小牺牲 sendmmsg 收益 |
+| ❌ 卡死 | ACK 策略 / pacing / send_window / 初始窗口 | 无配置入口，改了违反约束 9 |
+
+**以后要探索的方向（按性价比排序）**：
+
+1. **重写 `internal/` 常量**（fork 或 `replace` 到本地副本）——
+   唯一能拿到 ACK 5ms 收益的路，但违反约束 9，要单独评估是否值得。
+2. **实测 `cappedBbr` 阈值的重新标定**——用真链路多时段数据，
+   而不是拍脑袋的 20%/5%。这条不需要改依赖，风险最低。
+3. **减少包数**：受路径 MTU 限制，上限约 1% → 不做。
+4. **接受现状**：内核态与用户态都已逐个量完，
+   单流 16.8 MB/s / 4 并发 17.0 MB/s 已是这条链路 + 这个实现的合理水平。

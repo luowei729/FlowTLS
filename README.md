@@ -8,9 +8,6 @@
 最早验证协议的 Rust 实现已冻结在 `legacy-rust` 分支，仅作参考实现与历史记录
 （详见 [`docs/EVOLUTION.md`](docs/EVOLUTION.md)）。
 
-正式版通过 GitHub Actions 手动打包发布。开发者先手动同步 sing-box 正式 Release
-源码及依赖，再触发全架构构建；测试和所有目标构建通过后才创建正式 Release。
-
 ## 它解决什么问题
 
 | 场景 | 传统方案的问题 | FlowTLS 的做法 |
@@ -74,7 +71,7 @@ FlowTLS 用 raw socket 绕过内核 TCP 栈，自己构造 IP/TCP 头，把 TCP 
   │◀────────── 数据 ────────▶│
 ```
 
-代价只有建连时的 1 个 RTT（约 70ms），之后所有请求都在这条 QUIC 长连接上开新流，**不再握手**。
+代价只有建连时的 1 个 RTT，之后所有请求都在这条 QUIC 长连接上开新流，**不再握手**。
 
 ## 优势
 
@@ -329,7 +326,7 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
 
 1. **必须直接持有公网 IP**
    云主机只给内网地址 + NAT 映射时，网关会对 TCP 做状态检查，
-   FakeTCP 的裸 SYN 会被丢弃（实测 Oracle Cloud 上完全不可用）。
+   FakeTCP 的裸 SYN 会被丢弃。
 
 2. **只支持 IPv4**
    FakeTCP 层目前只处理 IPv4 报文。

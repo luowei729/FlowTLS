@@ -1,5 +1,42 @@
 # CHANGELOG
 
+## 2026-11-15 17:35 (北京时间)
+
+### 调研：quic-go 用户态路径的可动范围（ACK / 发送调度 / BBR）
+
+逐行读 `sagernet/quic-go`、`sing-quic/congestion_meta2`、`sing-quic/hysteria2`
+之后，把上一轮「转向用户态路径」的待办收敛成一张可执行的表。
+
+**核心发现：我们和 sing-box 里的 hy2 用的是同一份 quic-go fork、同一个 BBR 库。**
+
+| 项 | 原版 quic-go | hy2 | 我们 | 可调？ |
+|---|---|---|---|---|
+| ACK 策略 | 常量写死 | 同 | 同 | ❌ `packetsBeforeAck=2` / `MaxAckDelay=25ms` 都在 `internal/` |
+| pacing | 无入口 | 同 | 同 | ❌ |
+| BBR 本体 | — | `congestion_meta2` | 同 | ✅ 但我们硬编码 `ProfileStandard` |
+| Brutal | — | ✅ | ❌（刻意，Rust 也没有） | — |
+| 窗口钳制 | — | ❌ | ✅ `cappedBbr` + 丢包自适应 | — |
+| 发送批量化 | 靠 UDP **GSO** | 同 | **`sendmmsg(64)`** | 我们没 GSO，这是必然替代品 |
+
+另外记一处**实现与设计文档的偏离**：`PROJECT_PLAN §3` 写的是「`WriteTo`
+内同步 sendto（无队列）」，实际是 `txCh(64)` + 独立 `txLoop`。
+历史原因是 sendmmsg 必须攒批；代价是本地排队会被 quic-go 算成网络 RTT
+（v1 用 4096 深队列时抬到 213ms，现在 64 深压到 80~85ms）。
+如实记下：**它是有代价的设计，不是免费的**。
+
+`PROJECT_PLAN` 已按「性价比」重排后续方向：
+重写 `internal/` 常量（违反 AGENTS 约束 9，需单独评估）
+> 重标定 `cappedBbr` 阈值（不改依赖，风险最低）
+> 减少包数（上限 1%，不做）。
+
+### 安全：重写 `d77c0c67` 并强推，清除历史中的真实 IP
+
+`git filter-repo --replace-text` 把两个真实地址替换为 RFC 5737 占位值，
+`d77c0c67` → `6ae08093`，后续提交哈希同步变化，强推 `main`。
+
+验证：全历史 `git grep` 两个 IP 零命中；分支（`legacy-go`/`legacy-rust`）与
+3 个 tag 完好；`docs/leak_check.sh` PASS。备份在 `/tmp/FlowTLS-git-backup-155901`。
+
 ## 2026-11-15 17:10 (北京时间)
 
 ### 安全：测量脚本里写死了真实跳板与服务端 IP（CI 门禁抓到）
