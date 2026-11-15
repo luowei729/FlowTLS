@@ -146,8 +146,13 @@ jobs:
         # Windows 走 WinDivert 驱动，只支持 amd64/386（驱动资产只有这两份）。
         # macOS / FreeBSD 不发行：没有等价的包拦截能力，能编译但跑不起来。
         include:
+          # **只有 windows/amd64**。windows/386 编不出来，原因在上游：
+          # DEFAULT_BUILD_TAGS_WINDOWS 含 with_naive_outbound，它依赖
+          # cronet-go，而 cronet-go 没有 386 的实现
+          # （`build constraints exclude all Go files`）。
+          # 我们自己的 flowtls 模块是支持 386 的（WinDivert32.sys 也在），
+          # 一旦上游补齐 386 就可以直接加回来。
           - { goos: windows, goarch: amd64 }
-          - { goos: windows, goarch: "386" }
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
           - { goos: linux, goarch: arm, goarm: "5", suffix: "v5" }
@@ -258,6 +263,18 @@ jobs:
           cd dist
           mkdir -p "${DIR_NAME}"
           cp ../LICENSE "${DIR_NAME}/"
+          # WinDivert 驱动以字节数组内嵌进二进制、运行时落盘成 .sys 加载。
+          # 它是独立的 LGPLv3 作品（不是衍生物），但再分发必须附许可证原文，
+          # 否则不合规。只内嵌在二进制里用户拿不到，必须随包放一份。
+          # 只有 windows 产物内嵌驱动（embed 文件带 windows build tag），
+          # Linux 二进制里没有 WinDivert 字节，不需要附这份许可证。
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            mkdir -p "${DIR_NAME}/licenses"
+            cp ../flowtls/windivert_assets/LICENSE.txt \
+               "${DIR_NAME}/licenses/WinDivert-LGPLv3.txt"
+            cp ../flowtls/windivert_assets/SHA256SUMS \
+               "${DIR_NAME}/licenses/WinDivert-SHA256SUMS.txt"
+          fi
           if [ "${{ matrix.goos }}" = "windows" ]; then
             cp sing-box "${DIR_NAME}/sing-box.exe"
             zip -r "${DIR_NAME}.zip" "${DIR_NAME}"

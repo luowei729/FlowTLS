@@ -826,6 +826,34 @@ curl -k https://<server>:8443/
    Linux 的 `newRawSocket` 也要用这个类型，留在 Windows 文件里会让 Linux 编译
    直接失败（`_windows.go` 后缀的文件不参与 Linux 构建）。
 
+### 实现中推翻/修正的设计（**动手之后发现的，比计划更值钱**）
+
+1. **§W4 的「未消费就还给内核」不完整**。判据必须是 IP ID 标记，不是
+   「认证是否成功」：带标记但认证失败的包还给内核会引出 RST，中间设备拆
+   NAT 映射，而客户端源端口固定、正在重建同一四元组。已抽成
+   `shouldReinject` / `protocolOwned` 纯函数 + 真值表单测（`reinject_test.go`）。
+   详见 `DEVTIPS.md` 第 136 条。
+2. **收包地址不能存字段**。`WINDIVERT_ADDRESS` 必须与帧一起流动
+   （`frameHandle`），否则收包协程的下一次 `Recv` 会覆盖它，注入到错误的
+   接口上，表现为「伪装站偶发连不上」。详见 `DEVTIPS.md` 第 137 条。
+3. **windows/386 发不出去**（上游 `cronet-go` 无 386 实现），发行矩阵只留
+   windows/amd64。详见 `DEVTIPS.md` 第 138 条。
+4. **内嵌驱动的 LGPLv3 许可证要随包发**（`licenses/WinDivert-LGPLv3.txt`）。
+   详见 `DEVTIPS.md` 第 139 条。
+
+### W7 补充：已实际验证到的范围
+
+```
+✅ 完整 sing-box windows/amd64 二进制交叉编译（79MB PE32+，全部 windows tag）
+✅ flowtls 模块 8 个平台组合编译（make platforms）
+✅ windows go vet
+✅ 9 个 WinDivert 过滤器/批量拼接单测（在 Linux 上跑）
+✅ 3 个 reinject 决策真值表单测
+✅ 驱动字节确实内嵌进 exe（.sys 中间 512 字节片段在 exe 中连续命中）
+✅ Linux 视角 EmbedFiles 为空（Linux 二进制不含驱动，不需要 LGPL 附录）
+❌ 驱动 IOCTL / 安装 / 卸载 / 注入时序 / 端到端 / 性能 —— 全部仍需 Windows 主机
+```
+
 ### 顺带修掉的既有 bug
 
 `socket_stub.go`（macOS/FreeBSD）**一直编译不过**：上层按**字段**读

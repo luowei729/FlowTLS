@@ -81,10 +81,11 @@ type rawSocket struct {
 	// Windows 恒为 true；Linux 为 false（AF_PACKET 是被动复制）。
 	reinjectUnmatched bool
 
-	// lastAddr 是最近一次收到的包的地址，供 Reinject 复用。
+	// lastAddr 是最近一次 Recv 收到的包的地址（WINDIVERT_ADDRESS）。
 	//
-	// 只有 recvLoop 一个协程会在收到包之后立刻调用 Reinject，
-	// 所以这里不需要加锁；竞态窗口由「先 Recv 再 Reinject」的时序保证。
+	// **它不是长期可用的状态**：只保证「Recv 返回后、下一次 Recv 之前」有效。
+	// 调用方必须用 TakeFrameHandle 立刻取走，随帧一起交给处理方
+	// （见 frameHandle 的注释）。直接读这个字段是 bug。
 	lastAddr wdivAddr
 
 	truncated atomic.Uint64
@@ -126,13 +127,17 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 	}
 
 	s := &rawSocket{
-		handle:            handle,
-		localIP:           localIP,
-		rx:                make(chan wdivPacket, wdivRxQueue),
-		txBuf:             make([]byte, 0, maxSendBatch*wdivMTUMax),
-		rxStop:            make(chan struct{}),
-		rxDone:            make(chan struct{}),
-		reinjectUnmatched: true,
+		handle:  handle,
+		localIP: localIP,
+		rx:      make(chan wdivPacket, wdivRxQueue),
+		txBuf:   make([]byte, 0, maxSendBatch*wdivMTUMax),
+		rxStop:  make(chan struct{}),
+		rxDone:  make(chan struct{}),
+		// **只有服务端需要重新注入**：服务端要跟同端口的伪装站共存，
+		// 伪装站的流量被驱动器扣留，不还回去就静默失效；客户端不 bind 任何
+		// 本地端口，扣留的包都是自己的，丢弃才是正确动作
+		// （还给内核会让内核回 RST，反而把 NAT 映射拆掉）。
+		reinjectUnmatched: role.server,
 		logger:            logger,
 	}
 	s.pool.New = func() any {
@@ -318,11 +323,18 @@ func (s *rawSocket) SendBatch(pkts [][]byte, dst netip.Addr) (int, error) {
 // 而它只有 Recv 时给出。方向位强制为 inbound（我们的过滤器只收入向）。
 //
 // Linux 侧同名方法是 no-op（AF_PACKET 是被动复制，内核已经处理过）。
-func (s *rawSocket) Reinject(pkt []byte) error {
+func (s *rawSocket) Reinject(pkt []byte, h frameHandle) error {
 	if s.closed.Load() {
 		return errSocketClosed
 	}
-	addr := s.lastAddr
+	// 用调用方交回的句柄，**不要读 s.lastAddr**：收包与处理在不同协程，
+	// lastAddr 早已被后续帧覆盖（见 frameHandle 的注释）。
+	addr, ok := h.(wdivAddr)
+	if !ok {
+		// 句柄缺失就只能让驱动自己挑接口（IfIdx=0）；宁可慢一拍，
+		// 也不要注入到错误的接口上（表现为伪装站偶发连不上）。
+		addr = wdivAddr{}
+	}
 	// 明确置为入向：伪装站的包是发给本机的。
 	addr.Bits = wdivBitSet(addr.Bits, wdivBitOutbound, false)
 	// 校验和沿用驱动给出的判定（原包未修改，直接放行）。
@@ -331,6 +343,12 @@ func (s *rawSocket) Reinject(pkt []byte) error {
 	}
 	return nil
 }
+
+// TakeFrameHandle 返回最近一帧的注入句柄（WINDIVERT_ADDRESS 的副本）。
+//
+// **必须由调用方在 Recv 返回后立刻取走**，否则下一次 Recv 会覆盖它。
+// 这是「帧与地址严格配对」的唯一保证，详见 frameHandle 的注释。
+func (s *rawSocket) TakeFrameHandle() frameHandle { return s.lastAddr }
 
 // LocalIP 返回构造 IP 头时使用的源地址。
 func (s *rawSocket) LocalIP() netip.Addr { return s.localIP }

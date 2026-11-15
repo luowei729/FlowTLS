@@ -567,8 +567,12 @@ func newRecvSlots() *recvSlots {
 }
 
 // recvResult 是收包协程交给循环的一帧。frame 为 nil 表示这次读取失败。
+//
+// h 是这一帧的注入句柄（见 frameHandle），与 frame 严格配对：
+// 收包协程在 Recv 之后**立刻**取快照，再由 channel 一起交出去。
 type recvResult struct {
 	frame []byte
+	h     frameHandle
 	err   error
 }
 
@@ -605,7 +609,7 @@ func (s *Session) recvLoop() {
 				copy(frame, scratch[:n])
 			}
 			select {
-			case frames <- recvResult{frame, err}:
+			case frames <- recvResult{frame: frame, err: err}:
 			case <-s.closeCh:
 				return
 			}

@@ -258,8 +258,11 @@ func (l *Listener) recvLoop() {
 				frame = make([]byte, n)
 				copy(frame, scratch[:n])
 			}
+			// **必须在这里立刻取句柄**：Recv 一返回，下一次循环就可能把它覆盖。
+			// 句柄要跟着 frame 一起走进 channel（见 frameHandle 的注释）。
+			h := l.raw.TakeFrameHandle()
 			select {
-			case frames <- recvResult{frame, err}:
+			case frames <- recvResult{frame: frame, h: h, err: err}:
 			case <-l.ctx.Done():
 				return
 			}
@@ -309,7 +312,7 @@ func (l *Listener) recvLoop() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if sess := l.recvFrame(buf[:n]); sess != nil {
+		if sess := l.recvFrame(buf[:n], res.h); sess != nil {
 			touched = append(touched, sess)
 		}
 		touched = l.drainAvailable(buf, slots, touched)
@@ -345,7 +348,9 @@ func (l *Listener) drainAvailable(buf []byte, slots *recvSlots, touched []*Sessi
 			// 队列已空（或本帧被截断丢弃）：本轮结束
 			return touched
 		}
-		if sess := l.recvFrame(buf[:n]); sess != nil {
+		// 与主循环同理：Recv 一返回就取句柄，否则下一帧会覆盖它。
+		h := l.raw.TakeFrameHandle()
+		if sess := l.recvFrame(buf[:n], h); sess != nil {
 			touched = append(touched, sess)
 		}
 	}
@@ -372,7 +377,9 @@ func (l *Listener) drainBatch(slots *recvSlots, touched []*Session) []*Session {
 			if slots.lens[i] <= 0 {
 				continue // -1 = 超过槽位被截断（已计数）
 			}
-			if sess := l.recvFrame(slots.bufs[i][:slots.lens[i]]); sess != nil {
+			// 批量路径只存在于 Linux（recvmmsg），句柄恒为 nil；
+			// Windows 的 recvBatchEnabled() 返回 false，永远走不到这里。
+			if sess := l.recvFrame(slots.bufs[i][:slots.lens[i]], nil); sess != nil {
 				touched = append(touched, sess)
 			}
 		}
@@ -385,7 +392,8 @@ func (l *Listener) drainBatch(slots *recvSlots, touched []*Session) []*Session {
 //
 // 返回被投递数据帧的会话（供批末做延迟确认）；SYN / 首包路径不需要确认，
 // 返回 nil。
-func (l *Listener) recvFrame(raw []byte) *Session {
+// h 是这一帧的注入句柄（Windows 需要，Linux 恒为 nil），与 raw 严格配对。
+func (l *Listener) recvFrame(raw []byte, h frameHandle) *Session {
 	p, ok := ParseFrame(raw)
 	if !ok {
 		return nil
@@ -396,16 +404,58 @@ func (l *Listener) recvFrame(raw []byte) *Session {
 		return nil
 	}
 	sess, consumed := l.handlePacket(p)
-	if !consumed && l.raw.reinjectUnmatched {
-		// Windows（WinDivert）：这个包被驱动扣留了，我们不认识它。
-		// 必须原样还给内核，否则同端口伪装站的浏览器连接会被静默吞掉
-		// ——Linux 上 reinjectUnmatched 恒为 false，因为 AF_PACKET 只是
-		// 内核处理的副本，忽略它不影响内核继续处理。
-		if err := l.raw.Reinject(raw); err != nil {
+	if !consumed && l.raw.reinjectUnmatched && !l.protocolOwned(p) {
+		// 只有「不属于本协议族」的包才还给内核——典型情况就是同端口伪装站
+		// 的真实浏览器流量。WinDivert 把这些包扣留了，不还回去内核永远看不到，
+		// 伪装站会静默失效。
+		//
+		// **带标记但没被消费的包绝不能还**（认证失败、乱序、已关闭会话）：
+		// 内核里没有对应 socket，会回一个 RST，而 RST 是协议合法的终止信号，
+		// 中间设备看到就拆 NAT 映射，正在重建的同一四元组直接断掉。
+		// 这与 Linux 侧 iptables 用 u32 匹配 IP ID 标记后 DROP 是同一条判据
+		// （见 rules.go 的 serverRules）。
+		//
+		// Linux 上 reinjectUnmatched 恒为 false：AF_PACKET 只是内核处理的副本，
+		// 忽略它不影响内核继续处理。
+		if err := l.raw.Reinject(raw, h); err != nil {
 			l.logger.Warn("重新注入未识别的包失败: ", err)
 		}
 	}
 	return sess
+}
+
+// shouldReinject 报告「这个包必须还给内核」。
+//
+// 抽成独立函数是为了能单测：这是整个 Windows 移植里唯一一处
+// 「判错就会造成真实故障」的决策，而它在 Linux 上恒为 false（跑不到），
+// 不写成纯函数就没有任何测试能覆盖它。
+//
+// 真值表（服务端，reinjectUnmatched=true）：
+//
+//	包的类型                     consumed  带标记   还给内核
+//	伪装站真实浏览器流量            false    false    **是**（否则伪装站死掉）
+//	探测器/认证失败的首包           false    true     否（否则内核回 RST）
+//	已关闭会话残留包                true     true     否（同上）
+//	正常会话数据 / SYN              true     true     否
+//
+// 「带标记 + 未消费」绝不能还：内核里没有对应 socket，会回一个 RST，
+// 中间设备看到 RST 就拆 NAT 映射，正在重建的同一四元组直接断掉。
+func (l *Listener) shouldReinject(p ParsedPacket, consumed bool) bool {
+	if !l.raw.reinjectUnmatched || consumed {
+		return false
+	}
+	return !l.protocolOwned(p)
+}
+
+// protocolOwned 报告这个包是否属于本协议族。
+//
+// 判据就是 IP ID 高字节标记，与 Rust 版、与 Linux 的 iptables u32 规则
+// （`0x4&0xff00ffff=0x<mark>4000`）逐位一致。
+//
+// 注意：带标记 ≠ 认证通过。标记只是「这个包被本协议占用」的声明，
+// 真正的鉴权是握手首包的 AEAD 认证。两件事不能混。
+func (l *Listener) protocolOwned(p ParsedPacket) bool {
+	return p.IPID&l.mark == l.mark
 }
 
 // handlePacket 是分流核心（对应 Rust `handle_packet`）。

@@ -4084,3 +4084,138 @@ darwin/amd64 darwin/arm64 freebsd/amd64
 构造对象，而 Windows 的 `rawSocket` 没有 `sendFD` 字段。现在测试辅助按平台
 拆成 `socket_linux_test.go` / `socket_windows_test.go` 各一份 `newTestRawSocket`，
 公共断言留在 `listener_test.go`（无 build tag）。
+
+---
+
+## 136. 「未消费」不等于「不是我的」：还给内核的判据是 IP ID 标记（2026-11-15 19:10）
+
+第 133 条说了「未消费的包必须还给内核」。**这条说它不完整**，第一版实现就踩了。
+
+第一版写的是：
+
+```go
+sess, consumed := l.handlePacket(p)
+if !consumed && l.raw.reinjectUnmatched {
+    l.raw.Reinject(raw)     // 错
+}
+```
+
+看起来天经地义，实际会把隧道打断。`consumed == false` 有两类完全不同的情况：
+
+| 情况 | 带 IP ID 标记 | consumed | 该怎么做 |
+|---|---|---|---|
+| 伪装站的真实浏览器流量 | 否 | false | **还给内核**（否则伪装站死了） |
+| 探测器扫端口 / 我们自己的客户端认证失败 / 乱序首包 | **是** | false | **丢弃**（还给内核会引出 RST） |
+| 已关闭会话的残留包 | 是 | 我第一版返回 false → 也是错的 | 丢弃 |
+| 正常数据 / SYN | 是 | true | 不还 |
+
+第二、三类还给内核的后果：内核里没有对应 socket → 回一个 **RST** → RST 是协议
+合法的终止信号 → 中间设备立刻拆 NAT 映射 → 而客户端源端口固定，正在重建的
+**同一个四元组**，于是隧道断了，且现象是「莫名其妙掉线，重连有时好有时不好」。
+
+正确判据就是 Linux 侧 iptables 用的那一条：
+
+```
+0x4&0xff00ffff=0x<mark>4000      # u32：IP ID 高字节 == mark
+```
+
+所以代码改成 `shouldReinject(p, consumed)`：
+
+```go
+if !l.raw.reinjectUnmatched || consumed { return false }
+return !l.protocolOwned(p)   // p.IPID&l.mark == l.mark 就是本协议族
+```
+
+顺带纠正一个概念混淆：**带标记 ≠ 认证通过**。标记只是「这个包被本协议占用」
+的声明（防探测靠 IP+mark+SNI 三者不公开），真正的鉴权是首包的 AEAD 认证。
+两件事必须在代码里分开表达。
+
+这条决策在 Linux 上永远跑不到（`reinjectUnmatched` 恒为 false），所以抽成纯函数
+加真值表单测（`reinject_test.go`）。写测试时第一版用例用了 `mark+1` 当「不带
+标记」，被测试当场拦住——低字节是每包递增的序号，本来就不参与判定。
+
+---
+
+## 137. 收包元数据必须跟帧配对：存字段必然错配（2026-11-15 19:10）
+
+WinDivert 注入入向包时要带原始 `WINDIVERT_ADDRESS`（里面含 `IfIdx`）。
+第一版把它存在 `rawSocket.lastAddr` 字段上，注释还写着「只有 recvLoop 一个协程
+会立刻用，不需要加锁」。
+
+**这是错的。** 收包和处理不在同一个协程里：
+
+```
+goroutine: Recv → 复制 frame → 取 lastAddr → channel(cap=1) ─┐
+主协程:                                        └→ recvFrame → Reinject(lastAddr)
+```
+
+goroutine 在把 frame 塞进 channel 后立刻开始下一次 `Recv`。只要它比主协程处理
+快一步，`lastAddr` 就被下一帧覆盖了 —— `Reinject` 注入到**别的网卡**的地址上，
+包落到不存在的接口，丢弃。表现为「伪装站偶发连不上」，TCP 会重传所以不是彻底
+坏，反而更难查。
+
+修法是让元数据跟着帧走，而不是存在对象上：
+
+```go
+type frameHandle any                      // socket_common.go
+
+h := l.raw.TakeFrameHandle()              // Recv 一返回就取快照
+frames <- recvResult{frame: frame, h: h}  // 与 frame 一起传递
+l.recvFrame(buf[:n], h)                   // 处理时用同一个 h
+l.raw.Reinject(raw, h)                    // 注入用 h，不读字段
+```
+
+`TakeFrameHandle` 的语义被写死成「**只保证 Recv 返回后、下一次 Recv 之前有效**」，
+`lastAddr` 的字段注释也改成「直接读这个字段是 bug」。
+
+一般化：**跨协程的「最近一次」状态都是定时炸弹**。管道里流动的东西必须整体流动，
+不要拆成「数据走管道、元数据走字段」。这个坑在 Linux 上不存在（AF_PACKET 不需要
+注入），只在 Windows 出现，所以特别值得记。
+
+---
+
+## 138. 发行矩阵不能凭「我们支持」来填：windows/386 是上游编不出来（2026-11-15 19:10）
+
+我们的 `windivert_assets/` 有 `WinDivert32.sys`，flowtls 模块的 build tag 也是
+`windows && (amd64 || 386)`，于是很自然地把 `windows/386` 加进了 `build.yml`
+的发行矩阵。
+
+**编不出来**，而且不是我们的问题：
+
+```
+package github.com/sagernet/sing-box/cmd/sing-box
+    imports github.com/sagernet/sing-box/protocol/naive
+    imports github.com/sagernet/cronet-go/all: build constraints exclude all Go files
+```
+
+`DEFAULT_BUILD_TAGS_WINDOWS` 含 `with_naive_outbound`，它依赖 `cronet-go`，
+而 `cronet-go` 没有 386 的实现。不能靠去掉这个 tag 来绕过 —— 那会发出一个比官方
+版少特性、同一个版本号却能力不同的二进制（Makefile 里已经为 windows tag 列表
+踩过一次坑）。
+
+所以发行矩阵只有 `windows/amd64`，并在 yaml 里写清原因和「上游补齐后加回来」。
+我们自己的模块仍然支持 386（交叉编译门禁里有 `windows/386`），一旦上游补上就能
+直接开。
+
+**教训**：「我们的代码支持 X」不等于「发行版能出 X 产物」，发行矩阵必须真的构建
+一次才能确认。这次是靠本地 `go build` 完整二进制才发现的——`make platforms` 只编
+flowtls 模块，看不到这类上游依赖问题。
+
+---
+
+## 139. 内嵌的 LGPLv3 驱动必须随包附许可证（2026-11-15 19:10）
+
+`WinDivert64.sys` 以 `//go:embed` 变成字节数组进二进制，运行时落盘成 `.sys` 加载。
+它和我们的代码是**聚合**关系（独立的内核模块，不是衍生物），但 LGPLv3 对再分发
+二进制有硬要求：**必须附许可证原文**。
+
+第一版只在仓库里放了 `windivert_assets/LICENSE.txt`，用户解包后看不到，等于没附。
+现在打包步骤在 windows 产物里多放：
+
+```
+licenses/WinDivert-LGPLv3.txt
+licenses/WinDivert-SHA256SUMS.txt
+```
+
+只对 windows 产物加：`go list -f '{{.EmbedFiles}}'` 在 Linux 视角是空的，
+Linux 二进制里没有这些字节，附上反而是误导。

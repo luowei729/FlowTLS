@@ -41,3 +41,14 @@ type socketRole struct {
 //
 // 放在共享文件里是因为两个平台的实现都要用它（session.go 的错误分类也读它）。
 var errSocketClosed = errors.New("flowtls: raw socket 已关闭")
+
+// frameHandle 是收包时由平台实现附加的不透明元数据，**必须与那一帧配对使用**。
+//
+// 为什么需要它：WinDivert 要求「重新注入」时带上原始 WINDIVERT_ADDRESS
+// （里面含有 IfIdx，缺了它包会落到不存在的接口上）。而收包与处理不在同一个
+// 协程里（recvLoop 用 channel 交接），如果把这个地址存在 rawSocket 的字段上，
+// 下一帧的读取就会把它覆盖 —— 表现为「伪装站偶发连不上」，是那种查一天都
+// 查不出来的问题。
+//
+// Linux 的 AF_PACKET 用不到它（被动复制，不需要注入），恒为 nil。
+type frameHandle any

@@ -49,7 +49,10 @@ func (s *rawSocket) SendBatch(pkts [][]byte, dst netip.Addr) (int, error) {
 }
 
 // Reinject 与真实实现对位（这些平台上永远不会被调用）。
-func (s *rawSocket) Reinject(pkt []byte) error { return ErrPlatformUnsupported }
+func (s *rawSocket) Reinject(pkt []byte, h frameHandle) error { return ErrPlatformUnsupported }
+
+// TakeFrameHandle 与真实实现对位（这些平台上永远不会被调用）。
+func (s *rawSocket) TakeFrameHandle() frameHandle { return nil }
 
 func (s *rawSocket) Recv(buf []byte) (int, error) { return 0, ErrPlatformUnsupported }
 

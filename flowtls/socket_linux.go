@@ -265,7 +265,13 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 // AF_PACKET 拿到的是内核正在处理的同一份包的副本：我们「忽略」一个包，
 // 内核依然会把它交给协议栈（伪装站的连接因此正常工作）。
 // 只有在 WinDivert 的扣留语义下才需要真的把包还回去，见 socket_windows.go。
-func (s *rawSocket) Reinject(pkt []byte) error { return nil }
+func (s *rawSocket) Reinject(pkt []byte, h frameHandle) error {
+	// 语义正确的空实现：**必须返回 nil，不能返回「不支持」**。
+	//
+	// AF_PACKET 是内核对报文的被动复制 —— 内核手里本来就有这个包，
+	// 我们再注入一次等于发重复包。所以「不做事」就是正确行为。
+	return nil
+}
 
 // LocalIP 返回构造 IP 头时使用的源地址。
 func (s *rawSocket) LocalIP() netip.Addr { return s.localIP }
@@ -1070,3 +1076,9 @@ func localIPFor(dst netip.Addr) (netip.Addr, error) {
 	}
 	return netip.AddrFrom4(in.Addr), nil
 }
+
+// TakeFrameHandle 返回最近一帧的注入句柄。
+//
+// Linux 恒为 nil：AF_PACKET 不需要注入，没有 WINDIVERT_ADDRESS 这类东西。
+// 保留这个方法是为了让 listener.go 的收包路径保持单一份代码。
+func (s *rawSocket) TakeFrameHandle() frameHandle { return nil }

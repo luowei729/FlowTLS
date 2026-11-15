@@ -50,11 +50,40 @@ vendor 了它（`common/windivert`），驱动资产是 LGPLv3 可再分发，�
 同时修正 `rules.go`：`Ensure*` / `Check*` 由 `rulesBackendEnabled` 开关控制，
 Windows 上恒为 no-op（WinDivert 扣留语义下内核不会产生 RST，本来就不需要规则）。
 
+#### 实现中修正的三个设计缺陷
+
+1. **重新注入的判据写错了**。第一版是「未消费的包都还给内核」，但
+   「未消费」有两类：伪装站的真实浏览器流量（该还）和带 IP ID 标记但
+   认证失败/乱序的伪包（**绝不能还**——内核没有对应 socket 会回 RST，
+   中间设备随即拆 NAT 映射，而客户端源端口固定、正在重建同一四元组）。
+   正确判据与 Linux 的 iptables u32 规则一致：`(ip_id & mark) == mark`
+   就是本协议族。已抽成 `shouldReinject` + `protocolOwned` 纯函数，
+   并加真值表单测（`reinject_test.go`）——这条逻辑在 Linux 上永远跑不到，
+   不写成纯函数就没有任何测试能覆盖。
+2. **收包元数据存字段必然错配**。WinDivert 注入需要原始
+   `WINDIVERT_ADDRESS`（含 `IfIdx`），第一版存在 `rawSocket.lastAddr` 上，
+   而收包协程在把帧交给 channel 后会立刻开始下一次 `Recv` 把它覆盖。
+   现在改成 `frameHandle` 与帧一起流动（`TakeFrameHandle` → `recvResult.h`
+   → `recvFrame(_, h)` → `Reinject(_, h)`），字段注释明确写「直接读它是 bug」。
+3. **windows/386 是上游编不出来**，不是我们支持就能发。发行矩阵移除该目标
+   （`with_naive_outbound` → `cronet-go` 无 386 实现）。flowtls 模块本身
+   仍支持 386，交叉编译门禁保留。
+
+#### 合规
+
+内嵌的 `WinDivert*.sys` 是独立的 LGPLv3 作品。再分发必须附许可证原文，
+而它只在二进制字节里用户拿不到。windows 产物现在额外包含
+`licenses/WinDivert-LGPLv3.txt` 与 `licenses/WinDivert-SHA256SUMS.txt`。
+
 #### 未验证事项（必须说清）
 
 - **没有一行 Windows 代码在真机上执行过**。本机无 Windows、无 wine、无 qemu。
-- 已验证：windows/amd64、windows/386 交叉编译通过；`go vet` 通过；
-  9 个过滤器/批量拼接单测通过；Linux 全部单测（含 `-race`）通过。
+- 已验证：完整 sing-box `windows/amd64` 二进制交叉编译通过（79MB PE32+，
+  带全部 windows tag）；flowtls 模块 8 个平台组合编译通过；
+  windows `go vet` 通过；9 个过滤器单测 + 3 个 reinject 决策单测通过；
+  Linux 全部单测（含 `-race`）通过；确认驱动字节真的进了 exe
+  （取 `.sys` 中间 512 字节片段在 exe 中连续命中）；
+  确认 Linux 视角 `EmbedFiles` 为空（Linux 二进制不含驱动）。
 - **未验证**：驱动 IOCTL 交互、驱动安装与卸载、注入时序、端到端连通性、
   任何 Windows 性能数字。
 - 首次部署必须按 `PROJECT_PLAN.md` §W9 手工验证。最高风险是杀软拦截驱动。
