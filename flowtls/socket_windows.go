@@ -20,9 +20,11 @@ package flowtls
 // 通过交叉编译与静态检查 ≠ 能用。首次部署请按 PROJECT_PLAN.md §W9 验证。
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,11 +121,32 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 
 	filter := wdivServerInboundFilter(role.listenPort)
 	if !role.server {
-		filter = wdivClientInboundFilter(role.serverPort, role.sourcePort)
+		// 必须带上服务端端口：只按本机目的端口过滤会把本机其它连接的回包
+		// 一并扣下（见 wdivClientInboundFilter 的函数注释）。
+		filter = wdivClientInboundFilter(localIP, role.sourcePort, role.serverPort)
 	}
+
+	// 诊断开关：FLOWTLS_WDIV_ANY=1 时把过滤器放宽成「所有入向 IPv4 TCP 包」。
+	//
+	// 用途只有一个：**区分「过滤器匹配不到」和「驱动收包机制坏了」**。
+	// 两者现象完全相同（Recv 永远阻塞、什么都不报），没有这个开关就只能靠猜。
+	// 放宽后若开始收到包，问题一定在过滤器的字段/取值上；仍收不到则说明
+	// 问题在 STARTUP/flags/方向声明，与过滤器条件无关。
+	//
+	// 只在排查时用：放宽后每一帧都要过一遍用户态解析，且会被动看到本机
+	// 全部 TCP 流量（我们只处理自己的端口，但代价是白烧 CPU）。
+	diagnosticAny := false
+	if v := os.Getenv("FLOWTLS_WDIV_ANY"); v == "1" {
+		filter = wdivAnyInboundTCPFilter()
+		diagnosticAny = true
+	}
+
 	handle, err := wdivOpen(filter)
 	if err != nil {
 		return nil, err
+	}
+	if diagnosticAny {
+		logger.Warn("诊断模式 FLOWTLS_WDIV_ANY=1：过滤器已放宽为所有入向 TCP 包")
 	}
 
 	s := &rawSocket{
@@ -204,18 +227,50 @@ func (s *rawSocket) readLoop() {
 	}
 }
 
+// wdivEthPrefix 是补在裸 IP 包前面的 14 字节以太网头。
+//
+// Linux 的 AF_PACKET 收到的是以太网帧，ParseFrame 按「先读 EtherType
+// 再找 IPv4」解析。WinDivert 的 NETWORK 层直接给出裸 IP 包，没有这 14 字节，
+// 原样送进 ParseFrame 会被当成非法帧丢弃——表现为 SYN-ACK 到了驱动、
+// 日志里也能看到，但握手永远等不到它。
+// MAC 全 0 即可：ParseFrame 只看 EtherType（偏移 12 的 0x0800），不看地址。
+var wdivEthPrefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00}
+
+// stripFramePrefix 去掉 copyAsFrame 补上的以太网头，还原成裸 IP 包。
+//
+// 只在前缀确实是我们补的那 14 字节时才剥，避免误伤本来就是裸 IP 的缓冲。
+func stripFramePrefix(frame []byte) []byte {
+	if len(frame) >= len(wdivEthPrefix) && bytes.Equal(frame[:len(wdivEthPrefix)], wdivEthPrefix) {
+		return frame[len(wdivEthPrefix):]
+	}
+	return frame
+}
+
+// copyAsFrame 把裸 IP 包拷进 buf，并在前面补上以太网头。
+//
+// 返回 (帧长度, 是否完整)。buf 装不下时返回 (0, false)，调用方按截断处理。
+func copyAsFrame(buf, ip []byte) (int, bool) {
+	if len(buf) < len(wdivEthPrefix)+len(ip) {
+		return 0, false
+	}
+	copy(buf, wdivEthPrefix)
+	copy(buf[len(wdivEthPrefix):], ip)
+	return len(wdivEthPrefix) + len(ip), true
+}
+
 // Recv 阻塞取一个包（net.PacketConn 风格的语义由上层适配）。
 func (s *rawSocket) Recv(buf []byte) (int, error) {
 	for {
 		select {
 		case pkt := <-s.rx:
-			n := copy(buf, pkt.data)
+			n, ok := copyAsFrame(buf, pkt.data)
 			s.lastAddr = pkt.addr
 			// 归还池缓冲：copy 已经把数据搬走了。
 			// 注意这里不能 put 一个被上层引用的切片——上层只拿到 buf 里的副本。
 			s.releasePacket(pkt)
-			if n < len(pkt.data) {
+			if !ok {
 				s.truncated.Add(1)
+				continue
 			}
 			return n, nil
 		case <-s.rxStop:
@@ -228,9 +283,13 @@ func (s *rawSocket) Recv(buf []byte) (int, error) {
 func (s *rawSocket) recvAvailable(buf []byte) (int, bool, error) {
 	select {
 	case pkt := <-s.rx:
-		n := copy(buf, pkt.data)
+		n, ok := copyAsFrame(buf, pkt.data)
 		s.lastAddr = pkt.addr
 		s.releasePacket(pkt)
+		if !ok {
+			s.truncated.Add(1)
+			return 0, false, nil
+		}
 		return n, true, nil
 	default:
 		return 0, false, nil
@@ -268,7 +327,11 @@ func (s *rawSocket) Send(pkt []byte, dst netip.Addr) error {
 	}
 	addr := wdivAddr{}
 	addr.Bits = wdivBitSet(addr.Bits, wdivBitOutbound, true)
-	addr.SetChecksumsValid()
+	// 校验和位保持 0。WinDivert 2.2 的发送路径里，
+	// IPChecksum/TCPChecksum == 0 才会重算（sys/windivert.c 的
+	// WINDIVERT_HELPER_NO_*_CHECKSUM 分支）。置 1 表示「别动」，
+	// 网卡校验和卸载会把 IP 头里的校验和清成 0 再发出去，
+	// 中间设备直接丢，服务端一个 SYN 都看不到。
 	if _, err := s.handle.Send(pkt, &addr); err != nil {
 		return err
 	}
@@ -337,8 +400,10 @@ func (s *rawSocket) Reinject(pkt []byte, h frameHandle) error {
 	}
 	// 明确置为入向：伪装站的包是发给本机的。
 	addr.Bits = wdivBitSet(addr.Bits, wdivBitOutbound, false)
+	// Recv 给上层的是补了以太网头的帧（见 copyAsFrame），驱动注入要裸 IP 包。
+	ip := stripFramePrefix(pkt)
 	// 校验和沿用驱动给出的判定（原包未修改，直接放行）。
-	if _, err := s.handle.Send(pkt, &addr); err != nil {
+	if _, err := s.handle.Send(ip, &addr); err != nil {
 		return err
 	}
 	return nil

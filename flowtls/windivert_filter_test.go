@@ -17,6 +17,7 @@ package flowtls
 import (
 	"bytes"
 	"encoding/binary"
+	"net/netip"
 	"testing"
 	"unsafe"
 )
@@ -49,18 +50,6 @@ func TestWindivertAddressLayout(t *testing.T) {
 	if !a.Impostor() {
 		t.Fatal("bit19 应表示 impostor")
 	}
-	// 各标志位互不干扰。
-	a.Bits = 0
-	a.SetChecksumsValid()
-	if !wdivBitGet(a.Bits, wdivBitIPChecksum) || !wdivBitGet(a.Bits, wdivBitTCPChecksum) {
-		t.Fatalf("SetChecksumsValid 未设置 bit21/bit22: %#x", a.Bits)
-	}
-	if wdivBitGet(a.Bits, wdivBitUDPChecksum) {
-		t.Fatal("SetChecksumsValid 不应碰 UDP 校验和位")
-	}
-	if a.Outbound() {
-		t.Fatal("SetChecksumsValid 不应改变 outbound")
-	}
 }
 
 // TestWindivertFilterEncode 逐字节验证判定链编码。
@@ -71,7 +60,9 @@ func TestWindivertAddressLayout(t *testing.T) {
 //	word1 = failure:16
 //	word2..5 = arg[4]
 func TestWindivertFilterEncode(t *testing.T) {
-	f := wdivClientInboundFilter(8443, 44312)
+	// 取值固定下来是为了让字节级断言可复现（本机地址 / 源端口 / 服务端端口）。
+	// 8443 是服务端端口，过滤器必须限定源端口，否则会扣下别人的回包。
+	f := wdivClientInboundFilter(netip.MustParseAddr("10.0.0.2"), 44311, 8443)
 	bin, flags, err := f.encode()
 	if err != nil {
 		t.Fatal(err)
@@ -80,8 +71,8 @@ func TestWindivertFilterEncode(t *testing.T) {
 	if want := wdivFilterFlagInbound | wdivFilterFlagIP; flags != want {
 		t.Fatalf("flags 应为 %#x，实际 %#x", want, flags)
 	}
-	// 5 条指令：inbound / ip / tcp / tcp.SrcPort / tcp.DstPort
-	const wantInsts = 5
+	// 7 条指令：inbound / ip / ip.DstAddr / tcp / tcp.DstPort>= / tcp.DstPort<= / tcp.SrcPort
+	const wantInsts = 7
 	if len(bin) != wantInsts*wdivInstBytes {
 		t.Fatalf("指令数应为 %d，实际 %d", wantInsts, len(bin)/wdivInstBytes)
 	}
@@ -96,9 +87,11 @@ func TestWindivertFilterEncode(t *testing.T) {
 	wants := []want{
 		{wdivFieldInbound, wdivTestEQ, 1, 1},
 		{wdivFieldIP, wdivTestEQ, 2, 1},
-		{wdivFieldTCP, wdivTestEQ, 3, 1},
-		{wdivFieldTCPSrcPort, wdivTestEQ, 4, 8443},
-		{wdivFieldTCPDstPort, wdivTestEQ, wdivAccept, 44312},
+		{wdivFieldIPDstAddr, wdivTestEQ, 3, binary.BigEndian.Uint32(netip.MustParseAddr("10.0.0.2").AsSlice())},
+		{wdivFieldTCP, wdivTestEQ, 4, 1},
+		{wdivFieldTCPDstPort, wdivTestGEQ, 5, 44311},
+		{wdivFieldTCPDstPort, wdivTestLEQ, 6, 44311},
+		{wdivFieldTCPSrcPort, wdivTestEQ, wdivAccept, 8443},
 	}
 	for i, w := range wants {
 		got := bin[i*wdivInstBytes : (i+1)*wdivInstBytes]
@@ -114,10 +107,15 @@ func TestWindivertFilterEncode(t *testing.T) {
 			t.Fatalf("第 %d 条指令不符：field=%d test=%d succ=%#x fail=%#x arg=%d，期望 %+v",
 				i, gotField, gotTest, gotSucc, gotFail, gotArg, w)
 		}
-		// 后三个 arg 必须是 0：驱动不会忽略它们。
+		// ip.DstAddr 的 arg[1] 是 v4 标记 0x0000FFFF，其余指令后三个 arg 必须是 0。
 		for k := 1; k < 4; k++ {
-			if v := binary.LittleEndian.Uint32(got[8+4*k : 12+4*k]); v != 0 {
-				t.Fatalf("第 %d 条指令 arg[%d] 应为 0，实际 %d", i, k, v)
+			v := binary.LittleEndian.Uint32(got[8+4*k : 12+4*k])
+			want := uint32(0)
+			if w.field == wdivFieldIPDstAddr && k == 1 {
+				want = 0x0000FFFF
+			}
+			if v != want {
+				t.Fatalf("第 %d 条指令 arg[%d] 应为 %#x，实际 %#x", i, k, want, v)
 			}
 		}
 	}

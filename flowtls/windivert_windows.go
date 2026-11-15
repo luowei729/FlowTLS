@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,6 +68,16 @@ const (
 	wdivDriverPollInterval = 50 * time.Millisecond
 )
 
+// wdivDebug 是诊断开关，**进程内只读一次**。
+//
+// 不能在 `ioctl` / `Recv` 里直接调 `os.Getenv`：那两个函数在每收发一个报文时
+// 都执行一次，而 Windows 的 `os.Getenv` 要进 syscall。按 10MB/s、1400 字节
+// 一包计算约 7000 次/秒，纯读一个调试开关就白白消耗 syscall 预算，
+// 表现为吞吐下降与延迟抖动。
+//
+// 开关只在启动前设置（`$env:FLOWTLS_WDIV_DEBUG = 1` 再启进程），读一次完全等价。
+var wdivDebug = os.Getenv("FLOWTLS_WDIV_DEBUG") == "1"
+
 // wdivHandle 是一个 WinDivert 句柄。
 //
 // 一个句柄同时承担「收」和「发」：**必须只有一个**。
@@ -74,11 +85,26 @@ const (
 // 若拆成两个句柄（收一个、发一个），注入的包会被收的那个捕获，形成自环。
 type wdivHandle struct {
 	device windows.Handle
-	// event 是覆盖 I/O 用的事件对象（手动重置）。
+	// recvEvent / sendEvent 是**两个独立**的覆盖 I/O 事件对象。
 	//
-	// 复用同一个事件是安全的：`NtDeviceIoControlFile` 在排队每个请求前会把
-	// 它清成未信号，不需要我们 ResetEvent。
-	event windows.Handle
+	// **必须分开，这是本文件最容易出错的一处。**
+	// Windows 的 overlapped I/O 靠 event 通知「这个 IRP 完成了」。一个 event
+	// 同时只能对应一个未完成请求：如果 Recv 正挂在 event 上空等（隧道没流量
+	// 时它大部分时间都挂着），此时 Send 复用同一个 event 发起，那么 Send
+	// 完成时 signal 会把这个 event 点亮 —— Recv 的 GetOverlappedResult
+	// 于是立刻返回，拿到的却是别人的完成状态。
+	//
+	// 症状极具误导性：Send 看起来完全正常（包真的发出去了），
+	// 而 Recv 永远阻塞或返回垃圾，表现为「握手超时」，且没有任何错误日志。
+	// 本项目的第一次真机测试就栽在这里。
+	//
+	// 同一方向只会有一个未完成请求（readLoop 单协程收、txLoop 单协程发），
+	// 所以两个 event 足够，不需要每次 ioctl 现建一个。
+	//
+	// 每个方向内复用是安全的：`NtDeviceIoControlFile` 在排队请求前会把 event
+	// 清成未信号，不需要我们 ResetEvent。
+	recvEvent windows.Handle
+	sendEvent windows.Handle
 
 	// 复用缓冲，避免每次调用都分配。
 	recvAddr  wdivAddr
@@ -99,12 +125,26 @@ func wdivOpen(filter *wdivFilter) (*wdivHandle, error) {
 	if err != nil {
 		return nil, err
 	}
-	event, err := windows.CreateEvent(nil, 1, 0, nil) // manual reset, unsignaled
+	recvEvent, err := windows.CreateEvent(nil, 1, 0, nil) // manual reset, unsignaled
 	if err != nil {
 		_ = windows.CloseHandle(device)
 		return nil, os.NewSyscallError("CreateEvent", err)
 	}
-	h := &wdivHandle{device: device, event: event}
+	sendEvent, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		_ = windows.CloseHandle(recvEvent)
+		_ = windows.CloseHandle(device)
+		return nil, os.NewSyscallError("CreateEvent", err)
+	}
+	h := &wdivHandle{device: device, recvEvent: recvEvent, sendEvent: sendEvent}
+
+	// 诊断输出：直接看驱动实际收到的过滤器字节。
+	// 排查「收不到包」时这是唯一能区分「过滤器错」和「驱动没 divert」的手段。
+	if wdivDebug {
+		fmt.Fprintf(os.Stderr, "[wdiv-debug] filter=%d bytes flags=%#x bin=%x\n",
+			len(filterBin), filterFlags, filterBin)
+	}
+
 	if err = h.initialize(); err != nil {
 		_ = h.Close()
 		return nil, err
@@ -328,7 +368,7 @@ func (h *wdivHandle) initialize() error {
 	binary.LittleEndian.PutUint32(out[12:16], wdivVerMinor)
 	binary.LittleEndian.PutUint32(out[16:20], uint32(unsafe.Sizeof(uintptr(0))*8))
 
-	if _, err := h.ioctl(wdivIoctlInitialize, in[:], out[:]); err != nil {
+	if _, err := h.ioctl(wdivIoctlInitialize, in[:], out[:], h.sendEvent); err != nil {
 		return os.NewSyscallError("WinDivert initialize", err)
 	}
 	if got := binary.LittleEndian.Uint64(out[0:8]); got != wdivMagicSYS {
@@ -345,7 +385,7 @@ func (h *wdivHandle) initialize() error {
 func (h *wdivHandle) startup(filterBin []byte, filterFlags uint64) error {
 	var in [wdivIoctlSize]byte
 	binary.LittleEndian.PutUint64(in[0:8], filterFlags)
-	if _, err := h.ioctl(wdivIoctlStartup, in[:], filterBin); err != nil {
+	if _, err := h.ioctl(wdivIoctlStartup, in[:], filterBin, h.sendEvent); err != nil {
 		return os.NewSyscallError("WinDivert startup", err)
 	}
 	return nil
@@ -359,12 +399,52 @@ func (h *wdivHandle) Recv(buf []byte) (int, wdivAddr, error) {
 	var in [wdivIoctlSize]byte
 	h.recvAddr = wdivAddr{}
 	binary.LittleEndian.PutUint64(in[0:8], uint64(uintptr(unsafe.Pointer(&h.recvAddr))))
-	n, err := h.ioctl(wdivIoctlRecv, in[:], buf)
+	n, err := h.ioctl(wdivIoctlRecv, in[:], buf, h.recvEvent)
 	runtime.KeepAlive(h)
 	if err != nil {
 		return 0, wdivAddr{}, err
 	}
+	if wdivDebug && n > 0 {
+		wdivDebugPkt("RX", buf[:n])
+	}
 	return int(n), h.recvAddr, nil
+}
+
+// wdivDebugPkt 把 IPv4/TCP 头摘要成一行（只在 FLOWTLS_WDIV_DEBUG=1 时调用）。
+//
+// 排查握手问题时这是必需的：只看字节数（n=60）无法区分 SYN / SYN-ACK / ACK，
+// 也无法看出 seq/ack 是否合理。
+func wdivDebugPkt(dir string, p []byte) {
+	if len(p) < 20 || p[0]>>4 != 4 {
+		fmt.Fprintf(os.Stderr, "[wdiv-dbg] %s len=%d (not ipv4)\n", dir, len(p))
+		return
+	}
+	ihl := int(p[0]&0x0F) * 4
+	ipid := uint16(p[4])<<8 | uint16(p[5])
+	src := fmt.Sprintf("%d.%d.%d.%d", p[12], p[13], p[14], p[15])
+	dst := fmt.Sprintf("%d.%d.%d.%d", p[16], p[17], p[18], p[19])
+	if p[9] != 6 || len(p) < ihl+20 {
+		fmt.Fprintf(os.Stderr, "[wdiv-dbg] %s %s>%s proto=%d len=%d ipid=%#04x\n",
+			dir, src, dst, p[9], len(p), ipid)
+		return
+	}
+	sp := uint16(p[ihl])<<8 | uint16(p[ihl+1])
+	dp := uint16(p[ihl+2])<<8 | uint16(p[ihl+3])
+	seq := uint32(p[ihl+4])<<24 | uint32(p[ihl+5])<<16 | uint32(p[ihl+6])<<8 | uint32(p[ihl+7])
+	ack := uint32(p[ihl+8])<<24 | uint32(p[ihl+9])<<16 | uint32(p[ihl+10])<<8 | uint32(p[ihl+11])
+	fl := p[ihl+13]
+	name := ""
+	for _, b := range []struct {
+		m byte
+		s string
+	}{{0x02, "S"}, {0x10, "A"}, {0x01, "F"}, {0x04, "R"}, {0x08, "P"}} {
+		if fl&b.m != 0 {
+			name += b.s
+		}
+	}
+	payload := len(p) - ihl - int(p[ihl+12]>>4)*4
+	fmt.Fprintf(os.Stderr, "[wdiv-dbg] %s %s:%d>%s:%d [%s] seq=%d ack=%d ipid=%#04x plen=%d\n",
+		dir, src, sp, dst, dp, name, seq, ack, ipid, payload)
 }
 
 // Send 注入一个包。
@@ -378,7 +458,7 @@ func (h *wdivHandle) Send(pkt []byte, addr *wdivAddr) (int, error) {
 	var in [wdivIoctlSize]byte
 	binary.LittleEndian.PutUint64(in[0:8], uint64(uintptr(unsafe.Pointer(addr))))
 	binary.LittleEndian.PutUint64(in[8:16], uint64(wdivAddressSize))
-	n, err := h.ioctl(wdivIoctlSend, in[:], pkt)
+	n, err := h.ioctl(wdivIoctlSend, in[:], pkt, h.sendEvent)
 	runtime.KeepAlive(h)
 	if err != nil {
 		return 0, err
@@ -404,17 +484,17 @@ func (h *wdivHandle) SendBatch(buf []byte, count int) (int, error) {
 	if h.sendAddrs == nil {
 		h.sendAddrs = make([]wdivAddr, 255)
 	}
-	// 每个包一个地址项，方向都是 outbound；校验和已由我们算好，不要重算。
+	// 每个包一个地址项，方向都是 outbound。
+	// 校验和位不置 1：置 1 会禁止驱动重算，见 socket_windows.go 的 Send。
 	var zero wdivAddr
 	zero.Bits = wdivBitSet(zero.Bits, wdivBitOutbound, true)
-	zero.SetChecksumsValid()
 	for i := 0; i < count; i++ {
 		h.sendAddrs[i] = zero
 	}
 	var in [wdivIoctlSize]byte
 	binary.LittleEndian.PutUint64(in[0:8], uint64(uintptr(unsafe.Pointer(&h.sendAddrs[0]))))
 	binary.LittleEndian.PutUint64(in[8:16], uint64(count*wdivAddressSize))
-	n, err := h.ioctl(wdivIoctlSend, in[:], buf)
+	n, err := h.ioctl(wdivIoctlSend, in[:], buf, h.sendEvent)
 	runtime.KeepAlive(h)
 	if err != nil {
 		return 0, err
@@ -431,19 +511,27 @@ func (h *wdivHandle) Close() error {
 		}
 		h.device = 0
 	}
-	if h.event != 0 {
-		if err := windows.CloseHandle(h.event); err != nil && firstErr == nil {
+	if h.recvEvent != 0 {
+		if err := windows.CloseHandle(h.recvEvent); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		h.event = 0
+		h.recvEvent = 0
+	}
+	if h.sendEvent != 0 {
+		if err := windows.CloseHandle(h.sendEvent); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		h.sendEvent = 0
 	}
 	return firstErr
 }
 
 // ioctl 是一次覆盖式 DeviceIoControl。
-func (h *wdivHandle) ioctl(code uint32, in, out []byte) (uint32, error) {
+//
+// event 由调用方指定：收用 recvEvent、发用 sendEvent（原因见 wdivHandle 字段注释）。
+func (h *wdivHandle) ioctl(code uint32, in, out []byte, event windows.Handle) (uint32, error) {
 	var overlapped windows.Overlapped
-	overlapped.HEvent = h.event
+	overlapped.HEvent = event
 
 	var inPtr, outPtr *byte
 	var inLen, outLen uint32
@@ -458,13 +546,28 @@ func (h *wdivHandle) ioctl(code uint32, in, out []byte) (uint32, error) {
 	var returned uint32
 	err := windows.DeviceIoControl(h.device, code, inPtr, inLen, outPtr, outLen, &returned, &overlapped)
 	if err == nil {
+		if wdivDebug {
+			fmt.Fprintf(os.Stderr, "[wdiv-debug] ioctl code=%#x immediate n=%d\n", code, returned)
+		}
 		return returned, nil
 	}
 	if !errors.Is(err, windows.ERROR_IO_PENDING) {
+		if wdivDebug {
+			fmt.Fprintf(os.Stderr, "[wdiv-debug] ioctl code=%#x FAIL err=%v\n", code, err)
+		}
 		return 0, err
 	}
+	if wdivDebug {
+		fmt.Fprintf(os.Stderr, "[wdiv-debug] ioctl code=%#x pending...\n", code)
+	}
 	if err = windows.GetOverlappedResult(h.device, &overlapped, &returned, true); err != nil {
+		if wdivDebug {
+			fmt.Fprintf(os.Stderr, "[wdiv-debug] ioctl code=%#x overlapped FAIL err=%v\n", code, err)
+		}
 		return 0, err
+	}
+	if wdivDebug {
+		fmt.Fprintf(os.Stderr, "[wdiv-debug] ioctl code=%#x overlapped n=%d\n", code, returned)
 	}
 	return returned, nil
 }

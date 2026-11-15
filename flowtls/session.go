@@ -570,6 +570,11 @@ func newRecvSlots() *recvSlots {
 //
 // h 是这一帧的注入句柄（见 frameHandle），与 frame 严格配对：
 // 收包协程在 Recv 之后**立刻**取快照，再由 channel 一起交出去。
+//
+// **Session 这条路径从不填 h，这是有意的**：只有服务端需要「把不是本协议的包
+// 还给内核」（伪装站共存），而服务端的收包全部在 Listener 里完成（约束：
+// Session 在服务端不启动 recvLoop）。客户端扣留下来的包都是自己的，丢弃才是
+// 正确动作，也就不需要句柄。
 type recvResult struct {
 	frame []byte
 	h     frameHandle

@@ -4046,6 +4046,11 @@ inbound and ip and tcp.DstPort == 8443 and ip.Id >= 0xf100 and ip.Id <= 0xf1ff
 字段号现在只用这几个（都在 `windivert_filter.go` 里带注释）：
 `Zero=0 Inbound=1 Outbound=2 IP=5 TCP=8 TCPSrcPort=38 TCPDstPort=39`。
 
+**后续（2026-11-15 21:00）**：`TCPSrcPort=38` 已在真机上验证可用。
+当时的测量是在「注入包校验和位设错」的版本上做的（见第 140 条），
+那时所有手工构造的包都被中间设备丢弃，因此「加了 38 就收不到包」的结论不成立。
+教训：**在链路上有已知 bug 时做的 A/B 对比不可信**，要先修好链路再验证参数。
+
 ---
 
 ## 135. 全平台编译门禁：字段名不一致能让 macOS 坏半年没人发现（2026-11-15 18:30）
@@ -4219,3 +4224,34 @@ licenses/WinDivert-SHA256SUMS.txt
 
 只对 windows 产物加：`go list -f '{{.EmbedFiles}}'` 在 Linux 视角是空的，
 Linux 二进制里没有这些字节，附上反而是误导。
+
+## 140. WinDivert 注入的包，校验和位要留 0 让驱动重算（2026-11-15 21:00）
+
+第一版发送时把 `WINDIVERT_ADDRESS` 的 `IPChecksum` / `TCPChecksum` 位置 1，
+本意是「我们已经算好了，别动」。真机上的结果是网卡抓到的出向包
+IP 校验和恒为 `0x0000`：这两位置 1 会让驱动走 `WINDIVERT_HELPER_NO_*_CHECKSUM`
+分支（`sys/windivert.c` 的写路径），跳过重算；而网卡开了校验和卸载，会把软件
+填的值清成 0 再交给硬件。中间设备直接丢掉校验和为 0 的包，服务端一个 SYN 都收不到。
+
+位留 0 后驱动会调 `WinDivertHelperCalcChecksums` 重算再注入，网卡上仍然显示 0
+（卸载之后的显示），但线上是正确的。判断依据是服务端能不能回 SYN-ACK，不是网卡抓包。
+
+## 141. WinDivert 给的是裸 IP 包，ParseFrame 只认以太网帧（2026-11-15 21:00）
+
+Linux 的 `AF_PACKET` 收到的是带 14 字节以太网头的帧，`ParseFrame` 先读 EtherType 再找 IPv4。
+WinDivert 的 NETWORK 层直接给裸 IP 包。原样送进去，解析出来是 `ok=false`、空 IP，
+于是 SYN-ACK 到了驱动、日志里也看得到，但握手永远完不成。
+
+修法是收包时补上 14 字节以太网头（MAC 全 0，EtherType `0x0800`），让上层解析不变；
+重新注入给驱动时再剥掉，驱动要的是裸 IP 包。
+
+## 142. 客户端过滤器只按目的端口会扣下别人的回包（2026-11-15 21:00）
+
+客户端用固定的 `source_port`。过滤器如果只匹配「入向 + 目的端口 == source_port」，
+本机上其它进程连同一个服务端端口时，回包的目的端口是系统随机分配的，
+有概率撞上这个固定值。撞上后那个连接的回包被我们扣下、内核收不到，对端连接被掐断，
+而且这些包会混进本会话（真机上看到过序号对不上的 `[AF]` 包）。
+
+加上 `tcp.SrcPort == serverPort`（字段号 38，来自 sing-box 已验证的 `fieldTCPSrcPort`）后，
+只收来自我们服务端端口的回包。第 134 条曾记「字段号 38 测不通」，那次测量是在校验和
+bug 没修时做的，结论不成立。

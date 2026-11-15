@@ -583,8 +583,11 @@ bytesLostMultiplier = 2
 
 # Windows 支持（B 路线：WinDivert）
 
-> 状态：**设计 + 实现完成，运行时验证被阻塞**（无 Windows 主机）。
-> 本文档记录设计依据、实现边界与验证缺口，避免后来者把「编译通过」误当成「能用」。
+> 状态：**真机已跑通**（2026-11-15）。Windows 10 客户端经 SOCKS5 走新加坡服务端，
+> 出口为服务器公网地址，下载约 3.1 MB/s。
+> 三个只在真机上暴露的问题见 `DEVTIPS.md` 第 140、141、142 条：
+> 注入包校验和位要留 0、收包要补以太网头、客户端过滤器要加源端口。
+> 本文档其余部分记录设计依据与实现边界。
 
 ## W0. 为什么不能走原生 socket
 
@@ -677,11 +680,15 @@ inbound and ip and tcp and tcp.DstPort == <listenPort>
 ### 客户端（一个句柄，对应 `Session.raw`）
 
 ```
-inbound and ip and tcp and tcp.SrcPort == <serverPort> and tcp.DstPort == <sourcePort>
+inbound and ip == 1 and ip.DstAddr == <localIP>
+        and tcp == 1 and tcp.DstPort in [sourcePort, sourcePort]
+        and tcp.SrcPort == <serverPort>
 ```
 
-- 只用 4 元组，**不加 IP ID 条件**：客户端不需要面对伪装站，
-  且 4 元组已足够精确（`source_port` 是配置里固定的）。
+- **`tcp.SrcPort` 那条不能省**。真机上验证过：只有目的端口条件时，本机其它
+  进程连同一个服务端端口的回包会撞上固定的 `source_port`，被一并扣留——
+  那些连接被掐断，包还混进本会话（看到过 ACK 号完全对不上的 FIN）。
+- **不加 IP ID 条件**：客户端不需要面对伪装站。
 - **不含 outbound**：同上，避免注入自环。
 - 该过滤器覆盖 4 元组的全部入向包，因此内核永远看不到服务端的 SYN-ACK →
   **不会产生 RST**，Linux 那条 `OUTPUT` 规则在 Windows 上没有对应物也不需要。

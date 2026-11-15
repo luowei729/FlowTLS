@@ -100,17 +100,6 @@ func (a *wdivAddr) Outbound() bool { return wdivBitGet(a.Bits, wdivBitOutbound) 
 // 保留读取能力只为排查时能看出一帧是原生的还是注入回来的。
 func (a *wdivAddr) Impostor() bool { return wdivBitGet(a.Bits, wdivBitImpostor) }
 
-// SetChecksumsValid 声明 IP/TCP 校验和已经正确，驱动不要重算。
-//
-// **这是注入正确性的关键**：我们构包时已经算好校验和（`BuildPacketInto`），
-// 若让驱动重算，它会按自己的解析覆盖我们写好的值；更糟的是驱动只对
-// `*Checksum == 0` 的包重算，行为依赖未文档化的细节。
-// 明确置 1 = 「这两个校验和有效，别动」。
-func (a *wdivAddr) SetChecksumsValid() {
-	a.Bits = wdivBitSet(a.Bits, wdivBitIPChecksum, true)
-	a.Bits = wdivBitSet(a.Bits, wdivBitTCPChecksum, true)
-}
-
 // ---- 过滤器 VM ----
 
 // 过滤器指令布局（windivert.h WINDIVERT_FILTER，24 字节，packed）：
@@ -131,11 +120,19 @@ const (
 	// 写错会让过滤器直接不匹配（现象是「收不到任何包」，与「链路不通」
 	// 无法区分）。所以本实现的分流特征仍放在**用户态**判断
 	// （IP ID 高字节，见 handlePacket），过滤器只按方向 + 端口收紧。
-	wdivFieldZero       = 0
-	wdivFieldInbound    = 1
-	wdivFieldOutbound   = 2
-	wdivFieldIP         = 5
-	wdivFieldTCP        = 8
+	wdivFieldZero     = 0
+	wdivFieldInbound  = 1
+	wdivFieldOutbound = 2
+	wdivFieldIP       = 5
+	wdivFieldTCP      = 8
+	// wdivFieldIPDstAddr / wdivFieldTCPDstPort 这两个是**唯一经过真机验证**的
+	// 取值：sing-box 的 windivert 包在真 Windows 上用过它们（filter.go 的
+	// inboundTo / InboundTCPPortRange）。
+	wdivFieldIPDstAddr = 22
+	// wdivFieldTCPSrcPort = 38 来自 sing-box 已在真机验证的实现
+	// （common/windivert/filter.go 的 fieldTCPSrcPort，用于 TCPFlow 过滤器）。
+	// 客户端必须用它：只按目的端口过滤会把本机其它连到同端口的连接的回包
+	// 一并扣下（源端口恰好撞上时），混进本会话。
 	wdivFieldTCPSrcPort = 38
 	wdivFieldTCPDstPort = 39
 
@@ -173,6 +170,20 @@ type wdivFilter struct {
 
 func (f *wdivFilter) add(field uint16, test uint8, arg uint32) {
 	f.insts = append(f.insts, wdivInst{field: field, test: test, arg: [4]uint32{arg}})
+}
+
+// addIPv4 追加一条「字段 == IPv4 地址」的判断。
+//
+// 编码与 sing-box 逐字节一致（真机验证过）：
+// arg[0] = 地址的网络字节序按大端读成一个 uint32，arg[1] = 0x0000FFFF。
+// 后者是这个字段的「IPv4 标记」，漏了它驱动不会把 arg 当 v4 地址比较。
+func (f *wdivFilter) addIPv4(field uint16, addr netip.Addr) {
+	a := addr.As4()
+	f.insts = append(f.insts, wdivInst{
+		field: field,
+		test:  wdivTestEQ,
+		arg:   [4]uint32{binary.BigEndian.Uint32(a[:]), 0x0000FFFF},
+	})
 }
 
 // encode 把判定链编成驱动认识的字节流。
@@ -241,23 +252,51 @@ func wdivServerInboundFilter(listenPort uint16) *wdivFilter {
 
 // wdivClientInboundFilter 是客户端的过滤器。
 //
-//	inbound and ip and tcp and tcp.SrcPort == serverPort and tcp.DstPort == sourcePort
+//	inbound and ip == 1 and ip.DstAddr == localIP
+//	        and tcp == 1 and tcp.DstPort in [sourcePort, sourcePort]
+//	        and tcp.SrcPort == serverPort
 //
-// 4 元组里 IP 两端不用过滤器表达（客户端只有一个服务端地址，但域名解析结果
-// 可能在重连时变化），端口组合已足够精确：`source_port` 是配置里固定的，
-// 撞上本机其它连接的概率可以忽略（Linux 侧也是同样的假设）。
+// **六个条件缺一不可，其中源端口那条最容易漏，漏了会造成真实故障**：
+// 只按目的端口过滤时，本机上其它进程连同一个服务端端口，其回包的目的端口
+// 由系统随机分配，有概率撞上我们固定的 sourcePort。一旦撞上：
 //
-// **只收入向**：客户端发出的伪造包由我们自己注入。
-// 收全了这个 4 元组的入向包，内核就永远看不到服务端的 SYN-ACK，
-// 也就**不会生成 RST** —— Linux 侧那条 `iptables OUTPUT` 规则在 Windows 上
-// 没有对应物，也不需要。
-func wdivClientInboundFilter(serverPort, sourcePort uint16) *wdivFilter {
+//   - 那个连接的回包被我们扣下，内核收不到，对方连接被掐断；
+//   - 这些包还会混进本会话（真机上看到过 ACK 号完全对不上的 FIN 包）。
+//
+// IP 两端不写进过滤器：客户端只有一个服务端地址，但域名解析结果可能在重连时
+// 变化，写死 IP 会让换 IP 后彻底收不到包。端口对已经足够精确。
+//
+// **只收入向**：客户端发出的伪包由我们自己注入。收全了这个四元组的入向包，
+// 内核就永远看不到服务端的 SYN-ACK，也就**不会生成 RST** —— Linux 侧那条
+// `iptables OUTPUT` 规则在 Windows 上没有对应物，也不需要。
+func wdivClientInboundFilter(localIP netip.Addr, sourcePort, serverPort uint16) *wdivFilter {
+	// 与 sing-box 已验证实现（InboundTCPPortRange / inboundTo）对齐：
+	// 独立的 `ip == 1` 必须留在 `ip.DstAddr` 之前。
+	f := &wdivFilter{flags: wdivFilterFlagInbound | wdivFilterFlagIP}
+	f.add(wdivFieldInbound, wdivTestEQ, 1)
+	f.add(wdivFieldIP, wdivTestEQ, 1)
+	if localIP.Is4() {
+		f.addIPv4(wdivFieldIPDstAddr, localIP)
+	}
+	f.add(wdivFieldTCP, wdivTestEQ, 1)
+	f.add(wdivFieldTCPDstPort, wdivTestGEQ, uint32(sourcePort))
+	f.add(wdivFieldTCPDstPort, wdivTestLEQ, uint32(sourcePort))
+	f.add(wdivFieldTCPSrcPort, wdivTestEQ, uint32(serverPort))
+	return f
+}
+
+// wdivAnyInboundTCPFilter 是排查用的最宽松过滤器：所有入向 IPv4 TCP 包。
+//
+// **不要用于生产**（理由见调用点注释）。保留它是为了让「收不到包」这类故障
+// 能在一次运行内定性：见 socket_windows.go 的 FLOWTLS_WDIV_ANY。
+//
+// 只保留 inbound + IP + TCP 三个条件，去掉全部端口条件 —— 端口条件正是
+// 待验证的部分，留着它就测不出东西。
+func wdivAnyInboundTCPFilter() *wdivFilter {
 	f := &wdivFilter{flags: wdivFilterFlagInbound | wdivFilterFlagIP}
 	f.add(wdivFieldInbound, wdivTestEQ, 1)
 	f.add(wdivFieldIP, wdivTestEQ, 1)
 	f.add(wdivFieldTCP, wdivTestEQ, 1)
-	f.add(wdivFieldTCPSrcPort, wdivTestEQ, uint32(serverPort))
-	f.add(wdivFieldTCPDstPort, wdivTestEQ, uint32(sourcePort))
 	return f
 }
 

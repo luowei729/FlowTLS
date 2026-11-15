@@ -1,246 +1,436 @@
-# windows_smoke.ps1 —— Windows 首次部署验证脚本
+# windows_smoke.ps1 -- first-run verification for FlowTLS on Windows.
 #
-# 用途：在没有真机验证过的前提下，把 PROJECT_PLAN.md §W9 的手工清单变成
-#       一条命令能跑完的检查，并输出一份可直接贴回 issue 的报告。
+# ============================================================================
+# THIS FILE IS DELIBERATELY ASCII-ONLY (English messages, no CJK).
 #
-# 为什么需要这个脚本：
-#   flowtls 的 Windows 路径（WinDivert）从未在真机上运行过。交叉编译通过、
-#   过滤器编码的字节级单测通过，都不能证明驱动能装、包能收发。
-#   逐条手工敲不但慢，还容易漏掉「驱动落盘路径」「服务名」这类细节。
+# Windows PowerShell 5.1 decodes a .ps1 WITHOUT a UTF-8 BOM using the system
+# ANSI code page. CJK comments then decode into multi-byte garbage and the
+# script fails to PARSE -- before a single line runs. The errors point at
+# random places ("missing expression after ','" inside the param block) and
+# look like a syntax bug that does not exist.
 #
-# 用法（**管理员** PowerShell）：
-#   $env:FLOWTLS_SERVER = '203.0.113.10:8443'     # 服务端地址，不要写进仓库
-#   $env:FLOWTLS_SOCKS  = '127.0.0.1:1080'
+# It is NOT a runtime problem and NOT fixable by "running it again".
+# Two valid fixes exist: (a) save as UTF-8 WITH BOM, or (b) keep it ASCII.
+# We chose (b): an editor, a git filter or a zip tool can silently strip a BOM
+# and then the script breaks again for the next person. The Chinese
+# documentation for this script lives in PROJECT_PLAN.md section W9.
+#
+# If you edit this file, keep every byte below 0x80. Verify with:
+#   python -c "d=open('windows_smoke.ps1','rb').read(); print(max(d))"
+# ============================================================================
+#
+# Usage (Administrator PowerShell):
 #   .\windows_smoke.ps1 -Bin .\sing-box.exe -Config .\client.json
 #
-# 全部 PASS 才算 Windows 路径可用。任何一项 FAIL 都会打印排查提示。
+# Server address, local listen port and credentials are all read from the
+# config file, so no environment variables are needed.
 #
-# 注意：本脚本只做**读取和调用**，不修改系统状态。唯一会动系统的是
-#       sing-box 自己加载驱动（`sc query WinDivert` 只是查询）。
-#       清理见文末提示。
+# Exit code: 0 = all checks passed, 1 = at least one failure, 2 = cannot start.
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Bin,
-    [Parameter(Mandatory = $true)][string]$Config,
+    [Parameter(Mandatory = $true)]
+    [string]$Bin,
 
-    # 探测目标（用于判断隧道是否真的通）。用 Cloudflare trace，
-    # 它回显客户端 IP，能直接看出流量是从服务端出去的。
+    [Parameter(Mandatory = $true)]
+    [string]$Config,
+
+    # Probe target. The cloudflare trace echoes back the egress IP, which
+    # proves traffic really leaves from the server side.
     [string]$Probe = 'https://www.cloudflare.com/cdn-cgi/trace',
 
-    # 观察多久（秒）。期间会采样 sing-box 的 CPU / 内存。
+    # How long to sample CPU / memory while the tunnel is up.
     [int]$WatchSeconds = 20
 )
 
 $ErrorActionPreference = 'Stop'
 
-# 结果收集：最后统一打印，方便一次看到全貌
-$results = [System.Collections.Generic.List[object]]::new()
+$script:PassCount = 0
+$script:FailCount = 0
+$script:SkipCount = 0
 
-function Add-Result {
-    param([string]$Name, [bool]$Ok, [string]$Detail = '')
-    $results.Add([pscustomobject]@{ Check = $Name; Result = if ($Ok) { 'PASS' } else { 'FAIL' }; Detail = $Detail })
-    $tag = if ($Ok) { 'PASS' } else { 'FAIL' }
-    $color = if ($Ok) { 'Green' } else { 'Red' }
-    Write-Host ("[{0}] {1}" -f $tag, $Name) -ForegroundColor $color
-    if ($Detail) { Write-Host ("        {0}" -f $Detail) -ForegroundColor DarkGray }
-}
-
-function Add-Skip {
-    param([string]$Name, [string]$Why)
-    $results.Add([pscustomobject]@{ Check = $Name; Result = 'SKIP'; Detail = $Why })
-    Write-Host ("[SKIP] {0}" -f $Name) -ForegroundColor Yellow
-    if ($Why) { Write-Host ("        {0}" -f $Why) -ForegroundColor DarkGray }
-}
-
-Write-Host ''
-Write-Host '=== FlowTLS Windows 冒烟测试 ===' -ForegroundColor Cyan
-Write-Host ''
-
-# ---------------------------------------------------------------- 0. 前置检查
-
-# 管理员权限：加载 WinDivert 驱动必须有 SeLoadDriverPrivilege。
-# 不是管理员时 CreateFile("\\.\WinDivert") 返回 ERROR_ACCESS_DENIED(5)，
-# 而 sing-box 会把这条错误归类成 ErrWindivertUnsupported —— 很容易被误读成
-# 「驱动不支持本平台」。所以先单独检查。
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Add-Result '管理员权限' $isAdmin $(if (-not $isAdmin) { '右键 PowerShell → 以管理员身份运行' } else { '' })
-
-if (-not (Test-Path $Bin)) { throw "找不到二进制: $Bin" }
-if (-not (Test-Path $Config)) { throw "找不到配置: $Config" }
-Add-Result '二进制与配置存在' $true ("{0} ({1:N0} 字节)" -f $Bin, (Get-Item $Bin).Length)
-
-# ARM64 目前没有驱动资产（上游只有 x64 / x86 的 .sys）。
-$arch = $env:PROCESSOR_ARCHITECTURE
-Add-Result 'CPU 架构受支持' ($arch -eq 'AMD64' -or $arch -eq 'x86') "当前 $arch（WinDivert 资产只有 x64/x86）"
-
-# ---------------------------------------------------------------- 1. 启动
-
-# 端口占用会让启动失败但报错在别处，先查。
-$socks = $env:FLOWTLS_SOCKS
-if ($socks) {
-    $port = [int]($socks -split ':')[-1]
-    $busy = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-    Add-Result "本地端口 $port 空闲" (-not $busy) $(if ($busy) { '有进程已监听，先关掉或换端口' } else { '' })
-} else {
-    Add-Skip '本地端口检查' '未设置 FLOWTLS_SOCKS'
-}
-
-$logFile = Join-Path $env:TEMP ("flowtls-smoke-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-Write-Host ("启动: {0} run -c {1}" -f $Bin, $Config) -ForegroundColor DarkGray
-Write-Host ("日志: {0}" -f $logFile) -ForegroundColor DarkGray
-
-# 用 -Output 让 PowerShell 把 stdout/stderr 一起收进日志。
-$proc = Start-Process -FilePath $Bin -ArgumentList @('run', '-c', $Config) `
-    -PassThru -NoNewWindow -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err"
-
-# 等日志出现「发送路径」那一行。启动到写出它通常 < 3 秒，
-# 但首次要落盘并注册驱动，给 25 秒余量。
-$deadline = (Get-Date).AddSeconds(25)
-$sendMode = $null
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 500
-    if ($proc.HasExited) { break }
-    $all = ''
-    foreach ($f in @($logFile, "$logFile.err")) {
-        if (Test-Path $f) { $all += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
-    }
-    if ($all -match '发送路径[:：]\s*(.+)') { $sendMode = $Matches[1].Trim(); break }
-}
-
-if ($proc.HasExited) {
-    $all = ''
-    foreach ($f in @($logFile, "$logFile.err")) {
-        if (Test-Path $f) { $all += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
-    }
-    Add-Result 'sing-box 启动' $false ("进程已退出，退出码 {0}" -f $proc.ExitCode)
-    Write-Host '--- 日志 ---' -ForegroundColor DarkGray
-    Write-Host $all -ForegroundColor DarkGray
-
-    # 把常见错误码直接翻译成结论，省掉一轮来回。
-    $hint = if ($all -match 'ACCESS_DENIED|拒绝访问') {
-        '管理员权限不足 —— 用管理员 PowerShell 重跑'
-    } elseif ($all -match '1275|DRIVER_BLOCKED|驱动.*(阻止|拦截)') {
-        '杀软拦截 WinDivert 驱动（360/Defender/火绒常见）—— 需加白名单后重试'
-    } elseif ($all -match '577|INVALID_IMAGE_HASH|签名') {
-        '驱动数字签名被拒 —— 检查系统是否禁用签名、或驱动文件被篡改'
-    } elseif ($all -match 'windivert') {
-        'WinDivert 相关错误，见上方日志'
+function Write-Result {
+    param(
+        [string]$Name,
+        [bool]$Ok,
+        [string]$Detail = ''
+    )
+    if ($Ok) {
+        $script:PassCount = $script:PassCount + 1
+        Write-Host ('[PASS] ' + $Name) -ForegroundColor Green
     } else {
-        '见上方日志'
+        $script:FailCount = $script:FailCount + 1
+        Write-Host ('[FAIL] ' + $Name) -ForegroundColor Red
     }
-    Add-Skip '后续检查' '未能启动'
+    if ($Detail) {
+        Write-Host ('       ' + $Detail) -ForegroundColor DarkGray
+    }
+}
+
+function Write-Skip {
+    param(
+        [string]$Name,
+        [string]$Why = ''
+    )
+    $script:SkipCount = $script:SkipCount + 1
+    Write-Host ('[SKIP] ' + $Name) -ForegroundColor Yellow
+    if ($Why) {
+        Write-Host ('       ' + $Why) -ForegroundColor DarkGray
+    }
+}
+
+function Write-Section {
+    param([string]$Title)
     Write-Host ''
-    Write-Host ("排查方向: {0}" -f $hint) -ForegroundColor Yellow
-    exit 1
+    Write-Host ('--- ' + $Title + ' ---') -ForegroundColor Cyan
 }
 
-Add-Result 'sing-box 启动' $true
-Add-Result '发送路径 = windivert' ($sendMode -match 'windivert') ("实际: {0}" -f $sendMode)
+function Read-Logs {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    $t = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $t) { return '' }
+    return [string]$t
+}
 
-# ---------------------------------------------------------------- 2. 驱动状态
+Write-Host ''
+Write-Host '=== FlowTLS Windows smoke test ===' -ForegroundColor Cyan
 
-# 驱动与我们的 exe 是分开的：exe 里 embed 了 .sys 字节，运行时落盘并注册服务。
-$drvDir = Join-Path $env:LOCALAPPDATA 'flowtls\windivert'
-if (Test-Path $drvDir) {
-    $sys = Get-ChildItem -Path $drvDir -Recurse -Filter 'WinDivert*.sys' -ErrorAction SilentlyContinue
-    Add-Result '驱动落盘' ($sys.Count -gt 0) (($sys | ForEach-Object { $_.FullName }) -join '; ')
+# ---------------------------------------------------------------- 0. preflight
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList $identity
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$detail = ''
+if (-not $isAdmin) {
+    $detail = 'Run PowerShell as Administrator -- the WinDivert driver cannot load otherwise'
+}
+Write-Result 'Administrator privileges' $isAdmin $detail
+
+if (-not (Test-Path -LiteralPath $Bin)) {
+    Write-Host ('FATAL: binary not found: ' + $Bin) -ForegroundColor Red
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $Config)) {
+    Write-Host ('FATAL: config not found: ' + $Config) -ForegroundColor Red
+    exit 2
+}
+$binItem = Get-Item -LiteralPath $Bin
+Write-Result 'Binary and config present' $true ($binItem.Name + ' (' + [string]$binItem.Length + ' bytes)')
+
+# WinDivert ships x64 and x86 drivers only; ARM64 Windows is not supported.
+$arch = [string]$env:PROCESSOR_ARCHITECTURE
+$archOk = ($arch -eq 'AMD64') -or ($arch -eq 'x86')
+$detail = ''
+if (-not $archOk) { $detail = 'WinDivert assets exist for x64/x86 only; ARM64 is not supported' }
+Write-Result ('CPU architecture supported (' + $arch + ')') $archOk $detail
+
+# curl.exe ships with Windows 10 1803+ and Server 2019+. Without it the two
+# network checks cannot run, and "command not found" would be reported as a
+# tunnel failure -- the most misleading outcome possible.
+$curlCmd = Get-Command -Name 'curl.exe' -ErrorAction SilentlyContinue
+$curlOk = ($null -ne $curlCmd)
+$detail = ''
+if (-not $curlOk) { $detail = 'curl.exe not found; network checks will be skipped (Windows 10 1803+ ships it)' }
+Write-Result 'curl.exe available' $curlOk $detail
+
+# -------------------------------------------------------------- read settings
+
+$srvHost = ''
+$srvPort = 0
+$socksAddr = ''
+$proxyCred = ''
+
+try {
+    $rawCfg = Get-Content -LiteralPath $Config -Raw
+    $cfg = $rawCfg | ConvertFrom-Json
+} catch {
+    Write-Host ('FATAL: cannot parse config: ' + $_.Exception.Message) -ForegroundColor Red
+    exit 2
+}
+
+$ob = @($cfg.outbounds) | Where-Object { $_.type -eq 'flowtls' } | Select-Object -First 1
+if ($ob) {
+    $srvHost = [string]$ob.server
+    $srvPort = [int]$ob.server_port
+}
+
+$ib = @($cfg.inbounds) | Where-Object { $_.listen_port } | Select-Object -First 1
+if ($ib) {
+    $lh = [string]$ib.listen
+    if (($lh -eq '') -or ($lh -eq '0.0.0.0') -or ($lh -eq '::') -or ($lh -eq '[::]')) {
+        $lh = '127.0.0.1'
+    }
+    $socksAddr = $lh + ':' + [string]$ib.listen_port
+    $u = @($ib.users) | Select-Object -First 1
+    if ($u) {
+        $proxyCred = [string]$u.username + ':' + [string]$u.password
+    }
+}
+
+$server = ''
+if (($srvHost -ne '') -and ($srvPort -gt 0)) {
+    $server = $srvHost + ':' + [string]$srvPort
+}
+
+# Secrets are never printed; only presence is reported.
+if ($server -ne '') {
+    Write-Result 'Config: server parsed' $true ('port ' + [string]$srvPort)
 } else {
-    # 若官方 sing-box 已装过驱动，这里是空的但服务仍可用 —— 不算失败。
-    Add-Skip '驱动落盘（我们自己的目录）' "未找到 $drvDir（可能复用了官方 sing-box 已安装的驱动）"
+    Write-Result 'Config: server parsed' $false 'no flowtls outbound with server/server_port'
 }
 
-$svc = Get-Service -Name 'WinDivert*' -ErrorAction SilentlyContinue
-if ($svc) {
-    $names = ($svc | ForEach-Object { "$($_.Name)=$($_.Status)" }) -join '; '
-    Add-Result 'WinDivert 服务已注册' ($svc | Where-Object { $_.Status -eq 'Running' } | Measure-Object).Count -gt 0 $names
+if ($socksAddr -ne '') {
+    Write-Result 'Config: local listener parsed' $true $socksAddr
 } else {
-    Add-Result 'WinDivert 服务已注册' $false 'Get-Service 找不到 WinDivert，驱动未成功加载'
+    Write-Result 'Config: local listener parsed' $false 'no inbound with listen_port'
 }
 
-# ---------------------------------------------------------------- 3. 端到端
+# curl through the local proxy: -x for the endpoint, --proxy-user for auth.
+# The mixed inbound has a users list, so an unauthenticated request would just
+# return 407 and look like a broken tunnel.
+#
+# Plain string array (not ArrayList): @splat only guarantees expansion for
+# arrays, and an empty array must expand to nothing.
+[string[]]$proxyArgs = @()
+if ($socksAddr -ne '') {
+    $proxyArgs += '-x'
+    $proxyArgs += ('http://' + $socksAddr)
+    if ($proxyCred -ne '') {
+        $proxyArgs += '--proxy-user'
+        $proxyArgs += $proxyCred
+    }
+}
 
-if ($socks) {
-    try {
-        $trace = curl.exe -s --max-time 25 -x "http://$socks" $Probe 2>&1
-        # trace 里 ip= 那一行是从「对端看到的地址」，能证明流量真的从服务端出去。
-        $egress = ($trace | Select-String -Pattern '^ip=(.+)$').Matches.Groups[1].Value
-        Add-Result 'SOCKS5 出口可用' ([bool]$egress) ("出口 IP: {0}" -f $(if ($egress) { $egress } else { '(未取到)' }))
-    } catch {
-        Add-Result 'SOCKS5 出口可用' $false $_.Exception.Message
+if ($socksAddr -ne '') {
+    $lp = [int]($socksAddr.Split(':')[-1])
+    $busy = Get-NetTCPConnection -LocalPort $lp -State Listen -ErrorAction SilentlyContinue
+    $detail = ''
+    if ($busy) { $detail = 'another process is already listening; stop it or change listen_port' }
+    Write-Result ('Local port ' + [string]$lp + ' free') (-not [bool]$busy) $detail
+}
+
+# --------------------------------------------------------------- start binary
+
+Write-Section 'start'
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$logOut = Join-Path $env:TEMP ('flowtls-' + $stamp + '.out.log')
+$logErr = Join-Path $env:TEMP ('flowtls-' + $stamp + '.err.log')
+Write-Host ('log: ' + $logOut) -ForegroundColor DarkGray
+
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $Bin -ArgumentList @('run', '-c', $Config) -PassThru -NoNewWindow -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+} catch {
+    Write-Result 'Start sing-box' $false $_.Exception.Message
+    exit 2
+}
+
+try {
+    # Wait for the send-path log line. The first run also writes the driver to
+    # disk and registers the service, so allow a generous 25s.
+    $deadline = (Get-Date).AddSeconds(25)
+    $sendMode = ''
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        if ($proc.HasExited) { break }
+        $txt = (Read-Logs $logOut) + (Read-Logs $logErr)
+        if ($txt -match 'windivert') { $sendMode = 'windivert'; break }
     }
 
-    # 大流量压一下：WinDivert 每个包都要进出用户态，MTU/分片问题只在高负载暴露。
-    try {
+    if ($proc.HasExited) {
+        $txt = (Read-Logs $logOut) + (Read-Logs $logErr)
+        Write-Result 'Start sing-box' $false ('process exited with code ' + [string]$proc.ExitCode)
+        Write-Host ''
+        Write-Host '--- log ---' -ForegroundColor DarkGray
+        Write-Host $txt -ForegroundColor DarkGray
+
+        $hint = 'see the log above'
+        if ($txt -match 'ACCESS_DENIED|Access is denied') {
+            $hint = 'not running as Administrator (ERROR_ACCESS_DENIED)'
+        } elseif ($txt -match '1275|DRIVER_BLOCKED') {
+            $hint = 'antivirus blocked the WinDivert driver (ERROR_DRIVER_BLOCKED=1275); whitelist and retry'
+        } elseif ($txt -match '577|INVALID_IMAGE_HASH') {
+            $hint = 'driver signature rejected (ERROR_INVALID_IMAGE_HASH=577)'
+        } elseif ($txt -match 'windivert') {
+            $hint = 'WinDivert related, see the log above'
+        }
+        Write-Host ''
+        Write-Host ('hint: ' + $hint) -ForegroundColor Yellow
+        exit 1
+    }
+
+    Write-Result 'Start sing-box' $true
+    Write-Result 'Send path is windivert' ($sendMode -eq 'windivert') 'expected the log to contain "windivert"'
+
+    # ------------------------------------------------------------ driver state
+
+    Write-Section 'driver'
+
+    $drvDir = Join-Path $env:LOCALAPPDATA 'flowtls\windivert'
+    if (Test-Path -LiteralPath $drvDir) {
+        $sys = @(Get-ChildItem -LiteralPath $drvDir -Recurse -Filter 'WinDivert*.sys' -ErrorAction SilentlyContinue)
+        $detail = ''
+        if ($sys.Count -eq 0) { $detail = 'directory exists but contains no .sys file' }
+        Write-Result 'Driver written to disk' ($sys.Count -gt 0) $detail
+    } else {
+        # Not a failure: an official sing-box install may already have the
+        # service registered, in which case CreateFile reuses it.
+        Write-Skip 'Driver written to disk' ('no ' + $drvDir + ' (an existing WinDivert service may be reused)')
+    }
+
+    # Get-Service only lists services (win32 services), NOT kernel drivers, so it
+    # would always report "not found" here. Query the driver store instead.
+    $drv = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'WinDivert*' })
+    if ($drv.Count -gt 0) {
+        $names = @()
+        $running = $false
+        foreach ($d in $drv) {
+            $names += ($d.Name + '=' + [string]$d.State)
+            if ($d.State -eq 'Running') { $running = $true }
+        }
+        Write-Result 'WinDivert driver registered' $running ($names -join '; ')
+    } else {
+        # Not a hard failure: the driver node may not exist until the first
+        # CreateFile, and an official sing-box install may share it.
+        Write-Skip 'WinDivert driver registered' 'no WinDivert* entry in Win32_SystemDriver yet'
+    }
+
+    # ------------------------------------------------------------- end to end
+
+    Write-Section 'end to end'
+
+    if (($socksAddr -ne '') -and $curlOk) {
+        $egress = ''
+        $err = ''
+        try {
+            $out = & curl.exe -s --max-time 25 @proxyArgs $Probe 2>&1
+            foreach ($line in @($out)) {
+                $s = [string]$line
+                if ($s -match '^ip=(.+)$') { $egress = $Matches[1].Trim() }
+            }
+        } catch {
+            $err = $_.Exception.Message
+        }
+        if ($egress -ne '') {
+            $detail = 'egress IP ' + $egress
+            if (($srvHost -ne '') -and ($egress -ne $srvHost)) {
+                $detail = $detail + ' (differs from the configured server address)'
+            }
+            Write-Result 'Proxy egress works' $true $detail
+        } else {
+            if ($err -eq '') { $err = 'no ip= line in the trace output; tunnel or proxy auth failed' }
+            Write-Result 'Proxy egress works' $false $err
+        }
+
+        # A larger transfer: MTU / fragmentation problems only show under load.
+        # Judge on curl's own numbers, not on elapsed time: a failed curl also
+        # returns quickly (or after the timeout), which would make a timing-only
+        # check report PASS for a dead tunnel.
         $mb = 8
-        $t0 = Get-Date
-        curl.exe -s --max-time 60 -x "http://$socks" -o NUL `
-            "https://speed.cloudflare.com/__down?bytes=$($mb * 1024 * 1024)" | Out-Null
-        $sec = ((Get-Date) - $t0).TotalSeconds
-        $ok = $sec -gt 0.5
-        Add-Result "下载 ${mb}MB" $ok ("{0:N2}s → {1:N2} MB/s" -f $sec, ($(if ($sec -gt 0) { $mb / $sec } else { 0 })))
-    } catch {
-        Add-Result '下载 8MB' $false $_.Exception.Message
+        $url = 'https://speed.cloudflare.com/__down?bytes=' + [string]($mb * 1024 * 1024)
+        $fmt = '%{http_code} %{size_download} %{time_total} %{speed_download}'
+        $out = ''
+        try { $out = [string](& curl.exe -s --max-time 60 @proxyArgs -o NUL -w $fmt $url 2>$null) } catch { }
+        $code = 0
+        $got = 0
+        $sec = 0.0
+        $bps = 0.0
+        $parts = @($out -split ' ')
+        if ($parts.Count -ge 4) {
+            $code = [int]$parts[0]
+            $got = [double]$parts[1]
+            $sec = [double]$parts[2]
+            $bps = [double]$parts[3]
+        }
+        $want = $mb * 1024 * 1024
+        $ok = ($code -eq 200) -and ($got -ge ($want * 0.99))
+        $detail = ''
+        if ($ok) {
+            $detail = [string]::Format('{0:N2}s -> {1:N2} MB/s', $sec, ($bps / 1MB))
+        } else {
+            $detail = 'http=' + [string]$code + ' bytes=' + [string]$got + ' (want 200 and ' + [string]$want + ')'
+        }
+        Write-Result ('Download ' + [string]$mb + 'MB') $ok $detail
+    } else {
+        $why = 'local listener could not be determined'
+        if (-not $curlOk) { $why = 'curl.exe is not available' }
+        Write-Skip 'Proxy egress works' $why
+        Write-Skip 'Download 8MB' $why
     }
-} else {
-    Add-Skip '端到端连通' '未设置 FLOWTLS_SOCKS'
+
+    # The same TCP port must still serve the real website. This is the check
+    # that exercises "unconsumed packets are reinjected into the kernel":
+    # browser traffic carries no ip_id mark, so it has to reach the kernel TCP
+    # stack. 000 means no response at all.
+    if (($server -ne '') -and $curlOk) {
+        $code = ''
+        try {
+            $out = & curl.exe -s -o NUL -w '%{http_code}' --max-time 20 -k ('https://' + $server + '/') 2>&1
+            $last = @($out) | Select-Object -Last 1
+            $code = [string]$last
+        } catch { }
+        $ok = ($code -ne '') -and ($code -ne '000')
+        $detail = ''
+        if (-not $ok) {
+            $detail = 'no HTTP response, reinjection may be broken; '
+        }
+        Write-Result 'Decoy site reachable on the same port' $ok ($detail + 'HTTP ' + $code)
+    } else {
+        $why = 'server address unknown'
+        if (-not $curlOk) { $why = 'curl.exe is not available' }
+        Write-Skip 'Decoy site reachable on the same port' $why
+    }
+
+    # ------------------------------------------------------------------ load
+
+    Write-Section 'resource usage'
+
+    $proc.Refresh()
+    $cpu0 = $proc.TotalProcessorTime
+    Start-Sleep -Seconds $WatchSeconds
+    $proc.Refresh()
+    $cpu1 = $proc.TotalProcessorTime
+    $used = ($cpu1 - $cpu0).TotalSeconds
+    $cores = [Environment]::ProcessorCount
+    $pct = 0.0
+    if (($WatchSeconds -gt 0) -and ($cores -gt 0)) {
+        $pct = $used / $WatchSeconds / $cores * 100
+    }
+    $rss = $proc.WorkingSet64 / 1MB
+    Write-Host ('[INFO] ' + [string]$WatchSeconds + 's: cpu ' + [string]::Format('{0:N2}s ({1:N1}% of machine), working set {2:N1} MB', $used, $pct, $rss)) -ForegroundColor Cyan
+}
+catch {
+    # Record it as a FAIL instead of dying half way: a crash that exits with
+    # code 0 looks like success to whoever reads the output later.
+    Write-Result 'Unhandled error during checks' $false $_.Exception.Message
+}
+finally {
+    # Always stop the child, even if a check above threw. Leaving a tunnel and
+    # a loaded driver behind is how the next run starts from a stale state.
+    if ($null -ne $proc) {
+        if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+            $proc.Refresh()
+        }
+        $detail = ''
+        if (-not $proc.HasExited) { $detail = 'process is still alive' }
+        Write-Result 'Process stopped cleanly' $proc.HasExited $detail
+    }
 }
 
-# 伪装站：同一个端口上真实网站必须仍可访问。
-# 这条专门验证「未消费的包被重新注入给内核」（DEVTIPS 133/136）。
-# 过滤器的判据是 IP ID 标记，浏览器流量不带标记 → 必须走内核 TCP。
-$srv = $env:FLOWTLS_SERVER
-if ($srv) {
-    $host_ = ($srv -split ':')[0]
-    $port_ = ($srv -split ':')[-1]
-    try {
-        $code = curl.exe -s -o NUL -w '%{http_code}' --max-time 20 -k "https://${host_}:${port_}/"
-        # 任何非 000 的响应都说明内核 TCP 拿到了这个包（000 = 完全没响应）。
-        Add-Result '同端口伪装站可达（验证重新注入）' ($code -ne '000') ("HTTP {0}" -f $code)
-    } catch {
-        Add-Result '同端口伪装站可达（验证重新注入）' $false $_.Exception.Message
-    }
-} else {
-    Add-Skip '同端口伪装站' '未设置 FLOWTLS_SERVER'
-}
+# ------------------------------------------------------------------- summary
 
-# ---------------------------------------------------------------- 4. 资源占用
-
-# Windows 路径的 CPU 开销是未知数（每包一次内核↔用户拷贝）。
-# 这里在隧道跑着的情况下采样，给出一个可比较的量级。
-$cpu0 = $proc.TotalProcessorTime
-Start-Sleep -Seconds $WatchSeconds
-$proc.Refresh()
-$cpu1 = $proc.TotalProcessorTime
-$usedSec = ($cpu1 - $cpu0).TotalSeconds
-$cores = [Environment]::ProcessorCount
-$pct = if ($WatchSeconds -gt 0 -and $cores -gt 0) { $usedSec / $WatchSeconds / $cores * 100 } else { 0 }
-Write-Host ("[INFO] {0}s 内 CPU {1:N2}s（占整机 {2:N1}%），工作集 {3:N1} MB" -f `
-    $WatchSeconds, $usedSec, $pct, ($proc.WorkingSet64 / 1MB)) -ForegroundColor Cyan
-
-# ---------------------------------------------------------------- 5. 收尾
-
-$proc | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-Add-Result '进程可正常退出' $proc.HasExited
-
+Write-Section 'summary'
+Write-Host ('pass=' + [string]$script:PassCount + '  fail=' + [string]$script:FailCount + '  skip=' + [string]$script:SkipCount)
 Write-Host ''
-Write-Host '=== 汇总 ===' -ForegroundColor Cyan
-$results | Format-Table -AutoSize | Out-String | Write-Host
-
-$failed = ($results | Where-Object { $_.Result -eq 'FAIL' }).Count
-Write-Host ("通过 {0} / 失败 {1} / 跳过 {2}" -f `
-    ($results | Where-Object { $_.Result -eq 'PASS' }).Count, $failed,
-    ($results | Where-Object { $_.Result -eq 'SKIP' }).Count)
-Write-Host ''
-Write-Host '清理（需要时手工执行）：' -ForegroundColor DarkGray
-# 服务名就是 `WinDivert`（不带版本后缀），与 sing-box 官方版共用同一个服务名。
-# 驱动可以留在系统里，卸载 sing-box 不会自动删除（与 Linux 的 iptables 规则同理：
-# 升级/重启期间保留比删错更安全）。
+Write-Host 'cleanup (only if you want to remove the driver):' -ForegroundColor DarkGray
 Write-Host '  sc stop WinDivert ; sc delete WinDivert' -ForegroundColor DarkGray
-Write-Host ("  驱动文件: {0}" -f $drvDir) -ForegroundColor DarkGray
-Write-Host ("  日志:     {0}" -f $logFile) -ForegroundColor DarkGray
+Write-Host ('  driver dir: ' + (Join-Path $env:LOCALAPPDATA 'flowtls\windivert')) -ForegroundColor DarkGray
+Write-Host ('  logs:       ' + $logOut) -ForegroundColor DarkGray
 
-if ($failed -gt 0) { exit 1 }
+if ($script:FailCount -gt 0) { exit 1 }
 exit 0

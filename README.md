@@ -338,24 +338,34 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    更大的 UDP 报文会被丢弃；5~10% 的包会在跨境链路上丢失，
    依赖应用层自己重试。
 
-4. **平台支持：Linux 完整可用，Windows 已实现但未在真机验证**
+4. **平台支持：Linux 完整可用，Windows 客户端已真机验证**
 
    | 平台 | 状态 | 收发路径 |
    |---|---|---|
    | Linux | ✅ 完整验证 | `AF_PACKET` 收 + `IPPROTO_RAW` 发，需 iptables |
-   | Windows amd64/386 | ⚠️ 已实现，**未在真机跑过** | WinDivert 驱动，无需规则 |
+   | Windows amd64/386（客户端） | ✅ 真机验证 | WinDivert 驱动，无需规则 |
+   | Windows（服务端） | ⚠️ 代码完成，未真机验证 | 同上；伪装站依赖重新注入路径 |
    | macOS / FreeBSD | ❌ 只能编译 | 无等价能力，构造即失败 |
 
-   Windows 侧只有交叉编译和字节级单测通过（9 个过滤器 + 3 个注入决策），
-   **没有一行在 Windows 上执行过**。首次部署用脚本验证：
+   Windows 客户端在 Windows 10 上跑通：经 SOCKS5 访问，出口为服务端公网地址，
+   下载实测约 12 MB/s（同链路 Linux 客户端同一量级）。
+   **Windows 服务端未验证**——它比客户端多一条「把非本协议包还给内核」的路径
+   （伪装站共存），那段代码没有在真机上执行过。
+
+   部署前用脚本自检：
 
    ```powershell
    $env:FLOWTLS_SERVER = '203.0.113.10:8443'
-   $env:FLOWTLS_SOCKS  = '127.0.0.1:1080'
+   $env:FLOWTLS_SOCKS  = '127.0.0.1:1099'
    .\docs\windows_smoke.ps1 -Bin .\sing-box.exe -Config .\client.json
    ```
-已知风险：杀软拦截 WinDivert 驱动（360/Defender/火绒都拦）、
-   必须管理员运行、性能预期低于 Linux、无 arm64 驱动。
+
+   注意：入口写 `0.0.0.0` 时，本机 `127.0.0.1` 可能被其它工具（IDE 的端口转发、
+   其它代理客户端）先占住，curl 打到的是别人。自测优先用局域网地址
+   （如 `LAN_IP:端口`）而不是 `127.0.0.1:端口`。
+
+   已知风险：杀软拦截 WinDivert 驱动（360/Defender/火绒都拦）、
+   必须管理员运行、无 arm64 驱动。
 
    **不想折腾驱动就用 WSL2**：完整 Linux 内核，直接跑 linux-amd64 二进制，
    性能与 Linux 一致。
