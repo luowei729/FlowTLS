@@ -225,7 +225,7 @@ make upstream-pull TO=v1.15.0  # 同步上游 sing-box
       "password": "换成你自己的密码",
       "local_ip": "1.2.3.4",
       "ip_id_mark": 61703,
-      "iptables_mode": "print",
+      "iptables_mode": "auto",
       "masquerade": {
         "site_dir": "/var/www/lumen-edge",
         "certificate_path": "/etc/ssl/private/fullchain.pem",

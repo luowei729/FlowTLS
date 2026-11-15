@@ -532,6 +532,40 @@ const recvBufSize = 256 * 1024
 // （见 `client.rs:754` / `server.rs:456` 的注释）。
 const maxRecvBatch = 256
 
+// recvSlotCount 是一次 recvmmsg 最多带多少个槽位。
+//
+// 与接收批量（maxRecvBatch=256）解耦：一轮排空会连续调几次 recvmmsg。
+// 取 8 是把 syscall 数直接降到 1/8，而内存代价可控（见 recvSlotCap）。
+const recvSlotCount = 8
+
+// recvSlotCap 是单个槽位的缓冲容量。
+//
+// **不能等于 recvBufSize（256KB）**：8 × 256KB = 2MB/会话，服务端多会话时
+// 内存会失控。取 128KB 是折中——网卡 GRO 的聚合上限通常是 64KB
+// （`GRO_MAX_SIZE`），128KB 留了一倍余量，同时 8 槽位共 1MB/会话。
+//
+// 若某个极端聚合包真的超过 128KB，会被 MSG_TRUNC 检测到（计数 + 一次性
+// Warn），由 QUIC 重传覆盖；看到那条告警就设置 FLOWTLS_RECVMMSG=0 关掉批量。
+const recvSlotCap = 128 * 1024
+
+// recvSlots 是批量收包用的槽位集合（调用方复用，稳态零分配）。
+//
+// 每个槽位独立缓冲而不是共用一块：recvmmsg 要把 8 个不同的 iovec 交给内核，
+// 共用一块会让 8 个报文写进同一地址互相覆盖。
+type recvSlots struct {
+	bufs [recvSlotCount][]byte
+	lens [recvSlotCount]int
+}
+
+// newRecvSlots 分配槽位。只在开启批量收包时调用（关闭时零内存开销）。
+func newRecvSlots() *recvSlots {
+	r := &recvSlots{}
+	for i := range r.bufs {
+		r.bufs[i] = make([]byte, recvSlotCap)
+	}
+	return r
+}
+
 // recvResult 是收包协程交给循环的一帧。frame 为 nil 表示这次读取失败。
 type recvResult struct {
 	frame []byte
@@ -547,6 +581,11 @@ type recvResult struct {
 // 但**收包的批量边界与延迟确认判定点严格照搬 Rust**。
 func (s *Session) recvLoop() {
 	buf := make([]byte, recvBufSize)
+	// 批量收包的槽位：仅当 FLOWTLS_RECVMMSG=1 时分配（否则零内存开销）。
+	var slots *recvSlots
+	if recvBatchEnabled() {
+		slots = newRecvSlots()
+	}
 	// 纯 ACK 不能只在「下一个包到达」时才判断。
 	//
 	// 下载时服务端一次发来一批数据，客户端要回 TCP ACK，QUIC 才算得到 RTT。
@@ -617,7 +656,7 @@ func (s *Session) recvLoop() {
 		// 第一帧（阻塞取到的那一帧）
 		s.recvFrame(buf[:n])
 		// 把 socket 队列里已经到达的帧一起消化，最多再取 maxRecvBatch-1 帧
-		s.drainAvailable(buf)
+		s.drainAvailable(buf, slots)
 		// 一轮收包结束才判定一次延迟确认（对应 Rust 批末的 `due` 判定）
 		s.flushDelayedACK()
 	}
@@ -625,16 +664,23 @@ func (s *Session) recvLoop() {
 
 // drainAvailable 非阻塞地把已到达的帧取干并处理（每轮最多 maxRecvBatch 帧）。
 //
-// 保持逐帧 recvfrom，**不改成 recvmmsg 批量**。
+// 两条路径，由 FLOWTLS_RECVMMSG 选择（默认逐帧）：
 //
-// 2026-11-15 试过 recvmmsg（一次 8 帧）并完整实现过，当时看到吞吐涨了、
-// 但「RTT 从 79ms 恶化到 220ms」。后来用「同一份旧二进制换端口」做对照
-// 才发现那个 220ms 是**跨境链路的流级别两态**，与代码无关
-// （见 DEVTIPS 125）。所以那条 RTT 归因是错的。
+//	逐帧   i 次 recvfrom
+//	批量   ceil(i/8) 次 recvmmsg
 //
-// 既然两个版本在 CPU 与吞吐上都没有可复现的差异，就保留最简单的逐帧收：
-// 少一层手写的 mmsghdr/iovec 布局、少 1MB 槽位缓冲，排查成本最低。
-func (s *Session) drainAvailable(buf []byte) {
+// **主循环结构不变**：不论走哪条路，本函数都在处理完即返回，
+// 5ms 心跳（延迟确认的唯一发送机会）不受影响。
+// 这一点是上一轮把它误判成 RTT 恶化原因时没做对的地方——
+// 当时的顾虑是「批量会让主循环长时间不回到 select」，
+// 但真正的判据是「本函数有没有提前返回」，而不是「用了几个 syscall」。
+//
+// slots 为 nil（关闭批量）时走逐帧路径。
+func (s *Session) drainAvailable(buf []byte, slots *recvSlots) {
+	if slots != nil {
+		s.drainBatch(slots)
+		return
+	}
 	for i := 1; i < maxRecvBatch; i++ {
 		if s.closed.Load() {
 			return
@@ -651,6 +697,32 @@ func (s *Session) drainAvailable(buf []byte) {
 			return
 		}
 		s.recvFrame(buf[:n])
+	}
+}
+
+// drainBatch 是批量版本的 drainAvailable。
+func (s *Session) drainBatch(slots *recvSlots) {
+	for done := 1; done < maxRecvBatch; {
+		if s.closed.Load() {
+			return
+		}
+		n, err := s.raw.recvBatch(slots)
+		if err != nil {
+			if !s.closed.Load() {
+				s.logger.Error("raw recv 失败: ", err)
+			}
+			return
+		}
+		if n == 0 {
+			return // 队列已空：本轮结束
+		}
+		for i := 0; i < n; i++ {
+			if slots.lens[i] <= 0 {
+				continue // -1 = 超过槽位被截断（已计数）
+			}
+			s.recvFrame(slots.bufs[i][:slots.lens[i]])
+		}
+		done += n
 	}
 }
 

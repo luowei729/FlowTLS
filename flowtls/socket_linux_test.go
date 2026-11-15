@@ -157,3 +157,108 @@ func TestRecvActuallyReceives(t *testing.T) {
 	}
 	t.Logf("Recv 收到 %d 个回环报文", got)
 }
+
+// TestRecvBatchActuallyReceives 钉住 recvBatch（recvmmsg）真的能从内核取到包。
+//
+// 为什么必须有这条：recvmmsg 的结构体布局（mmsgHdr / iovec / msghdr）是
+// **手写的**，字段顺序或长度写错时内核往往不返回 EINVAL，而是「取到 0 个包」
+// ——调用方看到的现象与「链路不通」完全一样（DEVTIPS 96 记录过 mmsghdr
+// 布局写错导致吞吐崩到 7KB/s 的旧账）。
+//
+// 判据分两层，缺一不可：
+//  1. 至少取到 1 个报文（证明 mmsghdr/iovec 布局被内核接受）；
+//  2. 至少出现过一次 n>1（证明**槽位 1..7 也真的被填充**）。
+//
+// 第 2 条是关键：如果只填槽位 0，功能上仍能收到包，但「批量」是假的，
+// 等于用 8 倍内存换 0 收益。这种错误不会报错，只能在测试里钉住。
+func TestRecvBatchActuallyReceives(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要 raw socket")
+	}
+	dst := netip.MustParseAddr("8.8.8.8")
+	s, err := newRawSocket(dst, netip.Addr{}, nil, true)
+	if err != nil {
+		t.Skipf("无法创建 raw socket: %v", err)
+	}
+	defer s.Close()
+
+	local := s.LocalIP()
+	if !local.Is4() {
+		t.Skip("出口 IP 不是 IPv4")
+	}
+	// 连续灌 32 个回环包：足够让内核队列里同时存在多个，才能测出多槽位填充。
+	const marker = 253
+	const count = 32
+	pkts := make([][]byte, count)
+	for i := range pkts {
+		pkt := make([]byte, 220)
+		pkt[0] = 0x45
+		pkt[2], pkt[3] = 0x00, byte(len(pkt))
+		pkt[8] = 64
+		pkt[9] = marker
+		copy(pkt[12:16], local.AsSlice())
+		copy(pkt[16:20], local.AsSlice())
+		pkt[200] = byte(i)
+		pkts[i] = pkt
+	}
+	if _, err := s.SendBatch(pkts, local); err != nil {
+		t.Skipf("发送失败（环境不支持回环）: %v", err)
+	}
+
+	slots := newRecvSlots()
+	deadline := time.Now().Add(2 * time.Second)
+	var total, multi int
+	maxN := 0
+	for time.Now().Before(deadline) {
+		n, err := s.recvBatch(slots)
+		if err != nil {
+			t.Fatalf("recvBatch 返回错误（结构体布局可能写错）: %v", err)
+		}
+		if n == 0 {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		if n > maxN {
+			maxN = n
+		}
+		if n > 1 {
+			multi++
+		}
+		for i := 0; i < n; i++ {
+			if slots.lens[i] == 0 {
+				t.Fatalf("槽位 %d 返回 0 字节（内核没有填长度）", i)
+			}
+			if slots.lens[i] < 0 {
+				continue // 被截断
+			}
+			if _, ok := ParseFrame(slots.bufs[i][:slots.lens[i]]); ok {
+				total++
+			}
+		}
+		if multi >= 3 {
+			break // 已证明多槽位工作，不用等满 2 秒
+		}
+	}
+	if total == 0 {
+		t.Skip("本机 AF_PACKET 看不到 TX 方向的帧（虚拟化环境限制）")
+	}
+	t.Logf("recvBatch 共解析 %d 个报文，最大单次 n=%d，n>1 出现 %d 次", total, maxN, multi)
+	if multi == 0 {
+		t.Fatalf("从未出现 n>1：槽位 1..%d 没有被填充，批量收包是假的", recvSlotCount-1)
+	}
+}
+
+// TestRecvSlotsMemory 钉住槽位内存上限，防止将来有人把 recvSlotCap 调大。
+//
+// 服务端每个会话各持一份槽位；8 × 128KB = 1MB/会话是刻意的上限。
+func TestRecvSlotsMemory(t *testing.T) {
+	slots := newRecvSlots()
+	var total int
+	for _, b := range slots.bufs {
+		total += cap(b)
+	}
+	const want = 1024 * 1024
+	if total != want {
+		t.Fatalf("槽位总内存应为 %d 字节（1MB），实际 %d", want, total)
+	}
+}

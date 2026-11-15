@@ -159,7 +159,7 @@ func newRawSocket(dst netip.Addr, local netip.Addr, logger Logger, wantAFPacket 
 	// IPPROTO_RAW 根本不需要 MAC，就不该付这笔钱。
 	ifindex := 0
 	var nextHop [6]byte
-	// ifname 只用于 qdisc bypass 的驱动白名单判断。
+	// ifname 只用于 qdisc bypass 的驱动白名单判断与 TX_RING 的源 MAC。
 	var ifname string
 	if afPacketWanted(wantAFPacket) {
 		if route, err := defaultRoute(); err == nil {
@@ -534,6 +534,98 @@ func (s *rawSocket) recvAvailable(buf []byte) (int, bool, error) {
 	return s.recvOnce(buf, syscall.MSG_TRUNC|syscall.MSG_DONTWAIT)
 }
 
+// recvBatch 用 recvmmsg 一次取多个报文（非阻塞）。
+//
+// 返回 (收到的报文数, error)。被截断的槽位在 lens 里标成 -1，调用方必须跳过
+// ——截断帧的前缀可能是任意流量，解析它只会得到垃圾。
+//
+// 调用方必须保证 r != nil 且 recvFD 有效。
+func (s *rawSocket) recvBatch(r *recvSlots) (int, error) {
+	trap := sysRecvmmsg()
+	if trap == 0 {
+		// 未知架构：退化为逐帧非阻塞收，语义完全一致、只是没有批量收益。
+		n, ok, err := s.recvOnce(r.bufs[0], syscall.MSG_TRUNC|syscall.MSG_DONTWAIT)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, nil
+		}
+		r.lens[0] = n
+		return 1, nil
+	}
+
+	// iovec 与 mmsghdr 放栈上：批量收包不能引入分配，
+	// 否则省下的 syscall 开销又被 GC 吃掉。
+	var iovs [recvSlotCount]iovec
+	var msgs [recvSlotCount]mmsgHdr
+	for i := 0; i < recvSlotCount; i++ {
+		iovs[i].Base = uintptr(unsafe.Pointer(&r.bufs[i][0]))
+		iovs[i].Len = uint64(recvSlotCap)
+		msgs[i].Hdr.Name = 0
+		msgs[i].Hdr.Namelen = 0
+		msgs[i].Hdr.Iov = uintptr(unsafe.Pointer(&iovs[i]))
+		msgs[i].Hdr.Iovlen = 1
+		msgs[i].Hdr.Control = 0
+		msgs[i].Hdr.Controllen = 0
+		msgs[i].Hdr.Flags = 0
+		msgs[i].MsgLen = 0
+	}
+
+	const flags = syscall.MSG_TRUNC | syscall.MSG_DONTWAIT
+	var (
+		r0    uintptr
+		errno syscall.Errno
+	)
+	for {
+		// 签名 recvmmsg(fd, msgvec, vlen, flags, timeout)：
+		// flags 是**第 4 个参数**，不是 msghdr.msg_flags（那是输出字段）。
+		r0, _, errno = syscall.Syscall6(trap,
+			uintptr(s.recvFD),
+			uintptr(unsafe.Pointer(&msgs[0])),
+			uintptr(recvSlotCount), flags, 0, 0)
+		if errno == 0 || !isInterrupted(errno) {
+			break
+		}
+	}
+	if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
+		return 0, nil
+	}
+	if errno != 0 {
+		return 0, os.NewSyscallError("recvmmsg", errno)
+	}
+
+	n := int(r0)
+	for i := 0; i < n; i++ {
+		got := int(msgs[i].MsgLen)
+		if got > recvSlotCap {
+			// 超过槽位：报文被截断，数据已丢失。计数并丢弃本槽位。
+			s.truncated.Add(1)
+			if s.truncLog.CompareAndSwap(false, true) {
+				s.logger.Warn("批量收包槽位不足（", recvSlotCap, " 字节），报文被截断；",
+					"请设置 FLOWTLS_RECVMMSG=0 关闭批量收包")
+			}
+			r.lens[i] = -1
+			continue
+		}
+		r.lens[i] = got
+	}
+	return n, nil
+}
+
+// recvBatchEnabled 决定是否使用 recvmmsg 批量收包。
+//
+// 默认**关闭**：批量收包把一轮里 256 次 recvfrom 降到 32 次 recvmmsg，
+// 但收益与风险都要在同端口 A/B 里量过才认（DEVTIPS 125 的教训——
+// 跨端口并行测会被链路两态污染）。
+//
+//	FLOWTLS_RECVMMSG=1  开启
+//	FLOWTLS_RECVMMSG=0  关闭（默认）
+func recvBatchEnabled() bool {
+	v, ok := os.LookupEnv("FLOWTLS_RECVMMSG")
+	return ok && v != "0" && v != "false"
+}
+
 // erestartSys 是内核内部的「系统调用应当被重启」返回码。
 //
 // 它**不在**用户空间的 errno 表里（标准 errno 最大约 133），所以 syscall
@@ -564,6 +656,29 @@ func sysSendmmsg() uintptr {
 		return 349
 	case "s390x":
 		return 358
+	default:
+		return 0
+	}
+}
+
+// sysRecvmmsg 返回当前架构上 recvmmsg 的 syscall 编号。
+//
+// 与 sysSendmmsg 同理：标准库 syscall 包的 SYS_* 常量不完整
+// （amd64 的 zsysnum 只生成到 303），取值来自各架构 unistd.h。
+func sysRecvmmsg() uintptr {
+	switch runtime.GOARCH {
+	case "amd64":
+		return 299
+	case "arm64", "riscv64", "loong64":
+		return 243
+	case "arm":
+		return 365
+	case "386":
+		return 337
+	case "ppc64", "ppc64le":
+		return 343
+	case "s390x":
+		return 357
 	default:
 		return 0
 	}

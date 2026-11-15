@@ -228,6 +228,11 @@ func (l *Listener) Close() error {
 func (l *Listener) recvLoop() {
 	defer l.wg.Done()
 	buf := make([]byte, recvBufSize)
+	// 批量收包的槽位：仅当 FLOWTLS_RECVMMSG=1 时分配。
+	var slots *recvSlots
+	if recvBatchEnabled() {
+		slots = newRecvSlots()
+	}
 	// touched 是本轮收包触达的会话。用切片而不是集合：
 	// 同一会话重复出现只是多调一次 flushDelayedACK（第二次 ackPend 已清零，
 	// 天然幂等），换来的是热路径零 map 操作。
@@ -302,7 +307,7 @@ func (l *Listener) recvLoop() {
 		if sess := l.recvFrame(buf[:n]); sess != nil {
 			touched = append(touched, sess)
 		}
-		touched = l.drainAvailable(buf, touched)
+		touched = l.drainAvailable(buf, slots, touched)
 		// 一轮收包结束：对本轮触达的会话各判定一次延迟确认
 		for _, sess := range touched {
 			sess.flushDelayedACK()
@@ -315,8 +320,11 @@ func (l *Listener) recvLoop() {
 //
 // 与 Session.drainAvailable 同构；服务端是共享 socket，
 // 一轮里可能触达多个会话，所以把 session 收集在外层。
-// 保持逐帧收（不用 recvmmsg）的理由见 Session.drainAvailable。
-func (l *Listener) drainAvailable(buf []byte, touched []*Session) []*Session {
+// 批量路径同样“处理完即返回”，不影响 5ms 心跳。
+func (l *Listener) drainAvailable(buf []byte, slots *recvSlots, touched []*Session) []*Session {
+	if slots != nil {
+		return l.drainBatch(slots, touched)
+	}
 	for i := 1; i < maxRecvBatch; i++ {
 		if l.ctx.Err() != nil {
 			return touched
@@ -335,6 +343,35 @@ func (l *Listener) drainAvailable(buf []byte, touched []*Session) []*Session {
 		if sess := l.recvFrame(buf[:n]); sess != nil {
 			touched = append(touched, sess)
 		}
+	}
+	return touched
+}
+
+// drainBatch 是批量版本的 drainAvailable（服务端共享 socket）。
+func (l *Listener) drainBatch(slots *recvSlots, touched []*Session) []*Session {
+	for done := 1; done < maxRecvBatch; {
+		if l.ctx.Err() != nil {
+			return touched
+		}
+		n, err := l.raw.recvBatch(slots)
+		if err != nil {
+			if l.ctx.Err() == nil {
+				l.logger.Error("raw recv 失败: ", err)
+			}
+			return touched
+		}
+		if n == 0 {
+			return touched
+		}
+		for i := 0; i < n; i++ {
+			if slots.lens[i] <= 0 {
+				continue // -1 = 超过槽位被截断（已计数）
+			}
+			if sess := l.recvFrame(slots.bufs[i][:slots.lens[i]]); sess != nil {
+				touched = append(touched, sess)
+			}
+		}
+		done += n
 	}
 	return touched
 }
