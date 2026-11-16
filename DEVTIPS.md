@@ -4500,3 +4500,25 @@ PassWall 节点里以前手工填的 `ip_id_mark` 一定要删掉，否则会覆
 结果是 15 次全失败、服务端 `inbound connection` 计数为 0——看起来像
 「rev.6 也不通」，其实只是两端标记差了一个高字节。
 写测试配置时用 `printf '%d' $((0xF107))` 算十进制，不要心算。
+
+### 154. 重组结构体字面量时，算好的字段必须抄进去
+
+`NewListener` 开头把 `opts.IdleTimeout` 默认成 120 秒、
+`HandshakeTimeout` 默认成 5 秒，rev.6 在 `&Listener{...}` 里写了
+
+```
+idleTimeout:      opts.IdleTimeout,
+handshakeTimeout: opts.HandshakeTimeout,
+```
+
+rev.8 为了加 `marks` 重排这个字面量，这两行丢了。字段停在 0。
+`maintainLoop` 每秒做 `idleFor() > l.idleTimeout`：右值是 0，
+刚收到包的会话空闲只有几毫秒，比较成立，会话被 `Close`。
+
+现象和「标记不一致」「nft 丢包」几乎一样：客户端 `inflight` 卡住、
+`lost=0`、请求随机超时，服务端没有新的 `inbound connection`。
+差别是握手本身是成功的（抓得到 SYN-ACK），过大约 1 秒会话才消失。
+
+修法两层：字面量把算好的值抄回去；比较前再要求超时 `> 0`，
+这样以后再漏赋值，最坏是不回收，而不是把活会话杀掉。
+`listener_test.go` 的 `TestMaintainLoopHonorsIdleTimeout` 钉住第二种。

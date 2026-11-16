@@ -37,6 +37,12 @@ type synState struct {
 	ourISN  uint32
 	ts      uint32
 	at      time.Time
+	// mark 是这条 SYN 命中的 ip_id_mark。
+	//
+	// 首包的 IP ID 低字节已经递增，多用户时 `markOf` 可能命中
+	// 另一个用户的标记（匹配是 `ip_id & m == m`，不是高字节相等）。
+	// 回包必须继续用握手时认下的那个，否则客户端内核规则对不上。
+	mark uint16
 }
 
 // synStateTTL 是 pending 复用窗口（Rust `s.at.elapsed() < 10s`）。
@@ -155,17 +161,23 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	}
 
 	l := &Listener{
-		raw:         raw,
-		port:        cfg.Listen.Port(),
-		users:       users,
-		marks:       marks,
-		logger:      logger,
-		byAddr:      make(map[netip.AddrPort]*Session),
-		pending:     make(map[netip.AddrPort]*synState),
-		acceptCh:    make(chan *Session, opts.AcceptQueue),
-		sessionDone: make(chan netip.AddrPort, opts.AcceptQueue),
-		ctx:         ctx,
-		cancel:      cancel,
+		raw:    raw,
+		port:   cfg.Listen.Port(),
+		users:  users,
+		marks:  marks,
+		logger: logger,
+		// 这两个必须从 opts 抄过来。漏掉时字段是 0，
+		// maintainLoop 里 `idleFor() > 0` 对任何刚收到包的会话都成立，
+		// 下一秒就把会话关掉。客户端还以为隧道在，请求全部超时，
+		// 服务端日志里看不到新连接。rev.6 有这两行，rev.8 重组字面量时丢了。
+		idleTimeout:      opts.IdleTimeout,
+		handshakeTimeout: opts.HandshakeTimeout,
+		byAddr:           make(map[netip.AddrPort]*Session),
+		pending:          make(map[netip.AddrPort]*synState),
+		acceptCh:         make(chan *Session, opts.AcceptQueue),
+		sessionDone:      make(chan netip.AddrPort, opts.AcceptQueue),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 
 	l.wg.Add(2)
@@ -476,12 +488,15 @@ func (l *Listener) protocolOwned(p ParsedPacket) bool {
 
 // markOf 返回这个包的 IP ID 命中的标记；未命中返回 0。
 //
-// 返回命中的那个值（而不是 bool）是因为建会话时要沿用它：
-// 服务端回包的 IP ID 高字节必须与客户端一致，否则客户端那边的
-// 内核层规则匹配不上。
+// 只比高字节。配置里的 ip_id_mark 可以是 0xF107 这种带低字节的值，
+// 低字节是按包递增的序号，不参与识别。若直接做 `ip_id & m == m`，
+// m 的低字节非 0 时，IP ID 低字节一旦回绕到对不上就整包被丢掉。
+// 返回值也收成 0xNN00：回包要拿它去填 IP ID 高字节。
 func (l *Listener) markOf(p ParsedPacket) uint16 {
+	hibyte := p.IPID & 0xFF00
 	for _, m := range l.marks {
-		if m != 0 && p.IPID&m == m {
+		m = m & 0xFF00
+		if m != 0 && hibyte == m {
 			return m
 		}
 	}
@@ -586,6 +601,7 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, mark uint16)
 		ourISN:  isn,
 		ts:      ts,
 		at:      now,
+		mark:    mark,
 	}
 	l.mu.Unlock()
 
@@ -683,8 +699,14 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	l.mu.Unlock()
 
 	var peerISN, ourISN, ts uint32
+	// 有 pending 就用 SYN 认下的标记。首包再 markOf 一次会在多用户时
+	// 命中别的标记，回包的 IP ID 高字节就和客户端规则不一致。
+	mark := l.markOf(p)
 	if hasPending {
 		peerISN, ourISN, ts = st.peerISN, st.ourISN, st.ts
+		if st.mark != 0 {
+			mark = st.mark
+		}
 	} else {
 		// 客户端跳过了握手：序号与时间戳现取随机值，
 		// 但要满足「后续 TSval 不回退」，所以从一个随机基准起步。
@@ -694,7 +716,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	clock := NewTcpClockAt(ts + 2)
 	clock.Observe(p.TSVal, p.HasTS)
 
-	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, l.markOf(p), p.Dst, l.logger)
+	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, mark, p.Dst, l.logger)
 
 	// ---- 发伪 ServerHello（与 Rust 一致）----
 	//
@@ -812,20 +834,23 @@ func (l *Listener) maintainLoop() {
 
 		now := time.Now()
 
-		// pending 超时：客户端发了 SYN 却不继续握手（扫描/半开连接）
+		// pending 超时：客户端发了 SYN 却不继续握手（扫描/半开连接）。
+		// 超时未配置（0）时不回收：0 比任何正的时间差都小，
+		// 一到点就会把还没完成的握手状态删掉。
 		l.mu.Lock()
 		for addr, st := range l.pending {
-			if now.Sub(st.at) > l.handshakeTimeout*2 {
+			if l.handshakeTimeout > 0 && now.Sub(st.at) > l.handshakeTimeout*2 {
 				delete(l.pending, addr)
 			}
 		}
 		l.mu.Unlock()
 
-		// 会话空闲超时
+		// 会话空闲超时。同样：未配置时不回收。
+		// 否则刚收到包的会话 idleFor 只有几毫秒，照样大于 0，会被立刻关掉。
 		var expired []*Session
 		l.mu.Lock()
 		for addr, s := range l.byAddr {
-			if s.idleFor() > l.idleTimeout {
+			if l.idleTimeout > 0 && s.idleFor() > l.idleTimeout {
 				delete(l.byAddr, addr)
 				expired = append(expired, s)
 			}

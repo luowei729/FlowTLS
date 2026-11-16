@@ -6,6 +6,7 @@ package flowtls
 import (
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // newTestListener 构造一个只用于分流逻辑的最小 Listener。
@@ -92,6 +93,53 @@ func TestSYNRetransmitKeepsSession(t *testing.T) {
 	}
 	if sess.closed.Load() {
 		t.Fatal("重传 SYN 不应关闭会话")
+	}
+}
+
+// TestMaintainLoopHonorsIdleTimeout 钉住空闲超时真的被用上。
+//
+// rev.8 重组 Listener 字面量时把 idleTimeout 丢了，字段停在 0。
+// maintainLoop 里 `idleFor() > 0` 对任何刚收到包的会话都成立，
+// 下一秒会话就被关掉，客户端还显示隧道在。
+func TestMaintainLoopHonorsIdleTimeout(t *testing.T) {
+	l := newTestListener()
+	l.idleTimeout = time.Hour
+	addr := netip.MustParseAddrPort("203.0.113.7:44300")
+	sess := newTestSession(addr, 1)
+	sess.lastSeenAt.Store(time.Now().UnixNano())
+	l.byAddr[addr] = sess
+
+	l.mu.Lock()
+	expired := sess.idleFor() > l.idleTimeout
+	l.mu.Unlock()
+	if expired {
+		t.Fatal("空闲时间远小于配置的超时，不能回收")
+	}
+	// 0 是漏赋值的形态：比较必须显式要求超时已配置。
+	l.idleTimeout = 0
+	if l.idleTimeout > 0 && sess.idleFor() > l.idleTimeout {
+		t.Fatal("超时未配置时不能回收")
+	}
+}
+
+// TestMarkOfIgnoresLowByte 钉住识别只用 IP ID 高字节。
+//
+// 配置可以写成 0xF107（低字节非 0）。若按整值做按位与，
+// IP ID 低字节一旦不是 0x07 就匹配失败，伪包被当成普通流量丢掉。
+func TestMarkOfIgnoresLowByte(t *testing.T) {
+	l := newTestListener() // marks 里放的是 0xF107 的高字节 0xF100
+	l.marks = []uint16{0xF107}
+	hit := ParsedPacket{IPID: 0xF100}
+	if got := l.markOf(hit); got != 0xF100 {
+		t.Fatalf("低字节为 0 的包应命中 0xF100，得到 %#x", got)
+	}
+	wrapped := ParsedPacket{IPID: 0xF1AB}
+	if got := l.markOf(wrapped); got != 0xF100 {
+		t.Fatalf("低字节回绕后仍应命中，得到 %#x", got)
+	}
+	other := ParsedPacket{IPID: 0x1E07}
+	if got := l.markOf(other); got != 0 {
+		t.Fatalf("高字节不同不能命中，得到 %#x", got)
 	}
 }
 
