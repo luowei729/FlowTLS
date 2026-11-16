@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-11-17 03:15 (北京时间)
+
+### 排查续：回归在 rev.6 → rev.8 的服务端，rev.6 本身是好的
+
+**wire format 未改动**。这是对照实验结论，没有改协议代码。
+
+同一台生产机、同一个非生产端口 19444、同一个 rev.8 客户端、
+两端都显式 `ip_id_mark=0xF107`（高字节 0xF100，与 rev.6 默认值一致）：
+
+| 19444 上的服务端 | 15 次请求 |
+|---|---|
+| rev.6（本次现编 arm64） | **15/15**，换回来再测 **14/15** |
+| rev.8（发行包，显式同一标记） | **10/15** |
+| rev.8 把回包源地址从 `p.Dst` 改回 `raw.localIP` | **4/15**（更差，不是原因） |
+
+另外两组排除：
+
+- 删掉 rev.8 的 nft `notrack` 链、只留 iptables DROP：1/12，**不是 nft**。
+- 关掉 `PACKET_QDISC_BYPASS`（发送路径从 `af_packet+qdisc_bypass` 变成 `af_packet`）：1/12，**不是 bypass**。
+
+所以回归落在 **rev.6 之后、rev.8 服务端数据路径里除 `p.Dst` 以外的改动**。
+rev.6 到 rev.8 只有一个功能提交 `25e0c85c`。还没排除的是：
+
+1. `Listener.mark` 改成 `marks []uint16` 之后的 `markOf()` 匹配
+   （单值时 `p.IPID & m == m` 与旧的 `p.IPID & l.mark == l.mark` 不等价的边界）；
+2. 服务端 nft 脚本从 rev.6 的 `nftServerScript(kind, ...)` 重写成
+   现在的 `out_port` / `in_port`（rev.6 的 output 链有 RST drop，rev.8 没有）。
+
+生产 8443 仍是 `sing-box-rev3`，本次测试进程已全部停掉。
+
 ## 2026-11-17 02:41 (北京时间)
 
 ### 排查结论：rev.8 服务端存在未修复的回归，生产已回滚到 rev.3
