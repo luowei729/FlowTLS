@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 2026-11-17 03:40 (北京时间)
+
+### 发布：v1.14.4-rev.9，作废 v1.14.4-rev.8
+
+**wire format 未改动**。rev.9 只比 rev.8 多了服务端空闲超时的修复
+（见上一节）和 `markOf` 只比较 IP ID 高字节。
+
+`v1.14.4-rev.8` 的 Release 与 tag **删除**。那个包的服务端会在大约 1 秒内
+关掉活会话，不能再被 PassWall 的 `releases/latest` 当成最新版。
+
+补丁包与 Web 节点没有行为变化，版本号跟着升到 `1.14.4-r9`：
+
+- 节点仍然只输出地址、端口、密码、SNI。`source_port` / `ip_id_mark` /
+  `iptables_mode` 继续强制写成 nil，旧 UCI 里残留的值不会进 sing-box 配置。
+- 认证方式默认单用户；多用户只多一个不参与生成的用户名备注。
+- 组件更新仍读 `releases/latest/download/sing-box-release-api.json`，
+  版本比较用 `1.14.4-r9`，不会在字母 v 处被截断。
+
+设备上如果还留着手工填的 `ip_id_mark`，升级补丁包后生成配置会丢掉它，
+两端都改由 password 派生。生产 8443 在本版发布前仍跑 rev.3。
+
 ## 2026-11-17 03:33 (北京时间)
 
 ### 修复：rev.8 服务端把刚建好的会话在 1 秒内关掉
