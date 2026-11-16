@@ -17,7 +17,7 @@ func reinjectTestListener(mark uint16) *Listener {
 	return &Listener{
 		raw:     &rawSocket{reinjectUnmatched: true},
 		port:    8443,
-		mark:    IPIDMarkOf(mark),
+		marks:   []uint16{IPIDMarkOf(mark)},
 		byAddr:  make(map[netip.AddrPort]*Session),
 		pending: make(map[netip.AddrPort]*synState),
 		logger:  nopLogger{},
@@ -33,10 +33,10 @@ func TestShouldReinjectMarksProtocolOwned(t *testing.T) {
 	foreign := ParsedPacket{IPID: mark + 0x100, SrcPort: 55000, DstPort: 8443}
 
 	if !l.protocolOwned(owned) {
-		t.Fatalf("带标记的包应被判为本协议族: ipid=%#x mark=%#x", owned.IPID, l.mark)
+		t.Fatalf("带标记的包应被判为本协议族: ipid=%#x mark=%#x", owned.IPID, l.marks)
 	}
 	if l.protocolOwned(foreign) {
-		t.Fatalf("不带标记的包不应被判为本协议族: ipid=%#x mark=%#x", foreign.IPID, l.mark)
+		t.Fatalf("不带标记的包不应被判为本协议族: ipid=%#x mark=%#x", foreign.IPID, l.marks)
 	}
 
 	// 伪装站的真实浏览器流量：不带标记 + 未消费 → 必须还给内核，

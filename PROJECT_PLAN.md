@@ -671,7 +671,8 @@ inbound and ip and tcp and tcp.DstPort == <listenPort>
         and ip.Id >= <mark> and ip.Id <= <mark|0xFF>
 ```
 
-- `mark` 来自 `ip_id_mark & 0xFF00`，IP ID 低字节是递增序号，所以区间是 256 个值。
+- `mark` 由 `HKDF-SHA256(password)` 派生（`flowtls/mark.go`），低字节是递增序号，
+  所以区间是 256 个值。不再支持配置里手填 `ip_id_mark`。
 - **不含 outbound**：服务端发出的 SYN-ACK / 数据由我们自己注入，
   若把 outbound 也纳入，注入的包会被再次扣留，形成自环。
 - 该过滤器会命中真实浏览器的 SYN 约 1/256（IP ID 随机），

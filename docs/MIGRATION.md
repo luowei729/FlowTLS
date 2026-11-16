@@ -49,10 +49,7 @@ udp:
       "listen_port": 8443,
       "password": "换成你自己的密码",
       "users": [{ "name": "alice", "password": "alice-pass" }],
-      "local_ip": "1.2.3.4",
-      "ip_id_mark": 61703,
-      "udp_session_timeout": 120,
-      "iptables_mode": "print"
+      "udp_session_timeout": 120
     }
   ],
   "outbounds": [{ "type": "direct", "tag": "direct" }]
@@ -66,13 +63,13 @@ udp:
 | `listen: "0.0.0.0:8443"` | `listen` + `listen_port` | 拆成两个字段 |
 | `password` | `password` | 一致；外层 AEAD 的密钥来源 |
 | `users[].name/password` | `users[].name/password` | 一致；`users` 非空时忽略 `password` |
-| `faketcp.ip_id_magic` | `ip_id_mark` | 改名；**十进制** JSON 数值（`0xF107` = `61703`） |
-| `faketcp.local_ip` | `local_ip` | 提到顶层；NAT 后必须填公网 IP |
+| `faketcp.ip_id_magic` | （删掉即可） | 新版由 `HKDF(password)` 自动派生，两端一致 |
+| `faketcp.local_ip` | （删掉即可） | 新版用「客户端本次发往的地址」作为回包源地址，NAT / 多 IP 主机都对 |
 | `faketcp.handshake` | —— | 服务端恒为「标准三次握手」，无开关 |
 | `udp.timeout_secs` | `udp_session_timeout` | 改名，单位仍是秒 |
 | `udp.enabled` | —— | DATAGRAM 恒开（不配就是不允许，配了就有） |
 | `udp.max_sessions` | `udp_max_sessions` | 同名；默认 8192（Rust 默认 2048，Go 上调） |
-| `net.mode` | `iptables_mode` | `none`/`print`/`auto` 语义相同，但默认是 `print` |
+| `net.mode` | （删掉即可） | 规则改为强制自动写入（优先 nft，无则 iptables） |
 | `net.max_cwnd` | `max_cwnd` | 同名同默认值 8388608；两端必须填同一个值 |
 | `tls.cert` / `tls.key` | `masquerade.certificate_path` / `key_path` | 伪装网站的真证书，不是协议证书（见下） |
 | `site.dir` | `masquerade.site_dir` / `proxy_url` | 二选一；`proxy_url` 是 Rust 版没有的能力 |
@@ -131,7 +128,7 @@ server: "1.2.3.4:8443"
 password: "与服务端一致"
 sni: "your.domain"
 faketcp:
-  source_port: 44300
+  # 新版不需要这一段：源端口改为自动分配（见下方字段对照）
   handshake: symbolic
   ip_id_magic: 0xF107
 socks5:
@@ -169,8 +166,6 @@ net:
       "server": "1.2.3.4",
       "server_port": 8443,
       "password": "与服务端一致",
-      "source_port": 44300,
-      "ip_id_mark": 61703,
       "sni": "your.domain"
     }
   ]
@@ -184,14 +179,14 @@ net:
 | `server: "host:port"` | `server` + `server_port` | 拆成两个字段 |
 | `password` | `password` | 一致 |
 | `sni` | `sni` | 一致，只影响伪 ClientHello 外观 |
-| `faketcp.source_port` | `source_port` | 一致；用于 iptables 精确匹配内核 RST |
-| `faketcp.ip_id_magic` | `ip_id_mark` | 改名，十进制（`0xF107` = `61703`） |
+| `faketcp.source_port` | （删掉即可） | **旧值不要再填**：填了就是固定端口，两台机器经同一 NAT 去同一服务端时会四元组撞车、互相踢会话。新版规则按服务端地址匹配，不再需要它 |
+| `faketcp.ip_id_magic` | （删掉即可） | 新版由 `HKDF(password)` 自动派生，两端一致；手填会重新引入固定指纹 |
 | `faketcp.handshake: symbolic` | （默认开启） | 无需配置 |
 | `faketcp.handshake: none` | `"disable_handshake": true` | **反向字段**：不写＝开启握手 |
 | `socks5.listen/username/password` | `socks` inbound 的 `listen_port`/`users` | 用 sing-box 自带的 |
 | `http.*` | `http` inbound | 用 sing-box 自带的 |
 | `https.*` | `mixed` inbound（需 TLS 时用 `http` + `tls`） | 用 sing-box 自带的 |
-| `net.mode` | `iptables_mode` | 客户端建议 `auto` |
+| `net.mode` | （删掉即可） | 同上，客户端也不需要配置 |
 
 > `disable_handshake` 为什么是反的：Go 的 bool 零值是 `false`，
 > 若字段写成 `handshake`，默认行为会变成「关闭握手」——而正确默认是**开启**
@@ -215,10 +210,10 @@ net:
 
 ## 迁移检查清单
 
-1. `ip_id_magic` 的十六进制值换成十进制写进 `ip_id_mark`（或直接用字符串以外的数字）。
+1. `ip_id_magic` **直接删掉**：新版从 password 派生，两端自动一致、部署间自动不同。
 2. `listen: "host:port"` 拆成 `listen` + `listen_port`。
 3. 客户端原来的 `socks5`/`http`/`https` 入口换成 sing-box inbound。
-4. `net.mode: auto` 换成 `iptables_mode: "auto"`；第一次先留 `"print"` 看一眼规则。
+4. `net.mode` **直接删掉**：防火墙规则改为强制自动写入（优先 nft，无则 iptables）。
 5. 伪装网站单独起进程，证书别和内层 QUIC 的自签证书搞混。
 6. `sing-box check -c client.json` / `server.json` 都过一遍再启动。
 7. 用 `bash docs/e2e_matrix.sh` 在生产链路附近做一次实测（4 格矩阵或 Go↔Go）。

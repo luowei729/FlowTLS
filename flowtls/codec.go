@@ -141,23 +141,31 @@ func NewServerCodec(password string) (*Codec, error) {
 	return c, nil
 }
 
+// hkdfSalt 是本协议所有 HKDF 派生的公共 salt。
+//
+// **单一真源**：AEAD 密钥、authID、ip_id_mark 三处都用它，只靠 info
+// 字符串区分。将来若要改 salt（就是改 wire format 的兼容性），
+// 只改这一个常量即可，不会因为漏改某一处而出现「密钥换了、标记没换」
+// 这种极难定位的故障。
+const hkdfSalt = "flowtls-faketcp-v3"
+
 // deriveCodec 由用户密码派生 AEAD 密钥与身份标识。
 //
 // 两个派生值用不同的 info 标签，保证互不可推导：
 //   - aead key：真正的加密密钥（AES-128，16 字节）
 //   - auth id ：明文身份标识，只用于服务端查表
 func deriveCodec(password string) *Codec {
-	// HKDF-SHA256，salt = "flowtls-faketcp-v3"
+	// HKDF-SHA256，salt = hkdfSalt
 	//
 	// v3 同时改了 salt 与 info 标签：既然版本号已经变了，
 	// 就没有任何理由让新旧实现共用同一份派生上下文。
-	key, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v3"),
+	key, err := hkdf.Key(sha256.New, []byte(password), []byte(hkdfSalt),
 		"flowtls faketcp aead key v3", 16)
 	if err != nil {
 		// hkdf.Key 只在参数非法时失败；长度固定 16，实际不可能触发。
 		panic("flowtls: hkdf aead key: " + err.Error())
 	}
-	authID, err := hkdf.Key(sha256.New, []byte(password), []byte("flowtls-faketcp-v3"),
+	authID, err := hkdf.Key(sha256.New, []byte(password), []byte(hkdfSalt),
 		"flowtls faketcp auth id v3", AuthIDLen)
 	if err != nil {
 		panic("flowtls: hkdf auth id: " + err.Error())

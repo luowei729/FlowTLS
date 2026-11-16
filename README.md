@@ -220,9 +220,6 @@ make upstream-pull TO=v1.15.0  # 同步上游 sing-box
       "listen": "0.0.0.0",
       "listen_port": 8443,
       "password": "换成你自己的密码",
-      "local_ip": "1.2.3.4",
-      "ip_id_mark": 61703,
-      "iptables_mode": "auto",
       "masquerade": {
         "site_dir": "/var/www/lumen-edge",
         "certificate_path": "/etc/ssl/private/fullchain.pem",
@@ -242,10 +239,9 @@ make upstream-pull TO=v1.15.0  # 同步上游 sing-box
 sudo ./dist/sing-box-1.14.4-rev.3-linux-amd64 run -c server.json
 ```
 
-> 需要 root（raw socket + iptables），且机器必须**直接持有公网 IP**。
-> `iptables_mode` 只有两个合法值：`auto`（启动时幂等写入，默认）和
-> `none`（自己维护）。启动日志会打印实际执行的每条命令，
-> 想先看清楚就把日志级别开到 `info` 再看。
+> 需要 root（raw socket + 防火墙规则），且机器必须**直接持有公网 IP**。
+> 防火墙规则由核心自动写入（优先 nft，没有则回落 iptables），**无需配置**；
+> 规则内容会打印在启动日志里，把日志级别开到 `info` 就能看到。
 
 ### 客户端
 
@@ -268,8 +264,6 @@ sudo ./dist/sing-box-1.14.4-rev.3-linux-amd64 run -c server.json
       "server": "1.2.3.4",
       "server_port": 8443,
       "password": "与服务端一致",
-      "source_port": 44300,
-      "ip_id_mark": 61703,
       "sni": "your.domain"
     }
   ]
@@ -316,7 +310,11 @@ apk add ./passwall-flowtls_<版本>_all.apk     # opkg 系统用 .ipk
 
 - **组件更新 → Sing-Box 版本 → 检查更新**：直接从本项目的 Release 拉内核，
   换完就是带 `with_flowtls` 的 `1.14.4-rev.N`；
-- **节点列表 → 添加节点 → 协议选 `FlowTLS`**：填源端口 / IP ID 标记 / SNI 等。
+- **节点列表 → 添加节点 → 协议选 `FlowTLS`**：只需填地址、端口、密码、SNI；
+  源端口与 IP ID 标记都由核心自动处理。
+  服务端开了多用户时，把「认证方式」切成**多用户**并填**你自己那个用户**的
+  密码（全局密码在多用户模式下不生效）——详见
+  [`docs/PASSWALL.md`](docs/PASSWALL.md)。
 
 PassWall 升级会把补丁的调用点冲掉，但补丁有 cron（每 5 分钟）与 WAN 上线
 两处自愈，也可以手动 `passwall-flowtls apply`；
@@ -420,11 +418,10 @@ CI（`.github/workflows/ci.yml`）跑的是前一条 + `make test` + 交叉编�
    配了则由 inbound 自己 bind 该端口（这是唯一会 bind 内核 TCP 的地方）。
    两种方式都必须用真证书：探测者能看到证书链，自签等于自报家门。
 
-8. **iptables 规则不会自动删除**
-   `iptables_mode: auto` 会幂等写入规则，但**刻意不删除**（进程重启期间规则必须
-   继续生效，否则内核会回 RST 打断正在重建的隧道）。升级/卸载后要手工清，
-   卸载命令由 `iptables_mode: print` 直接打印出来。
-   `none` / `print` / `auto` 三种模式都可用。
+8. **防火墙规则不会自动删除**
+   启动时会幂等写入规则（优先 nft，没有则回落 iptables），但**刻意不删除**——
+   进程重启期间规则必须继续生效，否则内核会回 RST 打断正在重建的隧道。
+   规则内容打印在启动日志里，升级/卸载后按它手工清理即可。
 
 ## 项目结构
 

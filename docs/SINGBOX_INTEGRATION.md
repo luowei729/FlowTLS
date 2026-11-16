@@ -122,9 +122,12 @@ make verify
    里申请 fd 会让 `check` 也要求 root。所有需权限的动作必须在
    `Start(stage == adapter.StartStateStart)` 里做。
 
-2. **iptables 默认只打印不执行**
-   `iptables_mode` 三态：`none` / `print`（默认）/ `auto`。
-   `auto` 需要显式开启，且要考虑与 sing-box 的 nftables / auto_redirect 冲突。
+2. **防火墙规则强制自动写入，没有开关**
+   优先用 nft（`table inet flowtls`，priority `raw`，在 conntrack 之前
+   `notrack`），没有 nft 时回落到 iptables。写不进去就让启动失败并说明原因——
+   那两条规则（notrack + RST 抑制）是协议能工作的前提，不是可选优化。
+   规则名带端口/服务端地址，所以与 sing-box 自己的 nftables / auto_redirect
+   互不干扰。
 
 3. **不能用 `common/listener`**
    flowtls inbound 自己开 AF_PACKET，不 bind 内核端口。

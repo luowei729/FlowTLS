@@ -29,9 +29,10 @@ func main() {
 		password = flag.String("password", "", "密码")
 		target   = flag.String("target", "example.com:443", "目标 host:port")
 		sni      = flag.String("sni", "", "伪装 SNI（默认取 target 的域名）")
-		srcPort  = flag.Uint("source-port", 44300, "客户端源端口")
-		ipidMark = flag.Uint("ip-id-mark", 0xF107, "IP ID 分流标记")
-		iptables = flag.String("iptables", "none", "iptables 模式：none / auto")
+		// 0 = 自动分配。联调默认也走动态端口，避免多开几个进程就撞四元组。
+		srcPort  = flag.Uint("source-port", 0, "客户端源端口（0=自动分配）")
+		ipidMark = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
+
 		timeout  = flag.Duration("timeout", 30*time.Second, "总超时")
 		doTLS    = flag.Bool("tls", true, "在流上再做一次 TLS（访问 https 站点）")
 		insecure = flag.Bool("insecure", true, "跳过目标证书校验（自签站点测试用）")
@@ -43,11 +44,6 @@ func main() {
 
 	if *server == "" || *password == "" {
 		flag.Usage()
-		os.Exit(2)
-	}
-	mode, err := flowtls.ParseMode(*iptables)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 	serverAddr, err := netip.ParseAddrPort(*server)
@@ -81,7 +77,7 @@ func main() {
 			SourcePort: uint16(*srcPort),
 			IPIDMark:   uint16(*ipidMark),
 			Handshake:  flowtls.HandshakeSymbolic,
-			NetMode:    mode,
+
 			// 联调工具不接 sing-box，显式用标准库输出。
 			// 生产路径由适配层注入 sing-box logger（受 log.level 控制）。
 			Logger: flowtls.StdLogger(),

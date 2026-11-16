@@ -50,11 +50,25 @@ type Session struct {
 	// 服务端所有会话共享 Listener 的 socket，绝不能在这里关。
 	ownsRaw bool
 
-	// peer 是对端地址（客户端是服务端，服务端是客户端）
-	peer netip.AddrPort
+	// autoPort 表示 localPort 是自动分配的，Close 时要归还。
+	//
+	// 不能把「归还」放在 Dial 的 defer 里：defer 在 Dial 返回时就执行，
+	// 而 Dial 返回成功正是隧道要开始工作的时候 —— 那样端口会立刻被
+	// 释放，另一个实例就能抢到同一个端口，四元组又撞车了。
+	autoPort bool
+	peer     netip.AddrPort
 	// localPort 是本端端口，remotePort 是对端端口
 	localPort  uint16
 	remotePort uint16
+	// localIP 是回包使用的源地址。空（零值）表示用 raw socket 的探测值。
+	//
+	// 为什么需要它：多 IP 主机（云主机的公网 IP + 内网 IP 都在同一张网卡上）
+	// 时，路由探测只能拿到「内核默认选的那个源 IP」，不一定是客户端发往的
+	// 那个地址。回包源 IP 一旦不对，客户端会把包当作无关流量丢掉。
+	//
+	// 服务端在收包时就已经知道对端发往的是哪个地址（ParsedPacket.Dst），
+	// 直接沿用它就是**零配置且永远正确**的源地址。
+	localIP netip.Addr
 
 	// mu 保护下面所有 TCP 状态与写缓冲。
 	//
@@ -375,7 +389,13 @@ func (s *Session) appendSegmentLocked(dst, payload []byte, flags uint8) []byte {
 		TSecr:   s.clock.PeerTS,
 		Payload: payload,
 	}
-	dst = BuildPacketInto(dst, s.raw.localIP, s.peer.Addr(),
+	// 源地址：会话若自带就用它（服务端从入包目的地址继承而来），
+	// 否则回落到 raw socket 的路由探测值（客户端的正常路径）。
+	src := s.localIP
+	if !src.IsValid() {
+		src = s.raw.localIP
+	}
+	dst = BuildPacketInto(dst, src, s.peer.Addr(),
 		s.localPort, s.remotePort, seg)
 	// TCP 语义：序号按载荷推进
 	s.seq += seqLen(flags, len(payload))
@@ -441,6 +461,11 @@ func (s *Session) Close() error {
 		// 服务端所有会话共享 Listener 的 socket，绝不能在这里关。
 		if s.ownsRaw {
 			_ = s.raw.Close()
+		}
+		// 归还自动分配的源端口。放在最后：先关 socket 再放端口，
+		// 避免新会话拿到端口时旧 socket 还在往同一个四元组发包。
+		if s.autoPort {
+			ReleaseSourcePort(s.localPort)
 		}
 	})
 	return nil

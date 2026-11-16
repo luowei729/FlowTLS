@@ -84,37 +84,72 @@ local function build(m, s, s1)
 		end
 	end
 
-	-- 统一构造：都挂 depends({protocol="flowtls"})，
-	-- 选别的协议时自动隐藏，不影响原有界面。
-	local function opt(class, name, title, desc)
+	-- 统一构造：默认挂 depends({protocol="flowtls"})，选别的协议时自动隐藏。
+	--
+	-- extra 是**额外条件**，会并进**同一个** depends 表（因此是 AND）。
+	-- 千万不要在 opt() 之后再调一次 o:depends(...)——LuCI 的 depends
+	-- 每条是 OR 关系，那样写会变成「protocol=flowtls **或** 其它条件」，
+	-- 结果是选别的协议时该字段也冒出来。
+	local function opt(class, name, title, desc, extra)
 		local o = s:option(class, name, title, desc)
 		if o then
-			o:depends({ protocol = "flowtls" })
+			local cond = { protocol = "flowtls" }
+			if type(extra) == "table" then
+				for k, v in pairs(extra) do
+					cond[k] = v
+				end
+			end
+			o:depends(cond)
 		end
 		return o
 	end
 
-	-- 固定源端口 ------------------------------------------------------------
-	-- 为什么必须固定：客户端防火墙规则按源端口精确匹配内核回出的 RST，
-	-- 端口随机的话规则写不出来（只能整段 DROP，会误伤正常流量）。
-	-- 同一台机器上有多个 FlowTLS 节点时，每个节点必须用不同端口。
-	local o = opt(Value, "source_port", tr("源端口"),
-		tr("固定源端口，客户端防火墙靠它精确拦截内核 RST。多个 FlowTLS 节点必须互不相同。"))
+	-- 认证方式 --------------------------------------------------------------
+	-- 这一项**不改变生成的配置**（客户端永远只需要一个 password），
+	-- 解决的是「多用户服务器的第一条隧道连不上」这个高频误配：
+	--
+	-- 服务端有两种互斥的凭据形态（同填会直接报错）：
+	--   单用户：顶层 password
+	--   多用户：users[] 里每个用户各自的 password
+	--
+	-- 而客户端只填一个「密码」。如果服务端开了多用户，填顶层那个
+	-- 全局密码是**无效的**（服务端根本不登记它）——但界面上的
+	-- 「密码」字段说明写的是「与服务端 password 一致」，于是必然踩坑。
+	-- 症状是隧道完全建不起来，且没有任何明显的错误提示。
+	--
+	-- 所以这里把「你这台服务器是哪种」显式问出来，让下面的密码说明
+	-- 跟着变。默认单用户（最常见）。
+	local o = opt(ListValue, "auth_mode", tr("认证方式"),
+		tr("单用户服务器：密码填服务端的全局 password。"
+			.. "多用户服务器：密码填 users[] 里**你自己那个用户**的 password"
+			.. "（服务端的全局 password 在多用户模式下不生效）。"))
 	if o then
-		o.datatype = "port"
-		o.default = "44300"
-		o.rmempty = false
+		o.default = "single"
+		o:value("single", tr("单用户（全局密码）"))
+		o:value("multi", tr("多用户（用户密码）"))
 	end
 
-	-- IP ID 标记 ------------------------------------------------------------
-	-- 伪包识别特征：IP 头的 ID 高字节。必须与服务端的 ip_id_mark 完全一致，
-	-- 且每个部署应不同（它是抗主动探测的一部分，公开就等于交出指纹）。
-	o = opt(Value, "ip_id_mark", tr("IP ID 标记"),
-		tr("伪包识别标记（十进制 0-65535），必须与服务端 ip_id_mark 一致。例如 0xF107 = 61703。"))
-	if o then
-		o.datatype = "port"
-		o.default = "61703"
-	end
+	-- 用户名（仅多用户时出现）----------------------------------------------
+	-- **纯备注**，不参与任何生成逻辑：线上只传 password 派生出的 authID，
+	-- 用户名从不发送（服务端的 name 也只用于它自己的日志）。
+	-- 加它是因为多用户服务器上通常有好几个节点（一人一个），
+	-- 没有用户名就很难在节点列表里认出「这条隧道是谁的」。
+	o = opt(Value, "auth_user", tr("用户名"),
+		tr("仅用于区分/备注，不会发送给服务端。真正的凭据是上面的密码。"),
+		{ auth_mode = "multi" })
+
+	-- 这里**只有 SNI 一个必填项**。源端口、IP ID 标记、防火墙模式全部
+	-- 由核心自动处理，不再让用户填：
+	--
+	--   源端口      → 每次建连自动从动态端口段挑一个未在用的
+	--                 （固定它会撞四元组，两台机器经同一 NAT 去同一服务端
+	--                  就会互相踢会话）
+	--   IP ID 标记  → 从 password 派生（HKDF-SHA256，两端算出同一个值）。
+	--                 多用户时服务端为每个用户各派生一个，全部纳入识别范围。
+	--                 所以它天然「部署间不同」，不需要也不应该手填。
+	--   防火墙模式  → 强制写入（notrack + RST 抑制是协议能工作的前提）
+	--
+	-- 用户要填的就是：地址、端口、密码、SNI。四项。
 
 	-- SNI ------------------------------------------------------------------
 	o = opt(Value, "sni", tr("SNI"),
@@ -129,14 +164,6 @@ local function build(m, s, s1)
 		o:value("none", "None")
 	end
 
-	-- 防火墙规则落地方式 ----------------------------------------------------
-	o = opt(ListValue, "iptables_mode", tr("防火墙模式"),
-		tr("auto 自动写入 nftables/iptables 规则（推荐）。none 表示由你自己维护。"))
-	if o then
-		o.default = "auto"
-		o:value("auto", tr("自动（推荐）"))
-		o:value("none", tr("不处理"))
-	end
 
 	-- 拥塞窗口上限 ----------------------------------------------------------
 	o = opt(Value, "max_cwnd", tr("最大拥塞窗口"),

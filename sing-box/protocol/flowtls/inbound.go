@@ -76,17 +76,31 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.Password == "" && len(options.Users) == 0 {
 		return nil, C.ErrFlowTLSRequirePassword
 	}
+	// 凭据二选一：password（单用户）与 users（多用户）不能同时配置。
+	//
+	// 放在这里而不只在 flowtls.ServerConfig.Validate 里，是因为
+	// `sing-box check` 只走 NewInbound、不走 Start —— 而"配置校验不需要
+	// root"是项目的硬要求，错误必须在 check 阶段就暴露。
+	//
+	// 为什么必须报错而不是"以 users 为准"：users 非空时顶层 password
+	// 既不参与登录、也不参与 ip_id_mark 派生，留着只会让人以为它是
+	// 兜底凭据，而 mark 不一致的症状是隧道完全不通（DEVTIPS 149）。
+	if options.Password != "" && len(options.Users) > 0 {
+		return nil, E.New("flowtls: password 与 users 不能同时配置 —— " +
+			"只配 password 表示单用户；配 users 表示多用户，" +
+			"此时 password 会被完全忽略（既不能登录、也不参与 ip_id_mark 派生）")
+	}
 	if options.ListenPort == 0 {
 		return nil, E.New("flowtls: listen_port is required")
 	}
-	if options.IPIDMark == 0 {
-		options.IPIDMark = ft.IPIDMark | 0x07
-	}
-	// iptables 模式与握手参数在这里就校验，让 `sing-box check`
-	// 能拓出拼写错误（Rust config 校验同样在建连前）。
-	if _, err := ft.ParseMode(options.IPTablesMode); err != nil {
-		return nil, err
-	}
+	// IPIDMark 保持 0（表示按每个用户的 password 各自派生）。
+	//
+	// 服务端是**多用户**的：它不能只算一个标记，而要把每个用户的都纳入
+	// 识别范围（内核层判断「是不是我们的包」时还没解密）。这件事由
+	// flowtls.ServerConfig.Marks() 统一处理，这里不预先填值。
+	//
+	// 握手参数在这里就校验，让 `sing-box check` 能拓出拼写错误
+	// （Rust config 校验同样在建连前）。
 	if _, err := ft.ParseHandshake(options.Handshake); err != nil {
 		return nil, err
 	}
@@ -130,10 +144,6 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if err != nil {
 		return err
 	}
-	netMode, err := ft.ParseMode(h.opts.IPTablesMode)
-	if err != nil {
-		return err
-	}
 	handshake, err := ft.ParseHandshake(h.opts.Handshake)
 	if err != nil {
 		return err
@@ -142,7 +152,6 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	cfg := ft.ServerConfig{
 		Listen:         listenAddr,
 		Password:       h.opts.Password,
-		NetMode:        netMode,
 		Handshake:      handshake,
 		IPIDMark:       h.opts.IPIDMark,
 		UDPEnabled:     &h.udpOn,

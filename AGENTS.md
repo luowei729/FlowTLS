@@ -39,8 +39,15 @@ flowtls 传输层
     （严格 NAT 会丢弃握手完成前的数据包；零等待版本已废弃）
   - AEAD 密钥 = HKDF-SHA256(password)，解密成功即鉴权
   - 伪包识别特征 = **IP ID 高字节标记**（与 Rust 逐条一致）
-    `(ip_id & mark) == mark` 且 SYN 且无载荷；mark 来自配置的 `ip_id_mark`
-    （默认 `0xF100`），每个部署应不同。
+    `(ip_id & mark) == mark` 且 SYN 且无载荷；mark 由
+    `HKDF-SHA256(password, "flowtls ip id mark v1")` **派生**（见
+    `flowtls/mark.go`），两端自动一致、部署间自动不同。
+    多用户时服务端为每个用户各派生一个，全部纳入识别范围。
+    **凭据二选一**：`password`（单用户）与 `users`（多用户）**不能同时配置**，
+    同填会直接报错。因为 users 非空时顶层 password 既不参与登录、
+    也不参与 mark 派生，"静默忽略"会让人以为它是兜底凭据，
+    而 mark 不一致的症状是隧道完全不通（`DEVTIPS.md` 第 149 条）。
+    **不要改回「配置里手填一个固定值」**：那会重新引入公开指纹。
     **不要改成 wscale 判断**：v1 曾用 `wscale=12`，但 wscale 必须做得和真实
     Linux 一样（9~10）才不像伪造，一旦改成真实的就失去了识别能力。
         │  原始 IPv4 报文
@@ -191,8 +198,9 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 18. **真实 IP、域名、凭据一律不许写进仓库**。文档、测试、注释统一用
     `203.0.113.x` / `198.51.100.x` / `192.0.2.x`（RFC 5737 文档段）和
     `example.com`；真实值只放在被忽略的 `deploy/` 与 `DEPLOY_CREDENTIALS.md`。
-    FakeTCP 的抗探测能力全靠「IP + ip_id_mark + SNI 都不公开」，三者同时
-    泄露等于把部署指纹交出去。`docs/leak_check.sh` 用白名单扫描被跟踪文件，
+    FakeTCP 的抗探测能力全靠「IP + SNI + password 都不公开」，三者同时
+    泄露等于把部署指纹交出去（ip_id_mark 由 password 派生，所以它跟着
+    password 一起安全或一起泄露）。`docs/leak_check.sh` 用白名单扫描被跟踪文件，
     `make verify` 与 CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
     **测量/运维脚本连接哪台机器必须从环境变量取**（如 `FLOWTLS_SERVER`），
     不许写死地址或 `ssh -J 跳板`（`DEVTIPS.md` 第 131 条）。

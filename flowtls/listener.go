@@ -57,7 +57,13 @@ type Listener struct {
 	raw   *rawSocket
 	users *userTable
 	port  uint16
-	mark  uint16
+	// marks 是本服务端接受的**全部** ip_id_mark（每个用户一个）。
+	//
+	// 为什么是一组：内核层要判断「这个包是不是我们的」时还没解密，
+	// 不知道对端是哪个用户，所以只能把每个用户的派生标记都纳入范围
+	// （见 ServerConfig.Marks）。这也是多用户部署下「mark 从 password
+	// 派生」能成立的关键 —— 服务端不需要预先知道谁来连。
+	marks []uint16
 	// logger 是诊断日志出口，恒非 nil（构造时经 loggerOr 归一）。
 	//
 	// 服务端所有会话共享它：收包路径是单协程共享 socket，
@@ -108,6 +114,11 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	// 日志出口先归一：后面 newRawSocket 与收包协程都要用。
 	logger := loggerOr(cfg.Logger)
 
+	// marks 是每个用户 password 派生出的 ip_id_mark（见 ServerConfig.Marks）。
+	// 服务端在内核层判断「是不是我们的包」时还没解密，所以必须把所有
+	// 用户的标记都纳入识别范围。
+	marks := cfg.Marks()
+
 	// 探测用的目的地址**不能是监听地址**。
 	//
 	// 服务端 listen 通常是 0.0.0.0，拿它去查路由/网关 MAC 必然失败：
@@ -125,37 +136,36 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// 规则的作用是「让内核别碰我们的伪包」。
 	// 顺序理由：先有能收包的能力，再去改防火墙，失败时顺序可回退。
-	if cfg.NetMode == ModeAuto {
-		if err := EnsureServer(cfg.Listen.Port(), cfg.IPIDMark); err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		// 同客户端：fw4 的 ct invalid DROP 会静默吞掉我们的伪包。
-		for _, r := range NftRules(kindServer, cfg.Listen.Port(), 0, cfg.IPIDMark) {
-			logger.Info("防火墙规则: ", r)
-		}
+	//
+	// **没有开关**（同客户端）：这些规则是协议能工作的前提，不是可选优化。
+	// 少了它们内核会自己回 SYN-ACK / RST，把伪连接和同端口的真实网站都搞乱。
+	// 写不进去就带着原因失败，比静默不通强。
+	if err := EnsureServer(cfg.Listen.Port(), marks); err != nil {
+		_ = raw.Close()
+		cancel()
+		return nil, err
+	}
+	// 同客户端：fw4 的 ct invalid DROP 会静默吞掉我们的伪包。
+	for _, r := range NftRules(cfg.Listen.Port(), marks) {
+		logger.Info("防火墙规则: ", r)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
-		raw:              raw,
-		users:            users,
-		port:             cfg.Listen.Port(),
-		mark:             IPIDMarkOf(cfg.IPIDMark),
-		logger:           logger,
-		idleTimeout:      opts.IdleTimeout,
-		handshakeTimeout: opts.HandshakeTimeout,
-		byAddr:           make(map[netip.AddrPort]*Session),
-		pending:          make(map[netip.AddrPort]*synState),
-		acceptCh:         make(chan *Session, opts.AcceptQueue),
-		sessionDone:      make(chan netip.AddrPort, opts.AcceptQueue),
-		ctx:              ctx,
-		cancel:           cancel,
-	}
-	if l.mark == 0 {
-		l.mark = IPIDMark
+		raw:         raw,
+		port:        cfg.Listen.Port(),
+		users:       users,
+		marks:       marks,
+		logger:      logger,
+		byAddr:      make(map[netip.AddrPort]*Session),
+		pending:     make(map[netip.AddrPort]*synState),
+		acceptCh:    make(chan *Session, opts.AcceptQueue),
+		sessionDone: make(chan netip.AddrPort, opts.AcceptQueue),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	l.wg.Add(2)
@@ -458,8 +468,24 @@ func (l *Listener) shouldReinject(p ParsedPacket, consumed bool) bool {
 //
 // 注意：带标记 ≠ 认证通过。标记只是「这个包被本协议占用」的声明，
 // 真正的鉴权是握手首包的 AEAD 认证。两件事不能混。
+//
+// 多标记：任一用户的派生标记命中即算本协议（见 Listener.marks）。
 func (l *Listener) protocolOwned(p ParsedPacket) bool {
-	return p.IPID&l.mark == l.mark
+	return l.markOf(p) != 0
+}
+
+// markOf 返回这个包的 IP ID 命中的标记；未命中返回 0。
+//
+// 返回命中的那个值（而不是 bool）是因为建会话时要沿用它：
+// 服务端回包的 IP ID 高字节必须与客户端一致，否则客户端那边的
+// 内核层规则匹配不上。
+func (l *Listener) markOf(p ParsedPacket) uint16 {
+	for _, m := range l.marks {
+		if m != 0 && p.IPID&m == m {
+			return m
+		}
+	}
+	return 0
 }
 
 // handlePacket 是分流核心（对应 Rust `handle_packet`）。
@@ -484,8 +510,8 @@ func (l *Listener) handlePacket(p ParsedPacket) (*Session, bool) {
 	//
 	// 判别依据是 IP ID 高字节（配置派生的标记），与 Rust 一致：
 	// `(ip_id & mark) == mark && SYN && payload.is_empty()`。
-	if p.IPID&l.mark == l.mark && p.Flags&TCPSYN != 0 && len(p.Payload) == 0 {
-		l.handleSYN(client, p)
+	if m := l.markOf(p); m != 0 && p.Flags&TCPSYN != 0 && len(p.Payload) == 0 {
+		l.handleSYN(client, p, m)
 		return nil, true
 	}
 
@@ -527,7 +553,7 @@ func (l *Listener) sessionFor(client netip.AddrPort) *Session {
 }
 
 // handleSYN 回应 SYN-ACK 并登记 pending（对应 Rust 的 SYN 分支）。
-func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
+func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, mark uint16) {
 	now := time.Now()
 	l.mu.Lock()
 	// 客户端重启后四元组会复用（源端口固定），旧会话必须先清掉。
@@ -575,11 +601,19 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket) {
 		tsecr = p.TSVal
 	}
 	opts := SynOptions(ts, tsecr)
-	pkt := BuildPacket(l.raw.localIP, client.Addr(), l.port, client.Port(), TcpSeg{
+	// 回包源地址用入包的 Dst：客户端发往哪个地址，就从哪个地址回。
+	// 这比路由探测更准（多 IP 主机上探测值未必是客户端访问的那个）。
+	srcIP := p.Dst
+	if !srcIP.IsValid() {
+		srcIP = l.raw.localIP
+	}
+	pkt := BuildPacket(srcIP, client.Addr(), l.port, client.Port(), TcpSeg{
 		Seq:   isn,
 		Ack:   p.Seq + 1,
 		Flags: TCPSYN | TCPACK,
-		IPID:  RandomIPID(l.mark),
+		// 回包的标记必须与客户端发来的那个一致：客户端内核层规则
+		// 按同一个值匹配，用别的标记会让它认不出来。
+		IPID: RandomIPID(mark),
 		// SYN 阶段用未缩放的原始窗口（缩放因子在 ESTABLISHED 后才生效）
 		Window:  65535,
 		TSVal:   ts,
@@ -660,7 +694,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	clock := NewTcpClockAt(ts + 2)
 	clock.Observe(p.TSVal, p.HasTS)
 
-	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, l.mark, l.logger)
+	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, l.markOf(p), p.Dst, l.logger)
 
 	// ---- 发伪 ServerHello（与 Rust 一致）----
 	//
@@ -706,15 +740,22 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 // logger 由 Listener 传入而不是从 ServerConfig 重新取：
 // 同一进程里可能有多个 inbound，从配置取会让日志打错 tag。
 func newServerSession(raw *rawSocket, codec *Codec, peer netip.AddrPort,
-	localPort uint16, seq, peerSeq uint32, clock *TcpClock, mark uint16, logger Logger) *Session {
+	localPort uint16, seq, peerSeq uint32, clock *TcpClock, mark uint16,
+	localIP netip.Addr, logger Logger) *Session {
 	s := &Session{
 		raw:   raw,
 		codec: codec,
 		// logger 恒非 nil：收包/发送路径的错误日志直接调，不需判空。
 		logger: loggerOr(logger),
 		// 服务端所有会话共享 Listener 的 socket，绝不能在这里关。
-		ownsRaw:    false,
-		peer:       peer,
+		ownsRaw: false,
+		peer:    peer,
+		// 回包源地址 = 客户端本次发往的地址（即入包的 Dst）。
+		//
+		// 这是「零配置且永远正确」的源地址：多 IP 主机（公网 + 内网同在
+		// 一张网卡）时路由探测拿到的未必是客户端访问的那个 IP，用错
+		// 源地址回包会被客户端当无关流量丢掉。
+		localIP:    localIP,
 		localPort:  localPort,
 		remotePort: peer.Port(),
 		seq:        seq,

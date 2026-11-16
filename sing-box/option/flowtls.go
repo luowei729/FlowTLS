@@ -28,19 +28,21 @@ type FlowTLSInboundOptions struct {
 	Password string `json:"password,omitempty"`
 	// Users 对应 Rust `users`；为空时只用 Password 做单用户认证。
 	Users []FlowTLSUser `json:"users,omitempty"`
-	// LocalIP 对应 Rust `faketcp.local_ip`，是回包时使用的源 IP。
+	// LocalIP 是回包时使用的源 IP。**留空即可，不需要配**。
 	//
-	// NAT 云主机上路由探测只能拿到内网地址（如 10.0.0.10），
-	// 而对外源 IP 是网关 SNAT 后的公网地址。此时必须显式填**内网地址**，
-	// 让网关做 1:1 SNAT；填公网地址会被网关反欺骗静默丢弃。
+	// 服务端优先用「客户端本次发往的地址」（即入包的 IP 头目的地址）
+	// 作为回包源地址——这是零配置且永远正确的做法：
+	//   - NAT 云主机（Oracle Cloud 等）网卡上只有内网地址，
+	//     包里的源 IP 就填那个内网地址，让网关做 1:1 SNAT；
+	//   - 多 IP 主机（公网 + 内网同在一张网卡）时，客户端访问的是哪个
+	//     地址就从哪个地址回，不依赖路由探测猜；
+	//   - 单 IP 主机自然也对。
+	//
+	// 只有在特殊拓扑（例如要显式绑某块网卡的内网地址）时才需要填。
 	LocalIP string `json:"local_ip,omitempty"`
 	// IPIDMark 对应 Rust `faketcp.ip_id_magic`，是 IP ID 高字节分流标记。
-	// 每个部署应不同；默认 0xF100 | 0x07。
+	// **留空即从 password 派生**，两端自动一致；填了就用你填的值。
 	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
-	// IPTablesMode 对应 Rust `net.mode`，只有两个合法值：
-	//   none  — 不生成也不执行，部署方自行维护规则；
-	//   auto  — 启动时幂等写入 iptables（写后不清理，见 AGENTS 约束 13）。
-	IPTablesMode string `json:"iptables_mode,omitempty"`
 	// Handshake 对应 Rust `faketcp.handshake`：symbolic（默认）/ none。
 	Handshake string `json:"handshake,omitempty"`
 	// MaxCwnd 对应 Rust `net.max_cwnd`，QUIC 拥塞窗口硬上限（字节，默认 8MB）。
@@ -111,12 +113,19 @@ type FlowTLSOutboundOptions struct {
 	ServerOptions
 	// Password 对应 Rust `password`。
 	Password string `json:"password,omitempty"`
-	// SourcePort 对应 Rust `faketcp.source_port`，固定源端口。
+	// SourcePort 是客户端源端口。**留空（0）即自动分配，这也是推荐值**。
 	//
-	// 为什么要固定：客户端 iptables 规则按源端口精确匹配内核发回的 RST。
-	// 端口随机的话规则写不出来，只能整段 DROP。
-	// 重启后四元组完全相同——这正是「纯 SYN 判断必须优先于已有会话」
-	// 那条约束的来源。
+	// 一条 FlowTLS 隧道就是一个固定四元组（客户端 IP:源端口 →
+	// 服务端 IP:端口），服务端靠它定位会话。固定源端口等于「一条隧道
+	// 占一个端口」，而两台机器经同一个 NAT 去同一台服务端时，源端口
+	// 相同就会四元组撞车——服务端只看得到一个会话，新 SYN 把旧会话
+	// 踢掉，两边反复互踢。
+	//
+	// 旧版（≤ rev.6）之所以必须固定，是因为客户端防火墙规则按源端口
+	// 匹配内核回的 RST。现在规则改为按**服务端地址**匹配（同一服务端
+	// 的多个实例共享一组规则），与源端口无关，这个限制已消失。
+	//
+	// 所以这里不再提供固定端口选项：动态分配是默认且唯一推荐做法。
 	SourcePort uint16 `json:"source_port,omitempty"`
 	// IPIDMark 对应 Rust `faketcp.ip_id_magic`，与客户端 iptables 规则一致。
 	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
@@ -128,12 +137,6 @@ type FlowTLSOutboundOptions struct {
 	Handshake string `json:"handshake,omitempty"`
 	// SNI 对应 Rust `sni`，只影响伪 ClientHello 的外观，不参与握手校验。
 	SNI string `json:"sni,omitempty"`
-	// IPTablesMode 对应 Rust `net.mode`，与服务端同名、同语义。
-	//
-	// 客户端规则的作用是屏蔽内核对伪连接回的 RST：
-	// Session 走 raw socket，内核里没有对应 socket，收到 SYN-ACK 就会回 RST，
-	// 而 RST 是协议合法的终止信号，会让中间设备立刻拆掉 NAT 映射。
-	IPTablesMode string `json:"iptables_mode,omitempty"`
 	// MaxCwnd 对应 Rust `net.max_cwnd`。
 	// **客户端与服务端应保持一致**：两端各算各的窗口，取小值生效。
 	MaxCwnd int64 `json:"max_cwnd,omitempty"`

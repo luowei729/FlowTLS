@@ -204,15 +204,51 @@ for _, v in ipairs(sec.fields["protocol"].keylist or {}) do
 end
 ok(found, "协议下拉框里已加入 FlowTLS")
 
--- 七个自定义字段都要挂 flowtls 依赖，否则选其它协议时会全部露出
-local mine = { "source_port", "ip_id_mark", "sni", "handshake",
-	"iptables_mode", "max_cwnd", "udp_enabled" }
+-- 自定义字段里已经没有 source_port / ip_id_mark / iptables_mode
+-- （三者都改为核心自动处理），剩下的字段都要挂 flowtls 依赖，
+-- 否则选其它协议时会全部露出
+local mine = { "sni", "handshake", "max_cwnd", "udp_enabled" }
 for _, n in ipairs(mine) do
 	local o = sec.fields[n]
 	ok(o ~= nil and o.option == "singbox_" .. n,
 		string.format("字段 %s 已创建且带 singbox_ 前缀", n))
 	ok(o ~= nil and has_flowtls_dep(o),
 		string.format("字段 %s 已挂 flowtls 依赖", n))
+end
+
+-- ------------------------------------------------- 认证方式（单用户 / 多用户）
+print("== 认证方式 ==")
+local mode = sec.fields["auth_mode"]
+ok(mode ~= nil, "认证方式字段已创建")
+if mode then
+	-- 默认必须是单用户：多用户是少数情况，默认值要覆盖大多数部署
+	ok(mode.default == "single",
+		"认证方式默认 single（单用户，填全局密码），实际 " .. tostring(mode.default))
+	local hasSingle, hasMulti = false, false
+	for _, v in ipairs(mode.values or {}) do
+		if v == "single" then hasSingle = true end
+		if v == "multi" then hasMulti = true end
+	end
+	ok(hasSingle and hasMulti, "认证方式同时提供 single 与 multi 两个取值")
+	ok(has_flowtls_dep(mode), "认证方式挂了 flowtls 依赖")
+end
+
+-- 用户名只在多用户模式下出现。
+--
+-- 这里要盯的是 **AND 条件必须并进同一个 depends 表**：
+-- LuCI 的 depends 每条之间是 OR，写成两次 depends() 会变成
+-- 「protocol=flowtls 或 auth_mode=multi」，于是选任何协议 + 多用户时
+-- 这个字段都会跑出来。所以断言「只有一条依赖，且同时含两个键」。
+local user = sec.fields["auth_user"]
+ok(user ~= nil, "用户名字段已创建")
+if user then
+	local deps = user.depsset or {}
+	ok(#deps == 1,
+		string.format("user 应只有 1 条 depends（多条是 OR，会误显示），实际 %d 条", #deps))
+	local d = deps[1] or {}
+	ok(d.protocol == "flowtls" and d.auth_mode == "multi",
+		"用户名依赖应为 {protocol=flowtls, auth_mode=multi}（同一表内 AND），实际 "
+			.. tostring(d.protocol) .. "/" .. tostring(d.auth_mode))
 end
 
 -- ---------------------------------------------------------------- 4) 出站包装
@@ -235,15 +271,18 @@ ok(type(gen) == "function", "包装后仍是函数")
 local flow = gen(nil, {
 	protocol = "flowtls", address = "203.0.113.10", port = "8443",
 	password = "pw", source_port = "44313", ip_id_mark = "61703",
-	sni = "example.com", handshake = "symbolic", iptables_mode = "auto",
+	sni = "example.com", handshake = "symbolic", iptables_mode = "none",
 	max_cwnd = "8388608", udp_enabled = "",
 }, "n1")
 ok(flow.type == "flowtls", "type 保持 flowtls")
 ok(flow.password == "pw", "password 已带出")
-ok(flow.source_port == 44313, "source_port 已转成数字")
-ok(flow.ip_id_mark == 61703, "ip_id_mark 已转成数字")
+-- 源端口必须是自动分配：补丁不得再输出 source_port 字段。
+-- 一旦 output 里又有它，两台机器经同一 NAT 去同一台服务端时就会四元组
+-- 撞车、互相踢会话（真机踩过：haproxy 反复把 FlowTLS 后端标 DOWN）。
+ok(flow.source_port == nil, "source_port 不再输出（交给内核自动分配）")
+ok(flow.ip_id_mark == nil, "ip_id_mark 不再输出（从 password 派生）")
 ok(flow.sni == "example.com" and flow.handshake == "symbolic", "sni/handshake 已带出")
-ok(flow.iptables_mode == "auto", "iptables_mode 已带出")
+ok(flow.iptables_mode == nil, "iptables_mode 不再输出（核心已强制写入规则）")
 ok(flow.max_cwnd == 8388608, "max_cwnd 已转成数字")
 ok(flow.udp_enabled == nil, "udp_enabled 留空 → 不出字段（跟随核心默认）")
 ok(flow.tls == nil and flow.multiplex == nil, "已清掉 tls/multiplex（flowtls 不认）")
@@ -253,9 +292,11 @@ local flow2 = gen(nil, { protocol = "flowtls", address = "192.0.2.1", port = "84
 ok(flow2.udp_enabled == false, "udp_enabled=0 → 显式关闭")
 local flow3 = gen(nil, { protocol = "flowtls", address = "192.0.2.1", port = "8443",
 	password = "pw", udp_enabled = "1",
-	source_port = "", max_cwnd = "" }, "n3")
+	-- 旧配置里可能还留着 source_port，包装器必须把它丢掉
+	source_port = "44312", max_cwnd = "" }, "n3")
 ok(flow3.udp_enabled == true, "udp_enabled=1 → 显式开启")
-ok(flow3.source_port == nil and flow3.max_cwnd == nil, "空串不产生 0 值字段")
+ok(flow3.source_port == nil, "旧配置里的 source_port 已被清除")
+ok(flow3.max_cwnd == nil, "空串不产生 0 值字段")
 
 -- 非 flowtls 必须逐字节等价
 local other = gen(nil, { protocol = "hysteria2", address = "198.51.100.1", port = "443" }, "n4")

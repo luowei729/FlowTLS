@@ -10,6 +10,7 @@ package flowtls
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"time"
 )
@@ -35,6 +36,38 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	}
 	// 日志出口先归一：rawSocket 与 Session 都要用同一个实例。
 	logger := loggerOr(cfg.Logger)
+
+	// 源端口：0 表示自动分配一个当前未在用的端口。
+	//
+	// 为什么要自动分配：一条 FlowTLS 隧道就是一个固定四元组，服务端靠它
+	// 定位会话。固定源端口等于「一条隧道占一个端口」，两台机器经同一个
+	// NAT 去同一台服务端时四元组会撞车，服务端只认一个会话，新 SYN 把
+	// 旧会话踢掉（真机踩过：haproxy 里 FlowTLS 后端被反复标 DOWN）。
+	//
+	// 显式配置非 0 值时不动它：部署方需要对端按源端口放行时可以钉死。
+	sourcePort := cfg.SourcePort
+	autoPort := false
+	// portHandedOver 见下方 defer 的说明：Session 建立后归还责任转移。
+	portHandedOver := false
+	if sourcePort == 0 {
+		sourcePort = AllocSourcePort()
+		if sourcePort == 0 {
+			return nil, errors.New("flowtls: 没有可用的源端口（动态端口段已耗尽）")
+		}
+		autoPort = true
+		// 分配之后、Session 建立之前还有若干可能失败的步骤（raw socket、
+		// 防火墙规则、codec）。这段区间里的失败必须归还端口，否则每次
+		// 失败都泄漏一个端口，长时间运行会把动态端口段耗光。
+		//
+		// 一旦 Session 建立（两个 return s, nil 处）就把 portHandedOver
+		// 置 true，归还责任转交 Session.Close。
+		defer func() {
+			if !portHandedOver {
+				ReleaseSourcePort(sourcePort)
+			}
+		}()
+	}
+
 	// 客户端传 false：下载方向客户端只发 ACK，发送量极小，
 	// 用 AF_PACKET 无收益却要付 ARP 探测与 NAT 风险（见 socket_linux.go 文件头）。
 	//
@@ -42,7 +75,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	// 必须知道本端是客户端才能按四元组端口建过滤器。
 	raw, err := newRawSocket(cfg.Server.Addr(), netip.Addr{}, logger, false, socketRole{
 		serverPort: cfg.Server.Port(),
-		sourcePort: cfg.SourcePort,
+		sourcePort: sourcePort,
 	})
 	if err != nil {
 		return nil, err
@@ -50,41 +83,43 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	// 与 Rust `tracing::info!(%server_ip, %server_port, %local_ip, ...)` 对位：
 	// 这两行是排查「包发到哪去了」的第一现场证据。
 	logger.Info("FakeTCP 通道已就绪 server=", cfg.Server,
-		" local=", raw.LocalIP(), " 模式=", raw.SendMode())
+		" local=", raw.LocalIP(), " 源端口=", sourcePort,
+		" 模式=", raw.SendMode())
+
+	// ip_id_mark 用着默认值时必须明确提醒。
+	//
+	// 它不能像 source_port 那样自动生成：服务端与**所有**客户端必须用同
+	// 一个值（服务端靠它判断伪包），而多用户部署下每个用户 password 不同，
+	// 「从 password 派生」在两端会算出不同结果。所以只能显式配置，
+	// 唯一能做的就是提醒部署方别留着公开默认值。
+	if IsDefaultIPIDMark(cfg.IPIDMark) {
+		logger.Warn("ip_id_mark 仍为公开默认值(", cfg.IPIDMark,
+			")。它同时是抗主动探测指纹的一部分，",
+			"请为每个部署选一个不公开的值（需与服务端一致），例如 0xC500 = 50432。")
+	}
 
 	// 客户端规则必须在**第一个包发出之前**就位。
 	//
 	// SYN-ACK 一回，内核就会发现没有对应 socket 并回 RST，
 	// 而 RST 是协议合法的终止信号，中间设备会立即拆掉 NAT 映射。
-	if cfg.NetMode == ModeAuto {
-		if err := EnsureClient(cfg.SourcePort, cfg.Server.Port(), cfg.IPIDMark); err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		// 把实际写进 nft 的规则打出来。这一层出问题时现象极隐蔽：
-		// fw4 把伪包判成 ct invalid 并 DROP，而 DROP 在 sendto 里表现为
-		// EPERM —— 看起来像权限问题。不写日志就永远查不到。
-		for _, r := range NftRules(kindClient, cfg.SourcePort, cfg.Server.Port(), cfg.IPIDMark) {
-			logger.Info("防火墙规则: ", r)
-		}
-	} else {
-		// **mode=none 时必须明确警告，不能静默**。
-		//
-		// 这条 notrack 规则同时承担两个职责：
-		//   1. 让 fw4 不再把伪包判成 ct invalid 丢掉（否则第二个包起发不出去）；
-		//   2. 让**其它代理**（PassWall / OpenClash / SSR+ 等）无法接管我们的流量。
-		//
-		// 第 2 条的原理是硬性的：那些工具的劫持都写在 nat 钩子
-		// （`type nat hook output`），而内核 `nf_nat_inet_fn()` 的第一件事就是
-		// `ct = nf_ct_get(skb); if (!ct) return NF_ACCEPT;` —— 没有 conntrack
-		// 条目就没有 NAT。notrack 正是让包不进 conntrack 的唯一手段。
-		//
-		// 关掉之后一旦设备上装了别的代理，流量会被送进两个跨境隧道
-		// （两次回环，延迟翻倍），且源端口被改写会让服务端认证失败。
-		logger.Warn("iptables_mode=none：未写入 notrack 规则。",
-			"如果本机还跑着 PassWall / OpenClash 等代理，它们会接管本插件的伪 TCP 流量",
-			"（两次跨境回环 + 源端口被改写，表现为延迟翻倍或握手失败）。",
-			"除非你自行维护防火墙规则，否则请改回 iptables_mode=auto")
+	//
+	// 规则按**服务端地址**匹配（不是按源端口），所以源端口动态分配
+	// 不影响规则：同一台机器上的所有 FlowTLS 实例去同一个服务端时
+	// 共享同一组规则，去不同服务端时各有一组，互不干扰。
+	//
+	// **没有开关**：这两条规则不是「可选优化」，而是协议能工作的前提。
+	// 少了 notrack，fw4 会把伪包判成 ct invalid 丢掉（现象是 sendto 返回
+	// EPERM，看着像权限问题）；少了 RST 抑制，第一个 SYN-ACK 就把 NAT
+	// 映射拆掉。所以这里不做 `if 配置==auto` 判断 —— 直接写，写不进去
+	// 就带着原因失败，比静默不通强。
+	if err := EnsureClient(cfg.Server, cfg.IPIDMark); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	// 把实际生效的规则打出来。这一层出问题时现象极隐蔽，
+	// 不写日志就永远查不到。
+	for _, r := range ClientNftRules(cfg.Server, cfg.IPIDMark) {
+		logger.Info("防火墙规则: ", r)
 	}
 
 	codec, err := NewClientCodec(cfg.Password)
@@ -108,7 +143,8 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		// 那是服务端的语义。漏设会让每次重连泄漏 3 个 fd。
 		ownsRaw:    true,
 		peer:       cfg.Server,
-		localPort:  cfg.SourcePort,
+		localPort:  sourcePort,
+		autoPort:   autoPort,
 		remotePort: cfg.Server.Port(),
 		ipid:       RandomIPID(mark),
 		mark:       mark,
@@ -133,6 +169,8 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		// 跳过握手（要求客户端有公网 IP，且链路无状态防火墙）。
 		// Rust 同样把 peer_seq 留 0 后直接开始 drain_transmits。
 		s.peerSeq = 0
+		// Session 已建立：端口归还责任交给 Session.Close。
+		portHandedOver = true
 		return s, nil
 	}
 
@@ -140,6 +178,8 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		_ = s.Close()
 		return nil, err
 	}
+	// Session 已建立：端口归还责任交给 Session.Close。
+	portHandedOver = true
 	return s, nil
 }
 

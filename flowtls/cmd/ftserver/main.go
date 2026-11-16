@@ -31,20 +31,15 @@ func main() {
 		listen   = flag.String("listen", "0.0.0.0:8443", "监听地址")
 		password = flag.String("password", "", "密码")
 		localIP  = flag.String("local-ip", "", "回包源 IP（NAT 云主机填内网地址；留空按路由探测）")
-		ipidMark = flag.Uint("ip-id-mark", 0xF107, "IP ID 分流标记")
-		iptables = flag.String("iptables", "none", "iptables 模式：none / auto")
-		maxCwnd  = flag.Uint64("max-cwnd", 8388608, "QUIC 拥塞窗口上限（字节）")
-		verbose  = flag.Bool("v", false, "打印每 2 秒的路径统计")
+		ipidMark = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
+
+		maxCwnd = flag.Uint64("max-cwnd", 8388608, "QUIC 拥塞窗口上限（字节）")
+		verbose = flag.Bool("v", false, "打印每 2 秒的路径统计")
 	)
 	flag.Parse()
 
 	if *password == "" {
 		flag.Usage()
-		os.Exit(2)
-	}
-	mode, err := flowtls.ParseMode(*iptables)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 	addr, err := netip.ParseAddrPort(*listen)
@@ -53,10 +48,10 @@ func main() {
 		os.Exit(2)
 	}
 	cfg := flowtls.ServerConfig{
-		Listen:         addr,
-		Password:       *password,
-		IPIDMark:       uint16(*ipidMark),
-		NetMode:        mode,
+		Listen:   addr,
+		Password: *password,
+		IPIDMark: uint16(*ipidMark),
+
 		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,
 		UDPMaxSessions: 256,

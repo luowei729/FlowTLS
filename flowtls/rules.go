@@ -21,35 +21,11 @@ package flowtls
 
 import (
 	"fmt"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
 )
-
-// 防火墙规则模式。取值与 Rust `net.mode` 完全一致。
-const (
-	// ModeAuto 在启动时自动写入 iptables（Rust 的默认值）。
-	ModeAuto = "auto"
-	// ModeNone 不写规则，由部署方自行维护。
-	ModeNone = "none"
-)
-
-// ParseMode 校验 net.mode 取值。
-//
-// Rust check.rs:505 只接受 `auto` / `none`；空串按默认值 auto 处理
-// （与 Rust 的 serde default 一致）。
-func ParseMode(mode string) (string, error) {
-	switch strings.TrimSpace(mode) {
-	case "":
-		return ModeAuto, nil
-	case ModeNone:
-		return ModeNone, nil
-	case ModeAuto:
-		return ModeAuto, nil
-	default:
-		return "", fmt.Errorf("flowtls: 未知 net.mode %q（可选 auto / none）", mode)
-	}
-}
 
 // rule 是一条 iptables 规则：表名 + 匹配条件与动作。
 //
@@ -86,30 +62,41 @@ func (r rule) String() string {
 
 // serverRules 构造服务端规则（对应 Rust `server_rules`）。
 //
-// 只有一条：把发往监听端口的伪包在内核 TCP 栈之前 DROP。
+// 每个标记一条：把发往监听端口、且带该标记的伪包在内核 TCP 栈之前 DROP。
 //
-// 匹配依据是 IP ID 高字节，取值来自配置的 `ip_id_mark`。
-// **不能写死常量**：写死一个固定值意味着任何 DPI 只要加一条
-// 「IP ID 高字节 == 某值」的通用规则就能命中所有部署。
+// 匹配依据是 IP ID 高字节。**不能写死常量**：写死一个固定值意味着任何
+// DPI 只要加一条「IP ID 高字节 == 某值」的通用规则就能命中所有部署。
+//
+// marks 是一组值：服务端在内核层写规则时还不知道对端是哪个用户
+// （解密发生在之后），所以每个用户的派生标记都要各自写一条
+// （见 ServerConfig.Marks 的完整说明）。
 //
 // offset 4 读的是「IP ID(2) + Flags/Frag(2)」四字节：
 // Frag 固定 0x4000（DF），掩掉 IP ID 低字节与 MF/offset。
-func serverRules(port, magic uint16) []rule {
+func serverRules(port uint16, marks []uint16) []rule {
 	portStr := strconv.Itoa(int(port))
-	// 与 packet.go 的 IPIDMarkOf / BuildPacketInto 保持一致：只保留高字节
-	mark := magic & 0xFF00
-	magicExpr := fmt.Sprintf("0x4&0xff00ffff=0x%04x4000", mark)
-	return []rule{{
-		table: "raw",
-		spec: []string{
-			"PREROUTING",
-			"-p", "tcp",
-			"--dport", portStr,
-			"-m", "u32",
-			"--u32", magicExpr,
-			"-j", "DROP",
-		},
-	}}
+	out := make([]rule, 0, len(marks))
+	for _, magic := range marks {
+		mark := magic & 0xFF00
+		if mark == 0 {
+			// 防御：mark 为 0 时 `0x4&0xff00ffff=0x00004000` 会匹配
+			// 所有 IP ID 高字节为 0 的包（约占流量的 1/256），
+			// 等于无差别丢包。绝不能写进规则。
+			continue
+		}
+		out = append(out, rule{
+			table: "raw",
+			spec: []string{
+				"PREROUTING",
+				"-p", "tcp",
+				"--dport", portStr,
+				"-m", "u32",
+				"--u32", fmt.Sprintf("0x4&0xff00ffff=0x%04x4000", mark),
+				"-j", "DROP",
+			},
+		})
+	}
+	return out
 }
 
 // clientRules 构造客户端规则（对应 Rust `ensure_client` 的两条）。
@@ -123,27 +110,36 @@ func serverRules(port, magic uint16) []rule {
 //	  AF_PACKET 在 netfilter 之前收包，DROP 不影响我们拿到数据；
 //	  但内核不再为每个包回一个 RST（否则每个回程包都会引出一个
 //	  额外的出向包，既浪费带宽也让流量特征更显眼）。
-func clientRules(sourcePort, serverPort, magic uint16) []rule {
+//
+// **匹配依据是服务端地址，不是源端口**。这一条改动的理由很硬：
+//
+//	内核回的 RST 是 `src=<伪源端口> dst=<服务端>:<服务端端口>`，
+//	所以「按服务端地址丢 RST」比「按源端口丢 RST」更精确地描述了
+//	我们想丢的东西，而且**与源端口无关**——源端口因此可以动态分配。
+//
+// 为什么必须允许动态源端口：固定源端口意味着一条隧道占一个端口，
+// 同机多个实例 / 多台机器经同一个 NAT 出同一台服务器时，四元组会撞车，
+// 服务端只能看到一个会话，新 SYN 会把旧会话踢掉（真机踩过：
+// haproxy 里 FlowTLS 后端被反复标 DOWN）。
+//
+// 代价：本机发往 `服务端:服务端端口` 的 RST 会被一并丢弃。
+// 该端口是 FlowTLS 专用（伪装站同端口时只有主动访问才会遇到），可接受。
+func clientRules(server netip.AddrPort, magic uint16) []rule {
 	mark := magic & 0xFF00
+	dst := []string{"-p", "tcp", "-d", server.Addr().String(),
+		"--dport", strconv.Itoa(int(server.Port()))}
+	src := []string{"-p", "tcp", "-s", server.Addr().String(),
+		"--sport", strconv.Itoa(int(server.Port()))}
 	return []rule{
 		{
-			spec: []string{
-				"OUTPUT",
-				"-p", "tcp",
-				"--sport", strconv.Itoa(int(sourcePort)),
-				"--tcp-flags", "RST", "RST",
-				"-j", "DROP",
-			},
+			spec: append(append([]string{"OUTPUT"}, dst...),
+				"--tcp-flags", "RST", "RST", "-j", "DROP"),
 		},
 		{
-			spec: []string{
-				"INPUT",
-				"-p", "tcp",
-				"--sport", strconv.Itoa(int(serverPort)),
+			spec: append(append([]string{"INPUT"}, src...),
 				"-m", "u32",
 				"--u32", fmt.Sprintf("0x4&0xff00ffff=0x%04x4000", mark),
-				"-j", "DROP",
-			},
+				"-j", "DROP"),
 		},
 	}
 }
@@ -153,8 +149,8 @@ func clientRules(sourcePort, serverPort, magic uint16) []rule {
 // Rust 版没有独立的展示接口——它在 ensure_* 失败时把规则拼进报错信息。
 // Go 侧的 sing-box 适配层需要在启动日志里说明「实际生效了什么」，
 // 因此保留一个只读的文本出口。
-func ServerRules(port, magic uint16) []string {
-	rules := serverRules(port, magic)
+func ServerRules(port uint16, marks []uint16) []string {
+	rules := serverRules(port, marks)
 	out := make([]string, 0, len(rules))
 	for _, r := range rules {
 		out = append(out, r.String())
@@ -163,8 +159,8 @@ func ServerRules(port, magic uint16) []string {
 }
 
 // ClientRules 返回客户端规则的文本形式（供日志展示）。
-func ClientRules(sourcePort, serverPort, magic uint16) []string {
-	rules := clientRules(sourcePort, serverPort, magic)
+func ClientRules(server netip.AddrPort, magic uint16) []string {
+	rules := clientRules(server, magic)
 	out := make([]string, 0, len(rules))
 	for _, r := range rules {
 		out = append(out, r.String())
@@ -207,73 +203,80 @@ func runIPTables(args []string) (bool, error) {
 // 为什么这个顺序很重要：OpenWrt 22.03+ 默认只装 `iptables-nft`，
 // 而 nftables 没有 u32 扩展 —— 走 iptables 分支会直接失败，隧道起不来，
 // 用户被迫去装三个包。改用 nft 之后这条路不再需要（DEVTIPS 165）。
-func EnsureServer(port, magic uint16) error {
+func EnsureServer(port uint16, marks []uint16) error {
 	if !rulesBackendEnabled {
 		return nil // Windows：WinDivert 已扣留伪包，内核看不到（见 rules_windows.go）
 	}
-	if ensureNft(kindServer, port, 0, magic) {
+	if ensureNftServer(port, marks) {
 		return nil
 	}
-	for _, r := range serverRules(port, magic) {
-		ok, err := runIPTables(r.command("-C"))
-		if err != nil {
-			return fmt.Errorf("无法执行 iptables，请确认已安装并具备 root 权限: %w", err)
-		}
-		if ok {
-			continue
-		}
-		ok, err = runIPTables(r.command("-A"))
-		if err != nil {
-			return fmt.Errorf("无法执行 iptables，请确认已安装并具备 root 权限: %w", err)
-		}
-		if !ok {
-			return fmt.Errorf("写入 iptables 规则失败: %s", r.String())
-		}
-	}
-	return nil
+	return ensureIPTables(serverRules(port, marks), "服务端")
 }
 
 // EnsureClient 幂等写入客户端规则（对应 Rust `ensure_client`）。
 //
 // 与 EnsureServer 同样 nft 优先；客户端额外多一条「挡住内核为此伪连接
 // 回的 RST」，因为 SYN-ACK 一到内核就找不到对应 socket。
-func EnsureClient(sourcePort, serverPort, magic uint16) error {
+//
+// 参数是**服务端地址**而不是源端口：源端口允许动态分配，规则不能依赖它。
+func EnsureClient(server netip.AddrPort, magic uint16) error {
 	if !rulesBackendEnabled {
 		return nil // Windows：同 EnsureServer
 	}
-	if ensureNft(kindClient, sourcePort, serverPort, magic) {
+	if ensureNftClient(server, magic) {
 		return nil
 	}
-	for _, r := range clientRules(sourcePort, serverPort, magic) {
+	return ensureIPTables(clientRules(server, magic), "客户端")
+}
+
+// ensureIPTables 逐条幂等写入规则（回退路径，nft 不可用时走这里）。
+//
+// why 只用于报错文案（“服务端”/“客户端”），让用户一眼知道是哪一端失败。
+func ensureIPTables(rules []rule, why string) error {
+	for _, r := range rules {
 		ok, err := runIPTables(r.command("-C"))
 		if err != nil {
-			return fmt.Errorf("无法执行 iptables，请确认已安装并具备 root 权限: %w", err)
+			return iptablesUnavailable(why, err)
 		}
 		if ok {
 			continue
 		}
 		ok, err = runIPTables(r.command("-A"))
 		if err != nil {
-			return fmt.Errorf("无法执行 iptables，请确认已安装并具备 root 权限: %w", err)
+			return iptablesUnavailable(why, err)
 		}
 		if !ok {
-			return fmt.Errorf("写入 iptables 规则失败: %s", r.String())
+			return fmt.Errorf("flowtls: %s写入 iptables 规则失败: %s", why, r.String())
 		}
 	}
 	return nil
 }
 
+// iptablesUnavailable 把底层错误转成可执行的提示。
+//
+// 这条路径只在本机既没有可用的 nft、又执行不动 iptables 时走到 ——
+// 典型原因是缺少 root/CAP_NET_ADMIN，或者固件真的一套防火墙工具都没装。
+// 报错必须说清楚两件事：现在不通的原因，以及怎么修。
+func iptablesUnavailable(why string, err error) error {
+	return fmt.Errorf("flowtls: %s无法写入防火墙规则（nft 与 iptables 都不可用）: %w；"+
+		"\n  这两条规则不是可选优化，而是协议能工作的前提："+
+		"\n  1. notrack —— 否则 fw4 把伪包判成 ct invalid 丢掉（表现为 sendto 返回 EPERM）"+
+		"\n  2. RST 抑制 —— 否则第一个 SYN-ACK 就把 NAT 映射拆掉"+
+		"\n  请确认以 root 运行，且系统存在 nft（OpenWrt 22.03+ / fw4）或 iptables（旧固件）。",
+		why, err)
+}
+
 // CheckServer 只检查规则是否存在，不修改（对应 Rust `check_server`）。
 //
 // 顺序与 EnsureServer 一致：先看 nft 链，不在才回退查 iptables。
-func CheckServer(port, magic uint16) bool {
+func CheckServer(port uint16, marks []uint16) bool {
 	if !rulesBackendEnabled {
 		return true // Windows：无需规则，状态恒为「就绪」
 	}
 	if nftAvailable() {
-		return checkNft(kindServer, port)
+		return checkNftServer(port, marks)
 	}
-	for _, r := range serverRules(port, magic) {
+	for _, r := range serverRules(port, marks) {
 		ok, _ := runIPTables(r.command("-C"))
 		if !ok {
 			return false
@@ -285,20 +288,15 @@ func CheckServer(port, magic uint16) bool {
 // CheckClient 只检查客户端规则是否存在（对应 Rust `check_client`）。
 //
 // Rust 只检查 OUTPUT 那条（`check_client` 只看 RST 规则），这里保持一致。
-func CheckClient(sourcePort uint16) bool {
+func CheckClient(server netip.AddrPort) bool {
 	if !rulesBackendEnabled {
 		return true // Windows：同 CheckServer
 	}
 	if nftAvailable() {
-		return checkNft(kindClient, sourcePort)
+		return checkNftClient(server)
 	}
-	ok, _ := runIPTables([]string{
-		"-C", "OUTPUT",
-		"-p", "tcp",
-		"--sport", strconv.Itoa(int(sourcePort)),
-		"--tcp-flags", "RST", "RST",
-		"-j", "DROP",
-	})
+	r := clientRules(server, 0)
+	ok, _ := runIPTables(r[0].command("-C"))
 	return ok
 }
 
@@ -362,42 +360,113 @@ func notrackChains(port uint16) (outChain, inChain string) {
 	return "out_" + strconv.Itoa(int(port)), "in_" + strconv.Itoa(int(port))
 }
 
-// firewallKind 区分客户端与服务端要写的规则集。
-type firewallKind int
+// clientChains 返回客户端两条链名，按**服务端地址**命名。
+//
+// 为什么不再按源端口命名：源端口现在允许自动分配（每个实例、每次重连
+// 都可能不同），按它命名会让链越积越多、也永远清不干净；而规则本身
+// 也不该依赖源端口（见 clientRules 的说明）。
+// 服务端地址在一台机器上是稳定的，不同服务端天然得到不同链名，互不干扰。
+//
+// 名字里用 IP 的四字节十六进制 + 端口，保证是合法的 nft 标识符
+// （不能直接塞点号，虽然 nft 允许但引号/转义容易出错）。
+func clientChains(server netip.AddrPort) (outChain, inChain string) {
+	a := server.Addr().As4()
+	base := fmt.Sprintf("%x_%d", a, server.Port())
+	return "cout_" + base, "cin_" + base
+}
 
-const (
-	kindClient firewallKind = iota
-	kindServer
-)
+// nftClientScript 生成客户端 nft 批处理脚本，按服务端地址匹配。
+//
+//	方向        规则                                          作用
+//	output      daddr=<server> dport=<port> notrack            伪包不进 conntrack
+//	output      daddr=<server> dport=<port> rst drop           挡内核回的 RST
+//	prerouting  saddr=<server> sport=<port> notrack            回程包不进 conntrack
+//	prerouting  saddr=<server> sport=<port> ip id mark drop    挡内核处理回程包
+//
+// 与旧版的区别只在匹配字段：以前是 `tcp sport <源端口>`，现在是
+// `ip daddr/saddr <服务端>`。语义上更窄（只影响这一个服务端），
+// 同时因为是「按目的地址」而不是「按源端口」，源端口才能动态分配。
+func nftClientScript(server netip.AddrPort, magic uint16) string {
+	outChain, inChain := clientChains(server)
+	ip := server.Addr().String()
+	portStr := strconv.Itoa(int(server.Port()))
+	dst := " ip daddr " + ip + " tcp dport " + portStr
+	src := " ip saddr " + ip + " tcp sport " + portStr
+	markExpr := " ip id & 0xff00 == 0x" +
+		strconv.FormatUint(uint64(magic&0xFF00), 16)
 
-// nftScript 生成完整 nft 批处理脚本。
+	lines := []string{
+		"add table inet " + notrackTable,
+		"add chain inet " + notrackTable + " " + outChain +
+			" { type filter hook output priority raw; policy accept; }",
+		"flush chain inet " + notrackTable + " " + outChain,
+		"add rule inet " + notrackTable + " " + outChain + dst + " notrack",
+		"add rule inet " + notrackTable + " " + outChain + dst +
+			" tcp flags & rst == rst drop",
+		"add chain inet " + notrackTable + " " + inChain +
+			" { type filter hook prerouting priority raw; policy accept; }",
+		"flush chain inet " + notrackTable + " " + inChain,
+		"add rule inet " + notrackTable + " " + inChain + src + " notrack",
+		"add rule inet " + notrackTable + " " + inChain + src + markExpr + " drop",
+	}
+	return strings.Join(append(lines, ""), "\n")
+}
+
+// ClientNftRules 返回客户端实际写进 nft 的规则（供启动日志展示）。
+func ClientNftRules(server netip.AddrPort, magic uint16) []string {
+	if !nftAvailable() {
+		return nil
+	}
+	return nftRuleLines(nftClientScript(server, magic))
+}
+
+// ensureNftClient 写入客户端 nft 规则，返回是否真的成功。
+func ensureNftClient(server netip.AddrPort, magic uint16) bool {
+	return runNftScript(nftClientScript(server, magic))
+}
+
+// checkNftClient 报告客户端规则是否已就位。
+func checkNftClient(server netip.AddrPort) bool {
+	if !rulesBackendEnabled {
+		return true
+	}
+	if !nftAvailable() {
+		return false
+	}
+	outChain, inChain := clientChains(server)
+	return chainHasRules(outChain) && chainHasRules(inChain)
+}
+
+// nftRuleLines 从批处理脚本里挑出 add rule 行并加 nft 前缀（日志用）。
+func nftRuleLines(script string) []string {
+	var out []string
+	for _, ln := range strings.Split(script, "\n") {
+		if strings.HasPrefix(ln, "add rule ") {
+			out = append(out, "nft "+ln)
+		}
+	}
+	return out
+}
+
+// nftServerScript 生成服务端 nft 批处理脚本。
 //
-// **这就是 iptables 那套规则的 nft 等价实现**，两者做同一件事：
+//	方向        规则                                          作用
+//	prerouting  dport=<端口> notrack                          伪包不进 conntrack
+//	prerouting  dport=<端口> ip id == <mark> drop            挡内核处理伪包
 //
-//	方向        规则                                        作用
-//	output      sport=<本地端口> notrack                    伪包不进 conntrack
-//	output      sport=<本地端口> tcp flags & rst == rst drop 挡内核回的 RST
-//	prerouting  dport=<本地端口> notrack                    回程包不进 conntrack
-//	prerouting  <对端方向> ip id & 0xff00 == <mark> drop     挡内核处理回程包
-//
-// 为什么用 nft 而不是 iptables（实测依据见 DEVTIPS 165）：
-//
-//  1. **u32 在 nftables 里没有对应扩展**，OpenWrt 22.03+ 默认只装
-//     `iptables-nft`，`-m u32` 直接不支持 —— 于是插件必须让用户手工装
-//     `iptables-zz-legacy` + `iptables-mod-u32` + `kmod-ipt-raw` 三个包，
-//     否则隧道起不来。而 nft 用 `ip id & 0xff00 == 0x1e00` 一条就够，
-//     完全等价于 u32 的 `0x4&0xff00ffff=0x1e004000`（已验证）。
-//  2. `notrack` 只在 nft 里有；iptables 的 `-j NOTRACK` 在 OpenWrt 的
-//     xtables-legacy 上没编译，执行会报 `Couldn't load target 'NOTRACK'`。
-//  3. 少一套规则：不用再担心 iptables 与 nft 两处的规则互相打架。
+// marks 是一组值（每个用户一个），每个标记各写一条 drop。
 //
 // 用 `add table` / `add chain` + `flush chain` 而不是 `delete table`：
 // 前者在表已存在时幂等，后者在表不存在时会让整批 abort。
 // 先 flush 再 add rule 保证重复执行不叠加重复规则。
-func nftScript(kind firewallKind, localPort, peerPort, magic uint16) string {
-	outChain, inChain := notrackChains(localPort)
-	portStr := strconv.Itoa(int(localPort))
-	m := magic & 0xFF00
+//
+// **服务端只需要入向规则**：它不发伪包，回程包就是正常的出向数据，
+// 内核不会对它们回 RST（服务端是收 SYN-ACK 的一方……不，服务端是回复
+// SYN-ACK 的一方，它自己发出去的包都有真实 socket 之外的上下文，
+// 但内核并不知道这些 socket，所以仍需 notrack 出向）。见下方 output 链。
+func nftServerScript(port uint16, marks []uint16) string {
+	outChain, inChain := notrackChains(port)
+	portStr := strconv.Itoa(int(port))
 	lines := []string{
 		"add table inet " + notrackTable,
 		"add chain inet " + notrackTable + " " + outChain +
@@ -405,43 +474,32 @@ func nftScript(kind firewallKind, localPort, peerPort, magic uint16) string {
 		"flush chain inet " + notrackTable + " " + outChain,
 		"add rule inet " + notrackTable + " " + outChain +
 			" tcp sport " + portStr + " notrack",
-		"add rule inet " + notrackTable + " " + outChain +
-			" tcp sport " + portStr + " tcp flags & rst == rst drop",
 		"add chain inet " + notrackTable + " " + inChain +
 			" { type filter hook prerouting priority raw; policy accept; }",
 		"flush chain inet " + notrackTable + " " + inChain,
 		"add rule inet " + notrackTable + " " + inChain +
 			" tcp dport " + portStr + " notrack",
 	}
-
-	// 回程方向的 drop 两条分支的匹配字段不同，必须分开写：
-	//   客户端：回程包来自服务端端口（sport）且带对方的 IP ID 标记；
-	//   服务端：入站伪包发往监听端口（dport）且带客户端的 IP ID 标记。
-	markExpr := " ip id & 0xff00 == 0x" + strconv.FormatUint(uint64(m), 16)
-	if kind == kindClient {
+	for _, magic := range marks {
+		m := magic & 0xFF00
+		if m == 0 {
+			continue
+		}
 		lines = append(lines, "add rule inet "+notrackTable+" "+inChain+
-			" tcp sport "+strconv.Itoa(int(peerPort))+markExpr+" drop")
-	} else {
-		lines = append(lines, "add rule inet "+notrackTable+" "+inChain+
-			" tcp dport "+portStr+markExpr+" drop")
+			" tcp dport "+portStr+" ip id & 0xff00 == 0x"+
+			strconv.FormatUint(uint64(m), 16)+" drop")
 	}
 	return strings.Join(append(lines, ""), "\n")
 }
 
-// NftRules 返回实际写进 nft 的规则（供启动日志展示）。
+// NftRules 返回服务端实际写进 nft 的规则（供启动日志展示）。
 //
 // 返回空切片表示本机没有 nft（老系统），此时走 iptables 分支。
-func NftRules(kind firewallKind, localPort, peerPort, magic uint16) []string {
+func NftRules(port uint16, marks []uint16) []string {
 	if !nftAvailable() {
 		return nil
 	}
-	var out []string
-	for _, ln := range strings.Split(nftScript(kind, localPort, peerPort, magic), "\n") {
-		if strings.HasPrefix(ln, "add rule ") {
-			out = append(out, "nft "+ln)
-		}
-	}
-	return out
+	return nftRuleLines(nftServerScript(port, marks))
 }
 
 // nftPath 缓存 nft 可执行文件路径（空串表示没有）。
@@ -459,16 +517,21 @@ var nftPath = func() string {
 // nftAvailable 报告本机有没有 nft。
 func nftAvailable() bool { return nftPath != "" }
 
-// ensureNft 写入 nft 规则，返回是否真的成功。
+// ensureNftServer 写入服务端 nft 规则，返回是否真的成功。
 //
 // **返回值必须被检查**：如果本机有 nft 但写入失败（缺 CAP_NET_ADMIN、
 // 内核没编 nf_tables），不能假装成功 —— 调用方要回退到 iptables 或报错。
-func ensureNft(kind firewallKind, localPort, peerPort, magic uint16) bool {
+func ensureNftServer(port uint16, marks []uint16) bool {
+	return runNftScript(nftServerScript(port, marks))
+}
+
+// runNftScript 执行一段 nft 批处理脚本，返回是否成功。
+func runNftScript(script string) bool {
 	if !rulesBackendEnabled || !nftAvailable() {
 		return false
 	}
 	cmd := exec.Command(nftPath, "-f", "-")
-	cmd.Stdin = strings.NewReader(nftScript(kind, localPort, peerPort, magic))
+	cmd.Stdin = strings.NewReader(script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return false
@@ -477,25 +540,40 @@ func ensureNft(kind firewallKind, localPort, peerPort, magic uint16) bool {
 	return !strings.Contains(string(out), "Error:")
 }
 
-// checkNft 报告规则是否已就位（链存在且含 notrack 与 drop 两条）。
-func checkNft(kind firewallKind, localPort uint16) bool {
+// chainHasRules 报告链存在且同时含 notrack 与 drop 两条规则。
+func chainHasRules(name string) bool {
+	out, err := exec.Command(nftPath, "list", "chain", "inet",
+		notrackTable, name).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "notrack") &&
+		strings.Contains(string(out), "drop")
+}
+
+// checkNftServer 报告服务端规则是否已就位。
+func checkNftServer(port uint16, marks []uint16) bool {
 	if !rulesBackendEnabled {
 		return true // Windows：WinDivert 扣留语义，不需要
 	}
 	if !nftAvailable() {
 		return false // 交给调用方走 iptables
 	}
-	outChain, inChain := notrackChains(localPort)
-	for _, ch := range []string{outChain, inChain} {
-		out, err := exec.Command(nftPath, "list", "chain", "inet",
-			notrackTable, ch).CombinedOutput()
-		if err != nil {
-			return false
-		}
-		if !strings.Contains(string(out), "notrack") ||
-			!strings.Contains(string(out), "drop") {
-			return false
+	outChain, inChain := notrackChains(port)
+	if !chainHasRules(outChain) || !chainHasRules(inChain) {
+		return false
+	}
+	// 标记条数也要核对：PassWall/用户改了 ips 时规则必须跟着变。
+	out, err := exec.Command(nftPath, "list", "chain", "inet",
+		notrackTable, inChain).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	want := 0
+	for _, m := range marks {
+		if m&0xFF00 != 0 {
+			want++
 		}
 	}
-	return true
+	return strings.Count(string(out), "ip id") >= want
 }

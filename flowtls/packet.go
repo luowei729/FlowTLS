@@ -65,6 +65,27 @@ const (
 // IPIDMarkOf 从配置的 ip_id_mark 取出标记高字节（只有高字节参与标记）。
 func IPIDMarkOf(magic uint16) uint16 { return magic & 0xFF00 }
 
+// IsDefaultIPIDMark 报告这个标记是否等于代码里的默认值。
+//
+// 用途只有一个：启动时提醒部署方改掉它。
+//
+// 为什么必须提醒：`ip_id_mark` 是**服务端与所有客户端共享**的标识
+// （服务端用它判断「这个 SYN 是不是我们的伪包」），所以它必须两端一致，
+// **不能像 source_port 那样各自动态生成** —— 多用户部署时尤其不可能，
+// 因为每个用户的 password 不同，而服务端只有一个全局 mark，任何
+// 「从 password 派生」的方案在两端都会算出不同的值。
+//
+// 既然只能显式配置，那唯一的风险就是：大量部署都留着默认值 0xF107。
+// 一旦如此，DPI 只要加一条「IP ID 高字节 == 0x1e」的规则就能一次性
+// 命中所有未改动的部署 —— 这与 SNI、服务器 IP 一起构成部署指纹
+// （见 AGENTS 约束 18）。
+//
+// 所以这里不自动改，只在用默认值时明确告知：**请改掉**。
+func IsDefaultIPIDMark(magic uint16) bool {
+	m := magic & 0xFF00
+	return m == IPIDMark || m == 0
+}
+
 // NextIPID 取下一个 IP ID：高字节保持标记，低字节 +1 回绕。
 func NextIPID(mark, cur uint16) uint16 {
 	return mark | ((cur + 1) & IPIDLowMask)

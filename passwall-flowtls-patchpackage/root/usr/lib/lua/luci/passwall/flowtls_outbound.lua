@@ -53,13 +53,34 @@ return function(orig)
 		-- 与服务端一致的认证口令（外层 AEAD 密钥来源）
 		result.password = node.password
 
-		-- 固定源端口。客户端防火墙规则靠它精确匹配内核回出的 RST，
-		-- 端口随机的话规则写不出来。同一台机器上多个 FlowTLS 节点
-		-- 必须用不同的 source_port。
-		result.source_port = num(node.source_port)
+		-- 源端口：**刻意不写**，交给内核自动分配。
+		--
+		-- 一条 FlowTLS 隧道就是一个固定四元组，服务端靠它定位会话。
+		-- 固定源端口等于「一条隧道占一个端口」，而两台机器（或同一台
+		-- 机器的多个节点）经同一个 NAT 去同一台服务端时，源端口相同就会
+		-- 四元组撞车——服务端只认一个会话，新 SYN 把旧会话踢掉，两边反复
+		-- 互踢（真机踩过：haproxy 把 FlowTLS 后端反复标 DOWN）。
+		--
+		-- 旧版必须固定，是因为客户端防火墙规则按源端口匹配内核回的 RST。
+		-- 现在规则改为按**服务端地址**匹配（见 flowtls/rules.go 的
+		-- clientRules），与源端口无关，所以可以不写这个字段。
+		--
+		-- 如果旧配置里已经存了 source_port（升级前的数据），一并清掉：
+		-- 留着它会让该节点继续退回固定端口，问题照旧。
+		result.source_port = nil
 
-		-- 伪包识别标记（IP ID 高字节）。必须与服务端 ip_id_mark 一致。
-		result.ip_id_mark = num(node.ip_id_mark)
+		-- IP ID 标记：**刻意不写**，由核心从 password 派生。
+		--
+		-- 派生能同时满足两个硬要求（见 flowtls/mark.go）：
+		--   - 两端自动一致 —— password 本来就两端共享，客户端和服务端
+		--     各自 HKDF 一次就得到同一个 mark，不需要任何手工同步；
+		--   - 部署间自动不同 —— password 不同，mark 自然不同，不留公开指纹。
+		-- 多用户时服务端会为每个用户的 password 各派生一个，全部纳入识别
+		-- 范围（内核层判断「是不是我们的包」时还没解密，不知道对端是谁）。
+		--
+		-- 旧配置里若存过 ip_id_mark，一并清掉：留着它就等于把 mark 钉回
+		-- 一个固定值，失去上面两个好处。
+		result.ip_id_mark = nil
 
 		-- 只影响伪 ClientHello 的外观，不参与任何校验
 		result.sni = str(node.sni)
@@ -67,10 +88,11 @@ return function(orig)
 		-- 三次握手：symbolic（默认）/ none
 		result.handshake = str(node.handshake)
 
-		-- 防火墙规则落地方式：auto / none
-		result.iptables_mode = str(node.iptables_mode)
-
-		-- QUIC 拥塞窗口上限（字节）
+		-- 防火墙规则：**刻意不写**。核心库已改为强制写入（没有开关），
+		-- 因为那两条规则（notrack + RST 抑制）不是可选优化，而是协议
+		-- 能工作的前提。写个 iptables_mode=none 只会让隧道静默不通。
+		-- 旧配置里若还留着这个字段，一并清掉。
+		result.iptables_mode = nil
 		result.max_cwnd = num(node.max_cwnd)
 
 		-- UDP 三态：留空＝跟随核心默认（开启），1＝开，0＝关。

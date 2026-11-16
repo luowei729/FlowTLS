@@ -17,7 +17,7 @@ func newTestListener() *Listener {
 	return &Listener{
 		raw:     newTestRawSocket(),
 		port:    8443,
-		mark:    IPIDMarkOf(0xF107),
+		marks:   []uint16{IPIDMarkOf(0xF107)},
 		byAddr:  make(map[netip.AddrPort]*Session),
 		pending: make(map[netip.AddrPort]*synState),
 		// 手工构造会绕过 NewListener 的 loggerOr 归一，
@@ -60,7 +60,7 @@ func TestSYNWithNewISNDropsStaleSession(t *testing.T) {
 	l.byAddr[addr] = stale
 
 	// 客户端重启：新 SYN 带新的 ISN
-	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222})
+	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, IPIDMarkOf(0xF107))
 
 	if got := l.sessionFor(addr); got != nil {
 		t.Fatal("新 SYNC 到达后旧会话必须被清掉，否则新连接的数据会被旧会话吞掉")
@@ -85,12 +85,56 @@ func TestSYNRetransmitKeepsSession(t *testing.T) {
 	l.byAddr[addr] = sess
 
 	// 握手完成后迟到的 SYN 重传：ISN 与建连时相同
-	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222})
+	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, IPIDMarkOf(0xF107))
 
 	if got := l.sessionFor(addr); got != sess {
 		t.Fatal("ISN 相同的 SYN 是重传，绝不能关掉已建立的会话")
 	}
 	if sess.closed.Load() {
 		t.Fatal("重传 SYN 不应关闭会话")
+	}
+}
+
+// TestPasswordAndUsersAreMutuallyExclusive 钉住服务端凭据的两种模式。
+//
+// 曾经的做法是「users 非空则以 users 为准，静默忽略 password」。
+// 那是个很难发现的陷阱：
+//   - 顶层 password 既不能登录（authID 只在 users 里），
+//   - 也不参与 ip_id_mark 派生（mark 只从 users 派生），
+//   - 但配置文件里它明明白白写着，运维会以为它是兜底凭据。
+//
+// 而 mark 不一致的症状是「隧道完全不通」，排查成本极高。
+// 所以现在直接拒绝同时配置。
+func TestPasswordAndUsersAreMutuallyExclusive(t *testing.T) {
+	listen := netip.MustParseAddrPort("0.0.0.0:8443")
+
+	both := &ServerConfig{
+		Listen:   listen,
+		Password: "top-level-pw",
+		Users:    []User{{Name: "alice", Password: "alice-pw"}},
+	}
+	if err := both.Validate(); err == nil {
+		t.Fatal("同时填 password 与 users 必须报错（静默忽略会让人以为有兜底凭据）")
+	}
+
+	// 只有 users：正常，每个用户各派生一个 mark
+	onlyUsers := &ServerConfig{
+		Listen: listen,
+		Users:  []User{{Name: "a", Password: "pa"}, {Name: "b", Password: "pb"}},
+	}
+	if err := onlyUsers.Validate(); err != nil {
+		t.Fatalf("只配 users 应通过: %v", err)
+	}
+	if got := len(onlyUsers.Marks()); got != 2 {
+		t.Fatalf("两个用户应有 2 个 mark，得到 %d", got)
+	}
+
+	// 只有 password：正常，mark 从它派生
+	onlyPw := &ServerConfig{Listen: listen, Password: "pw1"}
+	if err := onlyPw.Validate(); err != nil {
+		t.Fatalf("只配 password 应通过: %v", err)
+	}
+	if m := onlyPw.Marks(); len(m) != 1 || m[0] != DeriveIPIDMark("pw1") {
+		t.Fatalf("单用户 mark 应从 password 派生，得到 %v", m)
 	}
 }

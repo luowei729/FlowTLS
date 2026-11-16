@@ -90,17 +90,27 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.ServerPort == 0 {
 		options.ServerPort = 8443
 	}
-	if options.SourcePort == 0 {
-		options.SourcePort = 44300
-	}
+	// SourcePort 保持 0（自动分配）：**不再给固定默认值**。
+	//
+	// 旧版默认 44300，于是同一台机器上多个 FlowTLS 节点、或两台机器经
+	// 同一个 NAT 去同一台服务端时，四元组完全相撞 —— 服务端只认一个
+	// 会话，新 SYN 把旧会话踢掉（真机踩过：haproxy 把 FlowTLS 后端反复
+	// 标成 DOWN，只能走备用节点）。
+	//
+	// 0 传给客户端库即「从动态端口段挑一个未在用的」。
+	// IPIDMark 保持 0（表示从 password 派生）：**不再填默认值**。
+	//
+	// 旧版回落到公开的 0xF107，而大量部署都用同一个值等于交出指纹 ——
+	// DPI 只需一条「IP ID 高字节 == 0x1e」就能命中所有未改动的部署。
+	//
+	// 从 password 派生能同时满足两个硬要求：两端自动一致（password
+	// 本来就共享）、不同部署自动不同（password 不同）。详见
+	// flowtls/mark.go 的完整论证。
 	if options.IPIDMark == 0 {
-		options.IPIDMark = ft.IPIDMark | 0x07
+		options.IPIDMark = ft.DeriveIPIDMark(options.Password)
 	}
-	// iptables 模式与握手参数在这里就解析：拼错时要报错，而不是拖到建连时
-	// 才变成一句「握手超时」。Rust 的 config 校验同样在建连前。
-	if _, err := ft.ParseMode(options.IPTablesMode); err != nil {
-		return nil, err
-	}
+	// 握手参数在这里就解析：拼错时要报错，而不是拖到建连时才变成
+	// 一句「握手超时」。Rust 的 config 校验同样在建连前。
 	if _, err := ft.ParseHandshake(options.Handshake); err != nil {
 		return nil, err
 	}
@@ -209,10 +219,6 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 	if sni == "" {
 		sni = o.opts.Server
 	}
-	netMode, err := ft.ParseMode(o.opts.IPTablesMode)
-	if err != nil {
-		return nil, err
-	}
 	handshake, err := ft.ParseHandshake(o.opts.Handshake)
 	if err != nil {
 		return nil, err
@@ -235,9 +241,8 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 			SourcePort: o.opts.SourcePort,
 			IPIDMark:   o.opts.IPIDMark,
 			Handshake:  handshake,
-			// 客户端规则必须在第一个包发出前就位：SYN-ACK 一回，内核就会
-			// 发现没有对应 socket 并回 RST，中间设备会立即拆掉 NAT 映射。
-			NetMode: netMode,
+			// 防火墙规则由 flowtls 库强制写入（没有开关）：SYN-ACK 一回，
+			// 内核就会发现没有对应 socket 并回 RST，中间设备会立即拆掉 NAT 映射。
 			// 注入 sing-box logger：分工与入站侧相同，
 			// 传输层日志从此全部由 `log.level` 控制。
 			Logger: o.logger,

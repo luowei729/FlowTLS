@@ -4412,3 +4412,42 @@ _f(m, s, s1)
 
 另加一层 `xpcall` + 写 `/tmp` 与 syslog：注入点的 `pcall` 会吞掉所有异常，
 "界面上少几个字段"本身不报错，不留痕就只能靠猜。
+
+## 149. `password` 与 `users` 同填时顶层密码是死配置（2026-11-17 00:40）
+
+服务端的凭据有两条路径，`effectiveUsers()` 里是**二选一**：
+
+```go
+if len(s.Users) > 0 { return 从 users 构造 }   // users 非空 → 只看 users
+if s.Password != "" { return 单用户 }          // 否则才看 password
+```
+
+第一版实现是「以 users 为准，静默忽略 password」。这形成一个很难发现的陷阱：
+
+- 顶层 `password` 既**不能登录**（authID 只登记在 users 表里），
+- 也**不参与 ip_id_mark 派生**（`Marks()` 只遍历 effectiveUsers），
+- 但配置文件里它明明白白写着，运维会以为它是兜底凭据或备用口令。
+
+而 ip_id_mark 不一致的症状是**隧道完全不通**（伪包被内核层规则当垃圾丢掉），
+排查成本极高——不会有人第一时间去怀疑"那个我没在用的密码"。
+
+所以现在改为**直接报错**：
+
+```
+flowtls: password 与 users 不能同时配置 —— 只配 password 表示单用户；
+配 users 表示多用户，此时 password 会被完全忽略（既不能登录、也不参与
+ip_id_mark 派生）
+```
+
+附带的行为对照（都有单测钉住，见 `listener_test.go` 的
+`TestPasswordAndUsersAreMutuallyExclusive`）：
+
+| 配置 | 生效用户 | 派生出的 mark |
+|---|---|---|
+| 只填 `password` | 1 个 | 1 个（从它派生） |
+| 只填 `users` | N 个 | N 个（各从自己的 password 派生，重复的会去重） |
+| 两者都填 | —— | **报错** |
+| 显式 `ip_id_mark` | —— | 单值，所有用户共用（覆盖派生） |
+
+顺带一条**不用**拦的：多个用户用同一个 password 只是 authID 相同、
+日志里的名字变成后一个，功能上完全正常（同一份凭据），所以不做校验。
