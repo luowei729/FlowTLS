@@ -61,6 +61,30 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 			_ = raw.Close()
 			return nil, err
 		}
+		// 把实际写进 nft 的规则打出来。这一层出问题时现象极隐蔽：
+		// fw4 把伪包判成 ct invalid 并 DROP，而 DROP 在 sendto 里表现为
+		// EPERM —— 看起来像权限问题。不写日志就永远查不到。
+		for _, r := range NftRules(kindClient, cfg.SourcePort, cfg.Server.Port(), cfg.IPIDMark) {
+			logger.Info("防火墙规则: ", r)
+		}
+	} else {
+		// **mode=none 时必须明确警告，不能静默**。
+		//
+		// 这条 notrack 规则同时承担两个职责：
+		//   1. 让 fw4 不再把伪包判成 ct invalid 丢掉（否则第二个包起发不出去）；
+		//   2. 让**其它代理**（PassWall / OpenClash / SSR+ 等）无法接管我们的流量。
+		//
+		// 第 2 条的原理是硬性的：那些工具的劫持都写在 nat 钩子
+		// （`type nat hook output`），而内核 `nf_nat_inet_fn()` 的第一件事就是
+		// `ct = nf_ct_get(skb); if (!ct) return NF_ACCEPT;` —— 没有 conntrack
+		// 条目就没有 NAT。notrack 正是让包不进 conntrack 的唯一手段。
+		//
+		// 关掉之后一旦设备上装了别的代理，流量会被送进两个跨境隧道
+		// （两次回环，延迟翻倍），且源端口被改写会让服务端认证失败。
+		logger.Warn("iptables_mode=none：未写入 notrack 规则。",
+			"如果本机还跑着 PassWall / OpenClash 等代理，它们会接管本插件的伪 TCP 流量",
+			"（两次跨境回环 + 源端口被改写，表现为延迟翻倍或握手失败）。",
+			"除非你自行维护防火墙规则，否则请改回 iptables_mode=auto")
 	}
 
 	codec, err := NewClientCodec(cfg.Password)

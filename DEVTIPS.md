@@ -4315,3 +4315,100 @@ bug 没修时做的，结论不成立。
 另外 `program=` 后面**不要加引号**：`exec` 把每个参数作为独立 argv 传下去，路径
 里的空格本来就安全。加了引号反而让 netsh 把引号当成路径的一部分。
 实测覆盖：`C:\Program Files\FlowTLS Test\sing-box.exe` 能正常创建规则。
+
+## 145. rev.5 的防火墙只写 iptables，在 nftables 系统上等于没有（2026-11-16 23:10）
+
+真机（ImmortalWrt 25.12，fw4/nftables）现象：
+
+```
+ERROR outbound/flowtls: 发送失败（累计 1 次）: sendmmsg: operation not permitted
+ERROR outbound/flowtls: flowtls 初始建连失败: flowtls 握手失败: context deadline exceeded
+```
+
+`EPERM` 看起来像权限或 SELinux 问题，实际是 **fw4 主动 DROP**：
+`accept_to_wan` 链里有 `ct state invalid ... drop`（防 NAT 泄漏），
+我们的伪包没有对应内核 socket，被判定成 ct invalid，
+而 netfilter 的 DROP 在 `sendto` / `sendmmsg` 里就翻译成 `-EPERM`
+（`nf_hook_slow()` 把 `NF_DROP` 映射成 `-EPERM`）。
+
+判据很简单，但必须先想到去查：
+
+```sh
+iptables-save | grep -c 44312      # 1  ← 规则"写进去了"
+nft list ruleset | grep -c 44312   # 0  ← 但 nft 规则集里什么都没有
+```
+
+两条命令的差异说明规则落在 **xtables-legacy** 的表里，而 nftables 系统
+根本不走那条 hook。所以 rev.5 在 nft 系统上是"看起来正常、实际不通"。
+
+修法是优先用 nft 原生 `notrack`（priority raw，在 conntrack 之前），
+不碰 iptables；nft 不可用时才回落。
+
+## 146. PassWall 的版本号比较会被字母 v 截断，导致永远检测不到更新（2026-11-16 23:10）
+
+`api.lua:to_check()` 里是：
+
+```lua
+local has_update = compare_versions(local_version:match("[^v]+"), "<",
+    remote_version:match("[^v]+"))
+```
+
+`[^v]+` 不是"去掉前缀 v"，它是**在第一个字母 v 处截断**。
+我们的版本号 `1.14.4-rev.5` 截断后变成 `1.14.4-re`，
+`1.14.4-rev.6` 也变成 `1.14.4-re` —— 两者相等，`<` 恒为假。
+
+所以补丁必须同时改两端，只改一端仍然不通：
+
+- 本机：`cmd_version` 追加 `sed "s/-rev\./-r/"`，得 `1.14.4-r5`
+- 远程：元数据里的 `tag_name` 写成 `1.14.4-r6`（不带 v）
+
+## 147. PassWall 的共享字段 depends 是逐协议登记的，新协议必须手动补（2026-11-16 23:10）
+
+`1_sing-box.lua` 末尾：
+
+```lua
+local protocols = s.fields["protocol"].keylist
+for _, v in ipairs(protocols) do
+    if not v:find("^_") then
+        s.fields["address"]:depends({ protocol = v })
+        s.fields["port"]:depends({ protocol = v })
+        s.fields["domain_resolver"]:depends({ protocol = v })
+        s.fields["domain_strategy"]:depends({ protocol = v })
+    end
+end
+```
+
+这段循环按当时的 `keylist` 展开。如果补丁在这之后才 `protocol:value("flowtls", ...)`，
+选中 FlowTLS 时 `address` / `port` 这四个字段**一个 depends 都不命中，
+整行不渲染**。
+
+真机现象：协议能选 FlowTLS，密码也能填，但**服务器地址和端口整行消失**——
+而密码能填是因为它有自己的一行 depends（补丁已单独补过），
+这种"部分字段在、部分字段没了"最容易误判成"字段没创建"。
+
+定位方法（比猜快得多）：在注入点把 `s.children` 的 `option` 逐行 dump 出来，
+确认字段确实创建了 → 那问题一定在渲染阶段的 deps 过滤，不在创建。
+
+## 148. 从 dofile 加载的 Lua 看不到 CBI 注入的全局名（2026-11-16 23:10）
+
+补丁块第一版写：
+
+```lua
+local _ok, _f = pcall(dofile, "/usr/lib/lua/luci/passwall/flowtls_fields.lua")
+```
+
+结果 `attempt to call global 'translate' (a nil value)`。
+因为 `dofile` 恒定用 `_G`，而 `translate` / `Value` / `ListValue` 是
+LuCI 的 CBI 控制器**注入到当前 chunk 环境**里的，不在 `_G`。
+
+正确写法（PassWall 自己也这么干）：
+
+```lua
+local _src = loadfile(path)
+setfenv(_src, getfenv(1))
+local _f = _src()
+_f(m, s, s1)
+```
+
+另加一层 `xpcall` + 写 `/tmp` 与 syslog：注入点的 `pcall` 会吞掉所有异常，
+"界面上少几个字段"本身不报错，不留痕就只能靠猜。

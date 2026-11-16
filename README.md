@@ -299,6 +299,31 @@ curl -x http://admin:abcd1234@127.0.0.1:1080 https://www.google.com
 配置格式从 YAML 变成 JSON，字段有改名。逐字段对照表见
 [`docs/MIGRATION.md`](docs/MIGRATION.md)。
 
+### OpenWrt 软路由（PassWall 补丁包）
+
+不想单独装插件、想继续用 PassWall 的节点管理和分流规则，就装补丁包：
+
+```bash
+# 1. 导入签名公钥（apk 在解包前验签，未签名包在网页上传入口装不上）
+wget -O /etc/apk/keys/flowtls.pem \
+  https://github.com/luowei729/FlowTLS/releases/latest/download/flowtls.pem
+
+# 2. 安装（架构无关，单包）
+apk add ./passwall-flowtls_<版本>_all.apk     # opkg 系统用 .ipk
+```
+
+装完在 PassWall 网页里：
+
+- **组件更新 → Sing-Box 版本 → 检查更新**：直接从本项目的 Release 拉内核，
+  换完就是带 `with_flowtls` 的 `1.14.4-rev.N`；
+- **节点列表 → 添加节点 → 协议选 `FlowTLS`**：填源端口 / IP ID 标记 / SNI 等。
+
+PassWall 升级会把补丁的调用点冲掉，但补丁有 cron（每 5 分钟）与 WAN 上线
+两处自愈，也可以手动 `passwall-flowtls apply`；
+`passwall-flowtls status` 查状态、`passwall-flowtls uninstall` 还原官方行为。
+
+细节与排障见 [`docs/PASSWALL.md`](docs/PASSWALL.md)。
+
 ### 自检
 
 ```bash

@@ -1,5 +1,92 @@
 # CHANGELOG
 
+## 2026-11-16 23:10 (北京时间)
+
+### 新增：PassWall 补丁包（`passwall-flowtls`），并恢复 nftables 防火墙支持
+
+**wire format 未改动**（仍是 v3）。内核侧新增的是防火墙规则落地方式，
+不改变任何收发字节，与 rev.5 及更早版本双向兼容。
+
+#### 1. 恢复 nftables 防火墙（**这是 rev.5 的功能缺陷**）
+
+rev.5 的 `flowtls/rules.go` 只会写 iptables 规则。而 OpenWrt 22.03+ 已是
+fw4/nftables：legacy iptables 表根本不在这条 hook 链上，规则"写成功"但从不生效。
+
+真机症状极具误导性：
+
+```
+ERROR outbound/flowtls: 发送失败（累计 1 次）: sendmmsg: operation not permitted
+```
+
+看起来像权限问题（`EPERM`），实际是 fw4 的 `accept_to_wan` 里那条
+`ct state invalid ... drop`（防 NAT 泄漏）把我们的伪包当无效连接丢弃，
+netfilter 的 DROP 在 `sendto`/`sendmmsg` 里就表现为 `-EPERM`。
+
+修法（从 `wip-luci-plugin` 分支取回，逻辑与已验证版本一致）：
+
+- `EnsureClient` / `EnsureServer` **优先尝试 nft**，成功即返回，完全不碰 iptables；
+- 规则写在 `table inet flowtls`，两条链 `out_<源端口>` / `in_<源端口>`，
+  priority `raw`(-300)，在 conntrack 之前就把伪包 `notrack` 掉；
+- nft 不可用（老系统）时自动回落原来的 iptables 分支；
+- 启动日志把每条生效的规则原文打出来——这一层出问题时现象过于隐蔽，
+  不写日志基本查不到。
+
+`notrack` 同时是**抗劫持**的硬保证：其它代理（PassWall / OpenClash / SSR+）
+的劫持都写在 nat 钩子，而 `nf_nat_inet_fn()` 第一件事就是
+`ct = nf_ct_get(skb); if (!ct) return NF_ACCEPT;` —— 没有 conntrack 就没有 NAT。
+
+#### 2. 新增 PassWall 补丁包
+
+`passwall-flowtls-patchpackage/`，纯 Lua + shell，**不含任何二进制**，
+因此单包 `Architecture: all` / `arch: noarch`，所有架构通用。
+
+装上后：
+
+- **组件更新**：PassWall → 组件更新 → `Sing-Box 版本` → 检查更新，
+  直接从本项目的 Release 拉核心（`releases/latest/download/sing-box-release-api.json`）；
+- **添加节点**：协议下拉框多一个 `FlowTLS`，带源端口 / IP ID 标记 / SNI /
+  握手方式 / 防火墙模式 / 最大拥塞窗口 / UDP 三态字段。
+
+实现约束（这是"最小侵入"的具体含义）：
+
+- 逻辑全部住在 `flowtls_com.lua` / `flowtls_outbound.lua` / `flowtls_fields.lua`
+  三个本包文件里；PassWall 源码中只插 5 行调用，带 `FLOWTLS-PATCH` 标记；
+- 注入用 `awk` + `cmp`：内容没变化就**一个字节都不写盘**，cron 一年也不磨损 flash；
+- 三处自愈：安装后 / 每 5 分钟 cron / 每次 WAN `ifup`；
+- `uninstall` 后三个文件与官方包**逐字节一致**；
+- 锚点找不到时明确报错并跳过，绝不写坏文件。
+
+#### 3. 两个必须记住的 PassWall 内部细节
+
+**版本号比较会被字母 v 截断。** PassWall 用
+`compare_versions(local:match("[^v]+"), "<", remote:match("[^v]+"))`，
+我们的 `1.14.4-rev.5` 截断成 `1.14.4-re`，rev.5 与 rev.6 塌缩成同一个串，
+**永远检测不到更新**。所以补丁同时改两端：
+
+- 本机版本：`cmd_version` 加 `sed 's/-rev\./-r/'` → `1.14.4-r5`；
+- 远程元数据：`tag_name` 直接写成 `1.14.4-r6`（CI 生成的 JSON 里）。
+
+**共享字段的 depends 是逐个协议登记的。** `1_sing-box.lua` 末尾有一段
+`s.fields["protocol"].keylist` 循环，给 `address` / `port` /
+`domain_resolver` / `domain_strategy` 挂 `depends({protocol=v})`。
+那段循环在我们追加 `flowtls` 之前就执行完了，于是选中 FlowTLS 时
+**服务器地址和端口整行不渲染**（密码却有，因为它有单独的 depends）。
+补丁里必须手动补登记这 4 个字段。
+
+#### 4. CI
+
+新增 `passwall` job（逻辑单测 + 打包 + 上传产物），`release` 依赖它；
+Release 在资产上传后追加一步生成并上传 `sing-box-release-api.json`
+（GitHub 只对已上传资产提供 `sha256:` digest，而 PassWall 下载后要拿它校验）。
+
+本地入口：`make passwall-test`、`make passwall`。文档见 `docs/PASSWALL.md`。
+
+### 已知限制
+
+- PassWall 的「检查更新」只读 `releases/latest`，**无法回退到旧版本**。
+- 同一台机器上多个 FlowTLS 节点必须用不同的 `源端口`，否则第二条隧道
+  会抢第一条的防火墙规则。
+
 ## 2026-11-15 22:45 (北京时间)
 
 ### 发布：v1.14.4-rev.5（Windows 自动放行防火墙，用户零配置）

@@ -1,0 +1,295 @@
+#!/bin/sh
+# passwall-flowtls —— FlowTLS × PassWall 补丁管理器
+#
+# 子命令：
+#   apply      幂等注入/刷新补丁（默认）。内容没变化时**不写盘**（省 flash）
+#   verify     检查补丁是否在位，返回码 0/1
+#   uninstall  撤销注入，把 PassWall 的三个文件还原成上游内容
+#   status     人类可读的状态摘要
+#
+# 设计原则：PassWall 的源码里只留「调用我们的 5 行」，逻辑全在本包的
+# Lua 文件里。PassWall 升级会覆盖那三个文件、把调用点冲掉，本脚本做的事
+# 就是**把调用点补回去**，所以它必须能反复执行、且不产生任何副作用。
+#
+# 为什么用「重写整块 + cmp 比较」而不是「grep 到就跳过」：
+#   1. grep 到就跳过 → 我们自己的 Lua 逻辑升级后不会生效，还得手动 uninstall；
+#   2. 每次都重写 → 三条 cron 一天写几十次 flash，擦写寿命经不起。
+#   cmp 比较两者兼得：逻辑变了就更新，没变就一个字节都不碰。
+
+set -u
+
+LUA_DIR=/usr/lib/lua/luci/passwall
+UI_DIR=/usr/lib/lua/luci/model/cbi/passwall/client/type
+COM="$LUA_DIR/com.lua"
+OUTBOUND="$LUA_DIR/util_sing-box.lua"
+SINGBOX_UI="$UI_DIR/1_sing-box.lua"
+MOD_COM="$LUA_DIR/flowtls_com.lua"
+MOD_OUT="$LUA_DIR/flowtls_outbound.lua"
+MOD_FIELDS="$LUA_DIR/flowtls_fields.lua"
+
+MARK_B='-- >>> FLOWTLS-PATCH'
+MARK_E='-- <<< FLOWTLS-PATCH <<<'
+
+CRON_TAG='# passwall-flowtls'
+CRON_LINE="*/5 * * * * /usr/bin/passwall-flowtls apply --quiet $CRON_TAG"
+
+# 补丁状态机的退出码：0=正常 1=需要处理 2=环境不满足（PassWall 没装）
+QUIET=0
+log() {
+	[ "$QUIET" = 1 ] || printf '%s\n' "$*"
+}
+warn() {
+	# 警告即使在 --quiet 下也要写 syslog，否则自愈失败无人知晓
+	logger -t passwall-flowtls "$*" 2>/dev/null
+	[ "$QUIET" = 1 ] || printf '警告：%s\n' "$*" >&2
+}
+
+[ $# -gt 0 ] || set -- apply
+CMD=$1
+shift
+case "$CMD" in
+	apply) ;;
+	status) ;;
+	verify) ;;
+	uninstall) ;;
+	-h|--help|help)
+		sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+		exit 0
+		;;
+	*)
+		printf '未知子命令：%s\n' "$CMD" >&2
+		exit 2
+		;;
+esac
+
+for a in "$@"; do
+	case "$a" in
+		--quiet) QUIET=1 ;;
+		--no-cron) NO_CRON=1 ;;
+		*) ;;
+	esac
+done
+NO_CRON=${NO_CRON:-0}
+
+# PassWall 不在就直接退出：这不是错误，是「还没装 PassWall」。
+if [ ! -f "$OUTBOUND" ] || [ ! -f "$SINGBOX_UI" ] || [ ! -d "$LUA_DIR" ]; then
+	[ "$CMD" = verify ] && { log "未安装 PassWall，无需补丁"; exit 2; }
+	[ "$CMD" = status ] && { log "PassWall：未安装"; exit 2; }
+	log "未安装 PassWall，跳过"
+	exit 0
+fi
+
+TMPD=$(mktemp -d "/tmp/passwall-flowtls.XXXXXX") || exit 1
+trap 'rm -rf "$TMPD"' EXIT INT TERM
+trap 'exit 1' HUP PIPE
+
+# ---------------------------------------------------------------- 注入块
+# 三块内容刻意写成 5-9 行：它们在 PassWall 的源码里，越短越不容易被上游改动
+# 破坏锚点，也越容易在升级后一眼看出被冲掉。
+cat > "$TMPD/blk_com.lua" <<'EOF'
+-- >>> FLOWTLS-PATCH (由 passwall-flowtls 生成，请勿手改) >>>
+pcall(function()
+	local _ok, _f = pcall(dofile, "/usr/lib/lua/luci/passwall/flowtls_com.lua")
+	if _ok and type(_f) == "function" then _f(_M) end
+end)
+-- <<< FLOWTLS-PATCH <<<
+EOF
+
+cat > "$TMPD/blk_out.lua" <<'EOF'
+-- >>> FLOWTLS-PATCH (由 passwall-flowtls 生成，请勿手改) >>>
+pcall(function()
+	local _ok, _f = pcall(dofile, "/usr/lib/lua/luci/passwall/flowtls_outbound.lua")
+	if _ok and type(_f) == "function" then
+		local _w = _f(gen_outbound)
+		if type(_w) == "function" then gen_outbound = _w end
+	end
+end)
+-- <<< FLOWTLS-PATCH <<<
+EOF
+
+cat > "$TMPD/blk_ui.lua" <<'EOF'
+-- >>> FLOWTLS-PATCH (由 passwall-flowtls 生成，请勿手改) >>>
+-- 这里必须用 loadfile + setfenv 而不是 dofile：
+-- dofile 加载的代码跑在 _G 里，而 PassWall 的 translate / Value / ListValue
+-- 不在 _G 里（是 CBI 控制器环境注入的），直接 dofile 会立刻报
+-- "attempt to call global 'translate' (a nil value)"，表现为
+-- 「协议能选 FlowTLS，但端口/SNI 等字段一个都不出现」。
+pcall(function()
+	local _src = loadfile("/usr/lib/lua/luci/passwall/flowtls_fields.lua")
+	if not _src then return end
+	setfenv(_src, getfenv(1))
+	local _f = _src()
+	if type(_f) == "function" then _f(m, s, s1) end
+end)
+-- <<< FLOWTLS-PATCH <<<
+EOF
+
+# ---------------------------------------------------------------- 核心：改一个文件
+#
+# 做法：awk 一遍完成「剥掉旧块 + 在锚点前插入新块」。
+# 锚点用 index($0, needle) == 1 做**纯前缀匹配**，不用正则：
+# 锚点是 api.type_cbi_section(s1, s) 这种带括号的行，当正则还要转义，
+# 而转义写错时 awk 不会报错，只会静默不匹配 —— 那是最难查的故障。
+#
+# 返回：0=已更新或本来就一致 1=需要重装 PassWall（锚点丢失或标记不成对）
+patch_file() {
+	_f=$1 _anchor=$2 _blk=$3
+	_out="$TMPD/patched"
+	_rc=0
+
+	awk -v anchor="$_anchor" -v blk="$_blk" -v mb="$MARK_B" -v me="$MARK_E" '
+		BEGIN {
+			skip = 0; ins = 0; n = 0; broken = 0
+			while ((getline line < blk) > 0) { n++; block[n] = line }
+			close(blk)
+		}
+		index($0, mb) == 1 { skip = 1; next }
+		skip {
+			if (index($0, me) == 1) { skip = 0 }
+			next
+		}
+		!ins && index($0, anchor) == 1 {
+			for (i = 1; i <= n; i++) print block[i]
+			ins = 1
+		}
+		{ print }
+		END {
+			if (skip) exit 4          # 只有开始标记没有结束标记
+			if (!ins) exit 3          # 锚点没找到
+		}
+	' "$_f" > "$_out"
+	_rc=$?
+	case "$_rc" in
+		0) ;;
+		3) warn "$(basename "$_f") 里找不到锚点「$_anchor」，PassWall 可能改了结构，本次跳过"; return 1 ;;
+		4) warn "$(basename "$_f") 的补丁标记不成对，请重新安装本包"; return 1 ;;
+		*) warn "$(basename "$_f") 注入失败（awk 退出码 $_rc）"; return 1 ;;
+	esac
+
+	# 内容一致就一个字节都不写：这三条 cron 会在设备上跑一整年
+	if cmp -s "$_out" "$_f"; then
+		return 0
+	fi
+
+	# 原子替换：先写同目录临时文件再 mv，避免 LuCI 正好在读到半个文件
+	# （写的瞬间被读到会让网页报 Lua 语法错误）
+	cp "$_out" "$_f.new.$$" 2>/dev/null || { warn "无法写入 $_f"; return 1; }
+	chmod 644 "$_f.new.$$" 2>/dev/null
+	mv -f "$_f.new.$$" "$_f" || { rm -f "$_f.new.$$"; warn "替换 $_f 失败"; return 1; }
+	log "已更新 $(basename "$_f")"
+	return 0
+}
+
+has_marker() {
+	# -e 不能省：标记以 "--" 开头，不加 -e 时 grep 会把它当成选项，
+	# 于是「补丁明明打上了却报未打」——这种静默失败最难查。
+	[ -f "$1" ] && grep -qF -e "$MARK_B" "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- apply
+do_apply() {
+	_need=0
+	for _m in "$MOD_COM" "$MOD_OUT" "$MOD_FIELDS"; do
+		[ -f "$_m" ] || { warn "缺少补丁模块：$_m"; _need=1; }
+	done
+	[ "$_need" = 0 ] || return 1
+
+	_fail=0
+	patch_file "$COM"        'return _M'                    "$TMPD/blk_com.lua" || _fail=1
+	patch_file "$OUTBOUND"   '_G.gen_config = gen_config'   "$TMPD/blk_out.lua" || _fail=1
+	patch_file "$SINGBOX_UI" 'api.type_cbi_section(s1, s)'  "$TMPD/blk_ui.lua"  || _fail=1
+
+	# PassWall 会把「核心版本号」按 stat 元数据缓存在 CACHE_PATH/binver_*。
+	# 我们改了 cmd_version（版本号从 1.14.4-rev.5 变成 1.14.4-r5），
+	# 旧缓存会让组件更新页继续显示旧值，所以补丁后清一次。
+	# 只删 binver_*：同目录还有节点 socks 端口缓存等，不能整目录清。
+	rm -f /var/etc/passwall_tmp/binver_* /tmp/etc/passwall_tmp/binver_* 2>/dev/null
+
+	# cron 自愈：PassWall 升级后到下一次开机之间也能自动恢复。
+	# 一行 grep 级的开销（文件没变时 cmp 直接返回）。
+	if [ "$NO_CRON" = 0 ] && [ -f /etc/crontabs/root ]; then
+		if ! grep -qF "$CRON_TAG" /etc/crontabs/root 2>/dev/null; then
+			printf '%s\n' "$CRON_LINE" >> /etc/crontabs/root
+			/etc/init.d/cron reload >/dev/null 2>&1
+			log "已加入每 5 分钟自愈检查（/etc/crontabs/root 中带 $CRON_TAG 标记）"
+		fi
+	elif [ "$NO_CRON" = 0 ]; then
+		# 没有 crontab 就自己建一个，别去动别人的
+		mkdir -p /etc/crontabs
+		printf '%s\n' "$CRON_LINE" > /etc/crontabs/root
+		/etc/init.d/cron reload >/dev/null 2>&1
+		log "已创建 /etc/crontabs/root 并加入自愈检查"
+	fi
+
+	[ "$_fail" = 0 ] && log "补丁已就位"
+	return "$_fail"
+}
+
+# ---------------------------------------------------------------- uninstall
+do_uninstall() {
+	_fail=0
+	for _f in "$COM" "$OUTBOUND" "$SINGBOX_UI"; do
+		has_marker "$_f" || continue
+		_out="$TMPD/clean"
+		awk -v mb="$MARK_B" -v me="$MARK_E" '
+			index($0, mb) == 1 { skip = 1; next }
+			skip { if (index($0, me) == 1) skip = 0; next }
+			{ print }
+		' "$_f" > "$_out" || { warn "还原 $(basename "$_f") 失败"; _fail=1; continue; }
+		cp "$_out" "$_f.new.$$" && chmod 644 "$_f.new.$$" && mv -f "$_f.new.$$" "$_f" \
+			|| { rm -f "$_f.new.$$"; warn "替换 $(basename "$_f") 失败"; _fail=1; continue; }
+		log "已还原 $(basename "$_f")"
+	done
+
+	if [ -f /etc/crontabs/root ] && grep -qF "$CRON_TAG" /etc/crontabs/root 2>/dev/null; then
+		grep -vF "$CRON_TAG" /etc/crontabs/root > "$TMPD/cron" 2>/dev/null
+		cat "$TMPD/cron" > /etc/crontabs/root
+		/etc/init.d/cron reload >/dev/null 2>&1
+		log "已移除自愈 cron"
+	fi
+
+	[ "$_fail" = 0 ] && log "补丁已撤销（PassWall 恢复官方行为）"
+	return "$_fail"
+}
+
+# ---------------------------------------------------------------- verify / status
+do_verify() {
+	_bad=0
+	[ "$CMD" = status ] && {
+		printf 'PassWall 客户端核心: %s\n' "$OUTBOUND"
+	}
+	for _f in "$COM" "$OUTBOUND" "$SINGBOX_UI"; do
+		if has_marker "$_f"; then
+			[ "$CMD" = status ] && printf '  [补丁] %s\n' "$(basename "$_f")"
+		else
+			[ "$CMD" = status ] && printf '  [未打] %s\n' "$(basename "$_f")"
+			_bad=1
+		fi
+	done
+	for _m in "$MOD_COM" "$MOD_OUT" "$MOD_FIELDS"; do
+		if [ -f "$_m" ]; then
+			[ "$CMD" = status ] && printf '  [模块] %s\n' "$(basename "$_m")"
+		else
+			[ "$CMD" = status ] && printf '  [缺失] %s\n' "$(basename "$_m")"
+			_bad=1
+		fi
+	done
+	if [ -f /etc/crontabs/root ] && grep -qF "$CRON_TAG" /etc/crontabs/root 2>/dev/null; then
+		[ "$CMD" = status ] && printf '  [自愈] 每 5 分钟\n'
+	else
+		[ "$CMD" = status ] && printf '  [自愈] 未启用\n'
+	fi
+
+	if [ "$_bad" = 0 ]; then
+		[ "$CMD" = status ] && printf '结论：补丁完整\n'
+		return 0
+	fi
+	[ "$CMD" = status ] && printf '结论：补丁不完整，执行 passwall-flowtls apply\n'
+	return 1
+}
+
+case "$CMD" in
+	apply)     do_apply ;;
+	uninstall) do_uninstall ;;
+	verify|status) do_verify ;;
+esac

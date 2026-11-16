@@ -138,7 +138,24 @@ interop:
 .PHONY: e2e
 e2e: build
 	bash docs/e2e_matrix.sh
+# PassWall 补丁包（.ipk/.apk，架构无关）
+#
+# 这个包不含内核，所以不依赖 build。apk 的容器格式需要 apk-tools，
+# 用 APK_TOOL 指过去（OpenWrt SDK 的 staging_dir/host/bin/apk）；
+# 不指定时只出 .ipk。
+#
+# 本地签名需要 deploy/apk-signing.key（已被 .gitignore 忽略）。
+.PHONY: passwall
+passwall:
+	@set -e; cd passwall-flowtls-patchpackage; \
+	APKARG=''; [ -n "$(APK_TOOL)" ] && APKARG="--apk-tool $(APK_TOOL)"; \
+	KEYARG=''; [ -n "$(SIGN_KEY)" ] && KEYARG="--sign-key $(SIGN_KEY)"; \
+	sh scripts/pack.sh --out dist $$APKARG $$KEYARG
 
+# 补丁包的纯逻辑单测（不需要 OpenWrt、不需要 root）
+.PHONY: passwall-test
+passwall-test:
+	@cd passwall-flowtls-patchpackage && lua scripts/luatest.lua .
 # 同步上游：pull 后预期只有 include/registry.go 的 2 行冲突
 .PHONY: upstream-pull
 upstream-pull:

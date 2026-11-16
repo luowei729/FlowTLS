@@ -1,0 +1,9 @@
+#!/bin/sh
+# 首次启动兜底：安装时 PassWall 可能还没装好（或正好在被升级），
+# 那时 post-install 里的 apply 会跳过。开机后 PassWall 的 lua 文件已经落盘，
+# 这里再跑一次。
+#
+# uci-defaults 的脚本执行后会被 rc.local 自动删除，所以不需要自己 rm。
+[ -x /usr/bin/passwall-flowtls ] || exit 0
+/usr/bin/passwall-flowtls apply --quiet
+exit 0

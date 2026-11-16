@@ -1,0 +1,14 @@
+#!/bin/sh
+# WAN 上线时检查一次补丁。
+#
+# 为什么值得挂在这里：PassWall 的包升级会覆盖它自己的 lua 文件，
+# 把我们的注入点冲掉。设备重启或断线重连是**几乎必然会发生**的事件，
+# 挂在这里等于给补丁加了一层零成本的自愈时机（文件没变时 cmp 直接返回，
+# 一次执行只有几次 stat 的开销）。
+#
+# 只处理 ifup：ifdown 时执行没有意义，而 renew 会在 PPPoE 环境里
+# 频繁触发，多跑几次虽然无害但没必要。
+[ "$ACTION" = ifup ] || exit 0
+[ -x /usr/bin/passwall-flowtls ] || exit 0
+/usr/bin/passwall-flowtls apply --quiet
+exit 0

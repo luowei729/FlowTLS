@@ -132,6 +132,10 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 			_ = raw.Close()
 			return nil, err
 		}
+		// 同客户端：fw4 的 ct invalid DROP 会静默吞掉我们的伪包。
+		for _, r := range NftRules(kindServer, cfg.Listen.Port(), 0, cfg.IPIDMark) {
+			logger.Info("防火墙规则: ", r)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

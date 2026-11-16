@@ -199,9 +199,20 @@ func runIPTables(args []string) (bool, error) {
 }
 
 // EnsureServer 幂等写入服务端规则（对应 Rust `ensure_server`）。
+//
+// **nft 优先**：本机有 nft 就用 nft 写全套规则（notrack + RST 抑制 +
+// IP ID 标记丢弃），成功即返回，完全不碰 iptables。
+// 只有 nft 不存在或写入失败时才回退到 iptables（老固件 fw3）。
+//
+// 为什么这个顺序很重要：OpenWrt 22.03+ 默认只装 `iptables-nft`，
+// 而 nftables 没有 u32 扩展 —— 走 iptables 分支会直接失败，隧道起不来，
+// 用户被迫去装三个包。改用 nft 之后这条路不再需要（DEVTIPS 165）。
 func EnsureServer(port, magic uint16) error {
 	if !rulesBackendEnabled {
 		return nil // Windows：WinDivert 已扣留伪包，内核看不到（见 rules_windows.go）
+	}
+	if ensureNft(kindServer, port, 0, magic) {
+		return nil
 	}
 	for _, r := range serverRules(port, magic) {
 		ok, err := runIPTables(r.command("-C"))
@@ -223,9 +234,15 @@ func EnsureServer(port, magic uint16) error {
 }
 
 // EnsureClient 幂等写入客户端规则（对应 Rust `ensure_client`）。
+//
+// 与 EnsureServer 同样 nft 优先；客户端额外多一条「挡住内核为此伪连接
+// 回的 RST」，因为 SYN-ACK 一到内核就找不到对应 socket。
 func EnsureClient(sourcePort, serverPort, magic uint16) error {
 	if !rulesBackendEnabled {
 		return nil // Windows：同 EnsureServer
+	}
+	if ensureNft(kindClient, sourcePort, serverPort, magic) {
+		return nil
 	}
 	for _, r := range clientRules(sourcePort, serverPort, magic) {
 		ok, err := runIPTables(r.command("-C"))
@@ -247,9 +264,14 @@ func EnsureClient(sourcePort, serverPort, magic uint16) error {
 }
 
 // CheckServer 只检查规则是否存在，不修改（对应 Rust `check_server`）。
+//
+// 顺序与 EnsureServer 一致：先看 nft 链，不在才回退查 iptables。
 func CheckServer(port, magic uint16) bool {
 	if !rulesBackendEnabled {
 		return true // Windows：无需规则，状态恒为「就绪」
+	}
+	if nftAvailable() {
+		return checkNft(kindServer, port)
 	}
 	for _, r := range serverRules(port, magic) {
 		ok, _ := runIPTables(r.command("-C"))
@@ -267,6 +289,9 @@ func CheckClient(sourcePort uint16) bool {
 	if !rulesBackendEnabled {
 		return true // Windows：同 CheckServer
 	}
+	if nftAvailable() {
+		return checkNft(kindClient, sourcePort)
+	}
 	ok, _ := runIPTables([]string{
 		"-C", "OUTPUT",
 		"-p", "tcp",
@@ -275,4 +300,202 @@ func CheckClient(sourcePort uint16) bool {
 		"-j", "DROP",
 	})
 	return ok
+}
+
+// ---------------------------------------------------------------- notrack
+
+// 这一节解决的是**用 nftables 的发行版（OpenWrt fw4、新版 Debian 等）上
+// 隧道第二个包起就发不出去**的问题。Rust 版同样有这个缺陷，只是当年
+// 的测试环境用 iptables 且没有那条规则，所以没暴露。
+//
+// ## 现象
+//
+// 日志里反复出现：
+//
+//	发送失败（累计 1 次）: sendmmsg: operation not permitted
+//	flowtls 握手失败: context deadline exceeded
+//
+// 且抓包只能看到 SYN 与 SYN-ACK，之后我们自己的数据包**全部消失**。
+//
+// ## 原因
+//
+// fw4（OpenWrt 默认防火墙）在 `accept_to_wan` 链里有一条：
+//
+//	meta nfproto ipv4 oifname "wan" ct state invalid ... drop
+//	  comment "!fw4: Prevent NAT leakage"
+//
+// 我们的伪 TCP 包是自己手写 IP/TCP 头的，序号/确认号与内核 conntrack
+// 记录的三次握手状态对不上，于是被判定成 `ct state invalid` 直接 DROP。
+// 而 **netfilter 的 DROP 会把错误翻译成 -EPERM 返回给 sendto/sendmmsg**
+// （`nf_hook_slow()` 里 `case NF_DROP: ret = -EPERM`），
+// 所以表现为「permission denied」而不是「被防火墙拦了」——这条错误信息
+// 具有极强的误导性，会让人去查 CAP_NET_RAW / SELinux。
+//
+// 为什么第一个包（SYN）能出去：那时 conntrack 还没有这个四元组的记录，
+// 内核会把 SYN 判成 NEW 并建档；从第二个包起才因为序号对不上变 INVALID。
+//
+// ## 修法
+//
+// 在 raw 优先级（-300，早于 conntrack）给这条流打 `notrack`：
+// 报文不再进 conntrack，也就没有「invalid」这个状态可判。
+// 只按端口匹配，是我们专用的端口，不会误伤业务流量。
+//
+// **iptables 的 `-j NOTRACK` 在这里不可用**：OpenWrt 的
+// `xtables-legacy-multi` 没有编译 xt_NOTRACK 目标，执行会报
+// `Couldn't load target 'NOTRACK'`。所以改用 nft 原生语句。
+//
+// 注意：**出向与入向都要打**。只打出向时，回程包仍会以 invalid 状态
+// 进 conntrack，把下一次握手也污染掉——实测「第一次失败、之后成功」
+// 的诡异现象就是这么来的。
+
+// notrackTable 是 FlowTLS 专用的 nft 表名。
+//
+// 用独立表而不是往 fw4 的表里插规则：fw4 每次 reload 都会重建自己的表，
+// 插进去的规则会消失；独立表不受它管理，重启服务时我们自己重建。
+const notrackTable = "flowtls"
+
+// notrackChains 返回本端口对应的两条链名。
+//
+// 链名带端口，多个 FlowTLS 实例（例如客户端 + 服务端在同一台机器上）
+// 各自维护自己的链，谁都不会清掉别人的规则。
+func notrackChains(port uint16) (outChain, inChain string) {
+	return "out_" + strconv.Itoa(int(port)), "in_" + strconv.Itoa(int(port))
+}
+
+// firewallKind 区分客户端与服务端要写的规则集。
+type firewallKind int
+
+const (
+	kindClient firewallKind = iota
+	kindServer
+)
+
+// nftScript 生成完整 nft 批处理脚本。
+//
+// **这就是 iptables 那套规则的 nft 等价实现**，两者做同一件事：
+//
+//	方向        规则                                        作用
+//	output      sport=<本地端口> notrack                    伪包不进 conntrack
+//	output      sport=<本地端口> tcp flags & rst == rst drop 挡内核回的 RST
+//	prerouting  dport=<本地端口> notrack                    回程包不进 conntrack
+//	prerouting  <对端方向> ip id & 0xff00 == <mark> drop     挡内核处理回程包
+//
+// 为什么用 nft 而不是 iptables（实测依据见 DEVTIPS 165）：
+//
+//  1. **u32 在 nftables 里没有对应扩展**，OpenWrt 22.03+ 默认只装
+//     `iptables-nft`，`-m u32` 直接不支持 —— 于是插件必须让用户手工装
+//     `iptables-zz-legacy` + `iptables-mod-u32` + `kmod-ipt-raw` 三个包，
+//     否则隧道起不来。而 nft 用 `ip id & 0xff00 == 0x1e00` 一条就够，
+//     完全等价于 u32 的 `0x4&0xff00ffff=0x1e004000`（已验证）。
+//  2. `notrack` 只在 nft 里有；iptables 的 `-j NOTRACK` 在 OpenWrt 的
+//     xtables-legacy 上没编译，执行会报 `Couldn't load target 'NOTRACK'`。
+//  3. 少一套规则：不用再担心 iptables 与 nft 两处的规则互相打架。
+//
+// 用 `add table` / `add chain` + `flush chain` 而不是 `delete table`：
+// 前者在表已存在时幂等，后者在表不存在时会让整批 abort。
+// 先 flush 再 add rule 保证重复执行不叠加重复规则。
+func nftScript(kind firewallKind, localPort, peerPort, magic uint16) string {
+	outChain, inChain := notrackChains(localPort)
+	portStr := strconv.Itoa(int(localPort))
+	m := magic & 0xFF00
+	lines := []string{
+		"add table inet " + notrackTable,
+		"add chain inet " + notrackTable + " " + outChain +
+			" { type filter hook output priority raw; policy accept; }",
+		"flush chain inet " + notrackTable + " " + outChain,
+		"add rule inet " + notrackTable + " " + outChain +
+			" tcp sport " + portStr + " notrack",
+		"add rule inet " + notrackTable + " " + outChain +
+			" tcp sport " + portStr + " tcp flags & rst == rst drop",
+		"add chain inet " + notrackTable + " " + inChain +
+			" { type filter hook prerouting priority raw; policy accept; }",
+		"flush chain inet " + notrackTable + " " + inChain,
+		"add rule inet " + notrackTable + " " + inChain +
+			" tcp dport " + portStr + " notrack",
+	}
+
+	// 回程方向的 drop 两条分支的匹配字段不同，必须分开写：
+	//   客户端：回程包来自服务端端口（sport）且带对方的 IP ID 标记；
+	//   服务端：入站伪包发往监听端口（dport）且带客户端的 IP ID 标记。
+	markExpr := " ip id & 0xff00 == 0x" + strconv.FormatUint(uint64(m), 16)
+	if kind == kindClient {
+		lines = append(lines, "add rule inet "+notrackTable+" "+inChain+
+			" tcp sport "+strconv.Itoa(int(peerPort))+markExpr+" drop")
+	} else {
+		lines = append(lines, "add rule inet "+notrackTable+" "+inChain+
+			" tcp dport "+portStr+markExpr+" drop")
+	}
+	return strings.Join(append(lines, ""), "\n")
+}
+
+// NftRules 返回实际写进 nft 的规则（供启动日志展示）。
+//
+// 返回空切片表示本机没有 nft（老系统），此时走 iptables 分支。
+func NftRules(kind firewallKind, localPort, peerPort, magic uint16) []string {
+	if !nftAvailable() {
+		return nil
+	}
+	var out []string
+	for _, ln := range strings.Split(nftScript(kind, localPort, peerPort, magic), "\n") {
+		if strings.HasPrefix(ln, "add rule ") {
+			out = append(out, "nft "+ln)
+		}
+	}
+	return out
+}
+
+// nftPath 缓存 nft 可执行文件路径（空串表示没有）。
+//
+// 只查一次：EnsureClient/EnsureServer 在每次建连都会走到，
+// 每次都 exec.LookPath 是没必要的系统调用开销。
+var nftPath = func() string {
+	p, err := exec.LookPath("nft")
+	if err != nil {
+		return ""
+	}
+	return p
+}()
+
+// nftAvailable 报告本机有没有 nft。
+func nftAvailable() bool { return nftPath != "" }
+
+// ensureNft 写入 nft 规则，返回是否真的成功。
+//
+// **返回值必须被检查**：如果本机有 nft 但写入失败（缺 CAP_NET_ADMIN、
+// 内核没编 nf_tables），不能假装成功 —— 调用方要回退到 iptables 或报错。
+func ensureNft(kind firewallKind, localPort, peerPort, magic uint16) bool {
+	if !rulesBackendEnabled || !nftAvailable() {
+		return false
+	}
+	cmd := exec.Command(nftPath, "-f", "-")
+	cmd.Stdin = strings.NewReader(nftScript(kind, localPort, peerPort, magic))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	// nft 的语法错误只体现在 stderr，退出码可能是 0（批量输入时）
+	return !strings.Contains(string(out), "Error:")
+}
+
+// checkNft 报告规则是否已就位（链存在且含 notrack 与 drop 两条）。
+func checkNft(kind firewallKind, localPort uint16) bool {
+	if !rulesBackendEnabled {
+		return true // Windows：WinDivert 扣留语义，不需要
+	}
+	if !nftAvailable() {
+		return false // 交给调用方走 iptables
+	}
+	outChain, inChain := notrackChains(localPort)
+	for _, ch := range []string{outChain, inChain} {
+		out, err := exec.Command(nftPath, "list", "chain", "inet",
+			notrackTable, ch).CombinedOutput()
+		if err != nil {
+			return false
+		}
+		if !strings.Contains(string(out), "notrack") ||
+			!strings.Contains(string(out), "drop") {
+			return false
+		}
+	}
+	return true
 }

@@ -209,6 +209,28 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
     代价是入口对整个局域网可达，所以 `users` 里的口令**必须改掉默认值**；
     要限制暴露面就用防火墙限网段，不要把口令当唯一防线
     （`DEVTIPS.md` 第 128 条）。
+21. **防火墙规则必须优先用 nft，iptables 只是回落**。
+    OpenWrt 22.03+ 是 fw4/nftables，`xtables-legacy` 的表**不在 hook 链上**：
+    规则写成功、`iptables-save` 能看到，但一个包都不会经过它。
+    后果是 `sendmmsg: operation not permitted`——看起来像权限问题，
+    实际是 fw4 的 `ct state invalid ... drop` 把伪包丢了，netfilter 的
+    DROP 翻译成 `-EPERM`。**看到 EPERM 先查 `nft list ruleset`，
+    不要查权限**（`DEVTIPS.md` 第 145 条）。
+    `notrack` 同时是**抗劫持**的硬保证：其它代理的劫持都写在 nat 钩子，
+    而 `nf_nat_inet_fn()` 在没有 conntrack 条目时直接 `NF_ACCEPT`。
+22. **PassWall 补丁包只许「薄注入」**（`passwall-flowtls-patchpackage/`）：
+    逻辑全部住在本包自己的三个 `flowtls_*.lua` 里，PassWall 源码中
+    只留带 `FLOWTLS-PATCH` 标记的 5 行调用；注入必须 `awk` 生成 + `cmp` 比较，
+    内容没变时**不写盘**（cron 每 5 分钟跑一次，写盘会磨损 flash）；
+    `uninstall` 后三个文件必须与官方包**逐字节一致**；
+    锚点找不到时**明确报错并跳过**，绝不写坏文件。
+    三个已知的 PassWall 内部约束（改之前必读）：
+    版本号比较的 `"[^v]+"` 会在字母 v 处截断，所以本机版本与元数据
+    `tag_name` 两端都不能带 v；共享字段（`address` / `port` /
+    `domain_resolver` / `domain_strategy`）的 `depends` 是逐协议登记的，
+    新协议必须手动补；注入文件必须 `loadfile` + `setfenv(getfenv(1))`
+    加载，`dofile` 看不到 CBI 注入的 `translate` / `Value`
+    （`DEVTIPS.md` 第 146~148 条）。
 
 ## 已知限制
 

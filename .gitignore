@@ -11,6 +11,14 @@ go.work.sum
 /ssl/
 *.pem
 *.key
+# 例外：apk 签名**公钥**必须入库。
+# 它不是机密（本来就随产物发布、装进 /etc/apk/keys/），
+# 而必须可复现：CI 用私钥重新导出公钥后要与仓库里的一致，
+# 否则老设备上的公钥会把升级包判成 UNTRUSTED。
+!passwall-flowtls-patchpackage/keys/*.pem
+
+# 补丁包打包产物
+/passwall-flowtls-patchpackage/dist/
 
 # 部署与凭据（含真实密码/服务器地址，本地维护）
 DEPLOY_CREDENTIALS.md

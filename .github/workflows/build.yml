@@ -296,10 +296,80 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ---------------------------------------------------------------- PassWall 补丁包
+  #
+  # 这个包**不含任何二进制**（架构无关），它只做两件事：
+  #   1. 把 PassWall「组件更新」里的 Sing-Box 源换成我们的 Release；
+  #   2. 给节点配置加上 flowtls 协议和对应字段。
+  # 逻辑全部住在包内的 Lua 文件里，PassWall 源码里只留 5 行调用，
+  # 所以 PassWall 升级后跑一次 apply 就能恢复（另有 cron 自愈）。
+  passwall:
+    name: PassWall 补丁包（架构无关）
+    needs: [calculate_version, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 逻辑单测（不需要 OpenWrt）
+        run: |
+          set -xeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1
+          cd passwall-flowtls-patchpackage
+          lua5.1 scripts/luatest.lua .
+
+      - name: 取 apk 打包工具
+        run: |
+          set -xeuo pipefail
+          # apk v3 的容器是 ADB 格式，自己实现不划算。
+          # 用预编译好的 apk-tools 静态二进制（与本地打包用的是同一份）。
+          # **注意**：SDK 里那个 apk 是 shell wrapper，依赖 host/lib 下
+          # 98 个共享库，单独提取出来无法运行（DEVTIPS 已记）。
+          mkdir -p /tmp/apktool
+          url=https://gitlab.alpinelinux.org/alpine/apk-tools/-/jobs/artifacts/master/raw/apk.static?job=build-static
+          if ! curl -fsSL --max-time 120 -o /tmp/apktool/apk "$url"; then
+            echo '静态 apk 工具取不到，本次只出 .ipk（补丁功能不受影响）' >&2
+            rm -rf /tmp/apktool
+            exit 0
+          fi
+          chmod 755 /tmp/apktool/apk
+          /tmp/apktool/apk --version
+
+      - name: 打包
+        env:
+          SIGN_KEY_B64: ${{ secrets.APK_SIGN_KEY_B64 }}
+        run: |
+          set -xeuo pipefail
+          cd passwall-flowtls-patchpackage
+          APKTOOL=''
+          [ -x /tmp/apktool/apk ] && APKTOOL='--apk-tool /tmp/apktool/apk'
+          SIGNKEY=''
+          if [ -n "$SIGN_KEY_B64" ]; then
+            printf '%s' "$SIGN_KEY_B64" | base64 -d > /tmp/apk.key
+            chmod 600 /tmp/apk.key
+            SIGNKEY='--sign-key /tmp/apk.key'
+            # 公钥必须与私钥配对，否则设备上验签失败（装不上）。
+            openssl rsa -in /tmp/apk.key -pubout -out keys/flowtls.pem
+          fi
+          # shellcheck disable=SC2086
+          sh scripts/pack.sh --out dist $APKTOOL $SIGNKEY
+          rm -f /tmp/apk.key
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passwall-patch
+          path: |
+            passwall-flowtls-patchpackage/dist/*.ipk
+            passwall-flowtls-patchpackage/dist/*.apk
+            passwall-flowtls-patchpackage/dist/flowtls.pem
+          if-no-files-found: warn
+          retention-days: 30
+
   # ---------------------------------------------------------------------- 发布
   release:
     name: 发布 Release
-    needs: [calculate_version, test, build]
+    needs: [calculate_version, test, build, passwall]
     # 只有开发者手动启动并且测试、所有架构构建成功后才创建正式 Release。
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -313,6 +383,13 @@ jobs:
         with:
           path: artifacts
           pattern: binary-*
+          merge-multiple: true
+
+      - name: 下载 PassWall 补丁包
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: passwall-patch
           merge-multiple: true
 
       - name: 生成校验和
@@ -332,6 +409,9 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/*.ipk
+            artifacts/*.apk
+            artifacts/flowtls.pem
             artifacts/sha256sum.txt
           draft: false
           prerelease: false
@@ -346,3 +426,65 @@ jobs:
             ```
             sha256sum -c sha256sum.txt
             ```
+
+            ---
+
+            ## PassWall 补丁包（`passwall-flowtls_*.ipk` / `.apk`）
+
+            装上之后可以在 PassWall 网页里**直接更新到本项目的核心**，
+            并在「添加节点」里选到 `FlowTLS` 协议。补丁包本身不含内核。
+
+            先导入本站公钥（三选一）：
+
+            ```sh
+            # 1) 网页：系统 → 管理权 → 软件包仓库公钥，粘贴 flowtls.pem 的内容
+            # 2) 命令行：
+            wget -O /etc/apk/keys/flowtls.pem \
+              https://github.com/luowei729/FlowTLS/releases/latest/download/flowtls.pem
+            # 3) 或安装时临时放行（不推荐长期使用）：
+            #    apk add --allow-untrusted ./passwall-flowtls_*.apk
+            ```
+
+            安装：
+
+            ```sh
+            apk add ./passwall-flowtls_${{ needs.calculate_version.outputs.version }}_all.apk
+            # opkg 系统：
+            # opkg install ./passwall-flowtls_*.ipk
+            ```
+
+            然后到 PassWall → 组件更新 → Sing-Box 版本 → 检查更新，
+            即可换成 FlowTLS 核心；到节点列表 → 添加节点 → 协议选 `FlowTLS`。
+
+            常用命令：
+
+            ```sh
+            passwall-flowtls status     # 看补丁是否完整
+            passwall-flowtls apply      # 手动重打（升级 PassWall 后）
+            passwall-flowtls uninstall  # 还原 PassWall 官方行为
+            ```
+
+      # PassWall 组件更新的元数据。
+      #
+      # 必须放在 Release **创建之后**：它要读 assets[].digest（GitHub 只在
+      # 资产上传后才提供 sha256），而 PassWall 下载完会拿它做完整性校验，
+      # 缺了就直接拒绝安装。
+      #
+      # 地址固定为 releases/latest/download/sing-box-release-api.json，
+      # 所以每发一个版本，PassWall 那边读到的就是这一版（不用改客户端）。
+      - name: 生成并上传组件更新元数据
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+          sudo apt-get install -y -qq jq
+          cd passwall-flowtls-patchpackage
+          sh scripts/gen-release-json.sh \
+            --repo "${{ github.repository }}" \
+            --tag "v${{ needs.calculate_version.outputs.version }}" \
+            --out sing-box-release-api.json
+          # --clobber：重跑同版本时覆盖旧元数据，而不是报 422。
+          gh release upload "v${{ needs.calculate_version.outputs.version }}" \
+            sing-box-release-api.json --clobber
+          cat sing-box-release-api.json | head -20

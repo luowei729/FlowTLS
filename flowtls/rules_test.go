@@ -151,3 +151,87 @@ func TestNoDuplicatedAction(t *testing.T) {
 		}
 	}
 }
+
+// TestNftScriptShape 钉住 nft 脚本的关键形状。
+//
+// 为什么值得钉：这段脚本是**用字符串喂给 nft -f** 的，写错一个字
+// （链名、hook 名、优先级、掩码）只会让 nft 报一句 "syntax error" 然后
+// 整批 abort，而现象是「规则没生效、日志里什么都没有」。
+//
+// 这条测试还兼作**与旧 iptables 实现的等价性检查**：过去用
+// `iptables -m u32 --u32 "0x4&0xff00ffff=0x1e004000"` 匹配 IP ID 高字节，
+// nft 的等价写法是 `ip id & 0xff00 == 0x1e00`。两者必须同时覆盖
+// 「出向 notrack / 出向 RST drop / 入向 notrack / 入向标记 drop」四件事，
+// 少任何一条都会导致「连上就断」或「第二个包发不出去」。
+func TestNftScriptShape(t *testing.T) {
+	s := nftScript(kindClient, 44312, 8443, 0x1E07)
+
+	musts := []string{
+		"add table inet flowtls",
+		// 出向：我们发出的伪 TCP 包
+		"add chain inet flowtls out_44312 { type filter hook output priority raw; policy accept; }",
+		"add rule inet flowtls out_44312 tcp sport 44312 notrack",
+		// 挡内核为伪连接回的 RST（否则中间设备拆 NAT 映射）
+		"add rule inet flowtls out_44312 tcp sport 44312 tcp flags & rst == rst drop",
+		// 入向：对端回来的包
+		"add chain inet flowtls in_44312 { type filter hook prerouting priority raw; policy accept; }",
+		"add rule inet flowtls in_44312 tcp dport 44312 notrack",
+		// 客户端回程包来自服务端端口，按 IP ID 高字节辨认
+		"add rule inet flowtls in_44312 tcp sport 8443 ip id & 0xff00 == 0x1e00 drop",
+	}
+	for _, m := range musts {
+		if !strings.Contains(s, m) {
+			t.Errorf("nft 脚本缺少: %s\n实际:\n%s", m, s)
+		}
+	}
+
+	// priority raw 必须是 raw：要早于 conntrack(-200)，否则规则没机会生效。
+	if strings.Count(s, "priority raw") != 2 {
+		t.Error("两条链都必须在 raw 优先级上")
+	}
+	// 必须用 flush 而不是 delete table：表不存在时 delete 会让整批 abort。
+	if strings.Contains(s, "delete table") {
+		t.Error("不能用 delete table（表不存在时整批 abort）")
+	}
+	if strings.Count(s, "flush chain") != 2 {
+		t.Error("两条链都要先 flush，否则重复执行会叠加重复规则")
+	}
+}
+
+// TestNftScriptServerUsesDport 钉住服务端与客户端的匹配字段差异。
+//
+// 服务端的入站伪包是「发往监听端口」的，所以标记丢弃必须用 dport；
+// 客户端的回程包是「来自服务端端口」的，必须用 sport。
+// 两者写反了规则永远不命中 —— 而现象只是「内核回了 RST / 起了伪连接」，
+// 极难从日志看出，所以用测试钉住。
+func TestNftScriptServerUsesDport(t *testing.T) {
+	c := nftScript(kindClient, 44312, 8443, 0x1E07)
+	srv := nftScript(kindServer, 8443, 0, 0x1E07)
+
+	if !strings.Contains(c, "tcp sport 8443 ip id") {
+		t.Error("客户端回程匹配必须用 sport=服务端端口")
+	}
+	if !strings.Contains(srv, "tcp dport 8443 ip id") {
+		t.Error("服务端入站匹配必须用 dport=监听端口")
+	}
+	// 服务端不该出现 sport=<服务端端口> + ip id 的组合（那是客户端的形状）
+	if strings.Contains(srv, "tcp sport 8443 ip id") {
+		t.Error("服务端误用了客户端方向的匹配")
+	}
+}
+
+// TestNotrackChainsPerPort 钉住「链名带端口」。
+//
+// 客户端与服务端可能跑在同一台机器上（本机联调就是这样）：
+// 链名不带端口时，后启动的实例会把前一个实例的链 flush 掉，
+// 表现为「先起的那个突然连不上了」。
+func TestNotrackChainsPerPort(t *testing.T) {
+	o1, i1 := notrackChains(44312)
+	o2, i2 := notrackChains(8443)
+	if o1 == o2 || i1 == i2 {
+		t.Fatalf("不同端口的链名必须不同: %s/%s vs %s/%s", o1, i1, o2, i2)
+	}
+	if !strings.HasSuffix(o1, "44312") || !strings.HasSuffix(i1, "44312") {
+		t.Errorf("链名应含端口: %s / %s", o1, i1)
+	}
+}

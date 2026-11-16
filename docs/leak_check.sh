@@ -27,7 +27,12 @@ hit() { printf '  ✗ %s\n' "$*"; fail=1; }
 echo "== 1/4 高危文件名 =="
 # 部署配置与证书永远不该入库。.gitignore 只是第一道防线，
 # 因为 `git add -f`、rename、或者换一台机器 clone 都可能绕过它。
-bad=$(git ls-files | grep -vE '^sing-box/' | grep -iE \
+#
+# 白名单只有一条：apk 签名**公钥**。它随产物公开、本来就装进
+# 目标机的 /etc/apk/keys/，不是机密；而它必须可复现，否则老设备验签失败。
+bad=$(git ls-files | grep -vE '^sing-box/' \
+  | grep -vE '^passwall-flowtls-patchpackage/keys/[^/]+\.pem$' \
+  | grep -iE \
   '(^|/)deploy/|(^|/)DEPLOY_CREDENTIALS\.md$|\.(pem|key|p12|pfx|jks|keystore)$|(^|/)\.env($|\.)|(^|/)id_(rsa|ed25519|ecdsa)$' || true)
 if [ -n "$bad" ]; then
   while IFS= read -r f; do hit "敏感文件被跟踪: $f"; done <<< "$bad"
