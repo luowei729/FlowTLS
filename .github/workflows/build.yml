@@ -463,10 +463,16 @@ jobs:
             安装：
 
             ```sh
-            apk add ./passwall-flowtls_${{ needs.calculate_version.outputs.version }}_all.apk
-            # opkg 系统：
-            # opkg install ./passwall-flowtls_*.ipk
+            # apk 系统（OpenWrt 24.10+ / ImmortalWrt 25.x）
+            apk add ./passwall-flowtls_*_all.apk
+            # opkg 系统（22.03 / 23.05）
+            opkg install ./passwall-flowtls_*_all.ipk
             ```
+
+            > 包名里的版本是 OpenWrt 风格 `-rN`（如 `1.14.4-r6`），
+            > 与前缀 `-rev.N` 是同一个意思的两种写法——apk 的版本语法不接受
+            > `rev.`，而 `-rN` 正是 OpenWrt 表达「同一上游版本第 N 次打包」的原生写法。
+            > 所以直接用通配符最省事，不要照抄版本号。
 
             然后到 PassWall → 组件更新 → Sing-Box 版本 → 检查更新，
             即可换成 FlowTLS 核心；到节点列表 → 添加节点 → 协议选 `FlowTLS`。

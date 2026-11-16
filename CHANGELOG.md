@@ -87,6 +87,29 @@ Release 在资产上传后追加一步生成并上传 `sing-box-release-api.json
 - 同一台机器上多个 FlowTLS 节点必须用不同的 `源端口`，否则第二条隧道
   会抢第一条的防火墙规则。
 
+### 发布：v1.14.4-rev.6
+
+Release 资产：19 个架构的 `sing-box-1.14.4-rev.6-linux-*.tar.gz` +
+`passwall-flowtls_1.14.4-r6_all.ipk` / `.apk` + `flowtls.pem` +
+`sing-box-release-api.json` + `sha256sum.txt`。
+
+真机验证（ImmortalWrt 25.12 / x86_64，PassWall 26.11.3）：
+
+- `passwall-flowtls status` → 补丁完整，三处自愈都在；
+- 组件更新「检查更新」→ `local=1.14.4-r6`、`remote=1.14.4-r6`、资产名与
+  `sha256:` digest 全部正确（同版本不误报）；
+- 节点配置页 FlowTLS 协议下 18 个字段全部渲染（含地址 / 端口）；
+- 真实出站：HTTP 204，首字节 84 ms，`nft list tables` 自动出现
+  `table inet flowtls`；
+- 卸载后三个 PassWall 文件注入点归零、cron 清空；重装后自愈正常；
+- 幂等：连跑两次 `apply` 内容 md5 不变（未写盘）。
+
+CI 修正：`apk` 打包工具改从 `dl-cdn.alpinelinux.org` 的
+`apk-tools-static`（3.x）取用。原先依赖 GitLab artifact，裸 curl 返回
+`418`，导致只出 `.ipk`；而 `pack.sh` 在没有 apk 工具时会提前退出，
+连公钥导出也跳过，于是 `.apk` 与 `flowtls.pem` 一起缺失。
+OpenWrt 25.12 用 apk-tools 3.x，2.x 的 `mkpkg` 参数集不同，所以钉在 3.x。
+
 ## 2026-11-15 22:45 (北京时间)
 
 ### 发布：v1.14.4-rev.5（Windows 自动放行防火墙，用户零配置）
