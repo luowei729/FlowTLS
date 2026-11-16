@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## 2026-11-17 03:54 (北京时间)
+
+### 部署：生产 8443 从 rev.3 换成 rev.9
+
+**wire format 未改动**。这是部署记录，没有改协议代码。
+
+- 服务端：停掉 `sing-box-rev3`，`./sing-box-rev9 run -c server.json`。
+  配置不写 `ip_id_mark`，启动日志里的规则是 `0xf300`（密码派生）。
+  进程确认只剩 rev.9。rev.3 二进制还留在 `/root/flowtls/sing-box-rev3`，
+  没有删除文件，只是不再运行。
+- 设备：补丁包 `1.14.4-r8` 升到 `1.14.4-r9`，`passwall-flowtls status` 为完整。
+  节点 `cfg331c7e` 里的 `ip_id_mark=7687` 已删除，生成配置不再带这个字段，
+  客户端 nft 链同样是 `0xf300`。
+  `/usr/bin/sing-box` 换成 rev.9，旧文件备份为 `/usr/bin/sing-box.rev8bak`。
+  PassWall 的 `bin/sing-box` 是指向它的符号链接。
+- 验证：经 PassWall `127.0.0.1:2001` 连续 20 次 `generate_204`，**20/20**。
+
 ## 2026-11-17 03:40 (北京时间)
 
 ### 发布：v1.14.4-rev.9，作废 v1.14.4-rev.8
