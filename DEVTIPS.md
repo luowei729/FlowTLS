@@ -4451,3 +4451,40 @@ ip_id_mark 派生）
 
 顺带一条**不用**拦的：多个用户用同一个 password 只是 authID 相同、
 日志里的名字变成后一个，功能上完全正常（同一份凭据），所以不做校验。
+
+### 150. 升级服务端时必须先杀旧进程——AF_PACKET 允许重复绑同一端口
+
+`AF_PACKET` 没有 `SO_REUSEADDR` 那种互斥语义，**两个进程可以同时绑
+`ETH_P_IP` 并各自收到每一份包**。所以「新版本先起、再停旧版本」的升级方式
+会得到两个服务端同时响应同一个 SYN：各回一个 SYN-ACK（IP ID 标记、
+TCP 序号都不同），客户端的伪 TCP 层只认一个，另一个变成持续的乱序/重复包，
+表现为**随机比例**的连接失败。这种失败在服务端日志里完全看不出来
+（两个进程都认为自己正常）。
+
+查法：`ps w | grep "[s]ing-box run"` 看有没有两个 `-c` 指向同一个端口；
+`ss -lunp | grep 8443` 看不到两个（raw 层不占端口）**不能**作为没重复的依据。
+升级流程必须是：**先 `kill -9` 旧进程 → 确认进程数 0 → 再起新进程**。
+
+### 151. `ip_id_mark` 两端必须逐位一致，rev.8 起的正确做法是两边都别配
+
+客户端会用它给伪造 SYN 的 IP ID 置高字节标记，服务端**只认**这个标记
+（`(ip_id & 0xFF00) == mark`）。两端不一致时：服务端 nft 规则不命中 →
+伪造 SYN **不被 DROP**，于是落到本机内核，被 conntrack / masquerade
+接住并回 RST，症状是「有时通、有时通不了」而不是「完全不通」。
+
+rev.8 之后 `ip_id_mark` 由 password 派生（`DeriveIPIDMark`），所以两端
+**都不要写** `ip_id_mark` 就是一致的。要写就必须两边写同一个值。
+PassWall 节点里以前手工填的 `ip_id_mark` 一定要删掉，否则会覆盖派生值
+（补丁包的 `flowtls_outbound.lua` 现在会强制 `result.ip_id_mark = nil`）。
+
+### 152. 跨 SSH 用 `pkill -f` 会把自己的 shell 一起杀掉
+
+`ssh host 'pkill -f sing-box'` 里，远端 shell 的命令行本身就含有
+`sing-box` 这个字符串，`pkill -f` 匹配到自己 → 连接被自己中断，
+命令后半段永远不执行，看起来像「卡住」或「没输出」。
+
+正确写法：`pgrep -x sing-box-rev8`（按进程名精确匹配），或方括号技巧
+`pkill -f "[s]ing-box run"`。同理，设备上清理残留测试客户端**不要**用
+宽泛的 `pkill -f "sing-box run -c /tmp"`——PassWall 的实例配置也写在
+`/tmp/etc/passwall/` 下，会被一起杀掉导致设备断网（本次已踩过）。
+用精确的文件名模式，例如 `pgrep -f "/tmp/[a-z0-9]*\.json"`。
