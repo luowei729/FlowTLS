@@ -321,18 +321,33 @@ jobs:
       - name: 取 apk 打包工具
         run: |
           set -xeuo pipefail
-          # apk v3 的容器是 ADB 格式，自己实现不划算。
-          # 用预编译好的 apk-tools 静态二进制（与本地打包用的是同一份）。
-          # **注意**：SDK 里那个 apk 是 shell wrapper，依赖 host/lib 下
-          # 98 个共享库，单独提取出来无法运行（DEVTIPS 已记）。
+          # apk v3 的容器是 ADB 格式，自己实现不划算，用官方静态二进制。
+          #
+          # 三个来源都试过，只有第三个能用：
+          #   1. OpenWrt SDK 的 staging_dir/host/bin/apk —— 是个 224 字节的
+          #      shell wrapper，靠 lib/ld-linux 加载 host/lib 下 98 个 .so，
+          #      单独提取必然跑不起来（DEVTIPS 已记）；
+          #   2. gitlab.alpinelinux.org 的 build-static artifact ——
+          #      裸 curl 返回 418（GitLab 用它拦未认证/爬虫）；
+          #   3. dl-cdn.alpinelinux.org 的 apk-tools-static 包 —— 可用，
+          #      而且它是 gzip tar（不是 ADB），本地 tar -xzf 就能取出
+          #      sbin/apk.static，静态链接、零依赖。
+          #
+          # 版本要说清：OpenWrt 25.12 用的是 apk-tools 3.x，
+          # 所以取 edge 的 3.x，不要用 2.x（mkpkg 的参数集不同）。
           mkdir -p /tmp/apktool
-          url=https://gitlab.alpinelinux.org/alpine/apk-tools/-/jobs/artifacts/master/raw/apk.static?job=build-static
-          if ! curl -fsSL --max-time 120 -o /tmp/apktool/apk "$url"; then
-            echo '静态 apk 工具取不到，本次只出 .ipk（补丁功能不受影响）' >&2
+          base=https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64
+          pkg=$(curl -fsSL --max-time 60 "$base/" \
+            | grep -oE 'apk-tools-static-3\.[0-9.]+-r[0-9]+\.apk' | sort -uV | tail -n 1)
+          if [ -z "$pkg" ]; then
+            echo '取不到 apk-tools-static，本次只出 .ipk（补丁功能不受影响）' >&2
             rm -rf /tmp/apktool
             exit 0
           fi
-          chmod 755 /tmp/apktool/apk
+          curl -fsSL --max-time 180 -o /tmp/apktool/pkg.apk "$base/$pkg"
+          tar -xzf /tmp/apktool/pkg.apk -C /tmp/apktool
+          install -m 755 /tmp/apktool/sbin/apk.static /tmp/apktool/apk
+          rm -rf /tmp/apktool/pkg.apk /tmp/apktool/sbin /tmp/apktool/lib
           /tmp/apktool/apk --version
 
       - name: 打包
