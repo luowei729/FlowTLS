@@ -1,5 +1,232 @@
 # CHANGELOG
 
+## 2026-11-18 02:10 (北京时间)
+
+### 发布：v1.14.4-rev.10
+
+**wire format 未改动。**
+
+rev.10 相对 rev.9 只有挂死处理，没有协议变化：
+
+- 写方向连续 8 秒零进展，只放弃这一条流，不拆整条通道。
+- 有进展的写入当成功，不再误杀正常下载。
+- 本地侧或目标侧不读时，给被写的那一端加同样的零进展上限。
+- 收包队列从 8192 加到 16384，装得下 16MB 连接级接收窗口。
+- 开新流写地址帧固定 8 秒超时，死连接不再被无限复用。
+- 补 `CloseWrite` / `CloseRead`，关闭时唤醒卡在流控上的写。
+
+发送路径没有加 `SO_SNDTIMEO`。那一版部署后下载变慢，已撤回。
+
+## 2026-11-18 01:50 (北京时间)
+
+### 修复：本地侧不读时也只放弃这一条流
+
+**wire format 未改动。发送超时与接收队列深度未改。**
+
+01:28 的真机记录和之前不同：透明代理 1041 上 5 条连接的内核**收队列**
+合计堆到约 6MB，发队列是 0，持续约 100 秒才自己清空。
+数据已经到了本机，卡在 relay 把 QUIC 流写进本地 TCP。
+浏览器停读时这个 `Write` 堵在内核里，01:30 加在 QUIC 流 `Write` 上的
+8 秒超时根本不会被调用，接收窗口也就还不回去。
+
+#### 改动
+
+判据与写方向相同，也与 hysteria 的 `TCPStallTimeout`（PR #1703，默认 10 秒）
+相同：一次写入连续 8 秒零进展才放弃，有字节出去就重新计时。
+
+- 客户端 `StreamConn.GuardLocalWrite` 包住本地入口连接。
+  超时关闭这一条 QUIC 流（`CancelRead` 归还接收窗口）。
+- 服务端 `streamConn.GuardLocalWrite` 包住 dial 出去的目标连接，
+  处理「客户端上传、目标不读」。
+- `sing-box/route/conn.go` 在两端都是 `net.Conn` 的地方做类型断言。
+  没有这个方法的协议原样返回，行为不变。
+- 包装转发 `CloseWrite` / `CloseRead`，不让它盖住内层的半关闭。
+
+## 2026-11-18 01:30 (北京时间)
+
+### 调整：零进展只放弃这一条流，不再拆整条通道
+
+**wire format 未改动。**
+
+01:05 那版在写方向连续 8 秒零进展时关闭整条 QUIC 通道。
+真机（01:11:43 到 01:12:39，透明代理 1041）确认它能自愈，
+但自愈的方式是把同通道上的约 60 条连接一起拆掉再重连，
+从积压出现到清空用了 56 秒，用户看到全部页面一起停。
+
+流控是两级的：每条流 4MB，整条连接 16MB。一条流的对端不读，
+卡住的只是它自己那 4MB，其它流还能发。
+
+#### 改动
+
+`flowtls/quic/client.go` 的 `StreamConn.Write`：零进展时
+`CancelWrite` 这一条流（发 RESET_STREAM，对端归还这条流占的窗口），
+不再调用 `Client.Close()`。relay 只关掉这一对连接，
+浏览器重试这一个请求，其它下载不停。
+
+`n > 0` 仍当成功返回，规则不变。服务端本来就是只放弃单流，无需改。
+
+## 2026-11-18 01:05 (北京时间)
+
+### 修复：写方向连续零进展时通道不重建（不走 haproxy 也会卡）
+
+**wire format 未改动。发送超时与接收队列深度未改。**
+
+不经 haproxy、直接走透明代理（全局进程，入口 1041，出站 154.19.186.38）
+同样卡死。监控记录（`/tmp/mon.log`）：
+
+```
+00:45:46 起 4 条连接的 Recv-Q 冻住：203KB、266KB、565KB 停在 ESTABLISHED，
+         757KB 停在 CLOSE_WAIT
+之后两分钟这 4 个数字一个字节不动，总积压每 3 秒涨约 530 字节
+00:47:51 全部消失，通道恢复
+```
+
+数据已经到了 sing-box 的内核缓冲里，但写方向堵在流控窗口上，
+relay 不返回，所以没人读。保活 ACK 仍在流动，30 秒 idle 不触发。
+
+#### 改动
+
+`StreamConn.Write`（客户端）与 `streamConn.Write`（服务端）：
+每次写入限时 8 秒。
+
+- `n > 0`：有进展，**当成功返回**。调用方继续写剩余部分。
+  这一条是上次事故的修正：把有进展的超时当错误，会在第 8 秒
+  掐断正常下载。
+- `n == 0`：连续 8 秒零进展。两端都只 `CancelWrite` 放弃这一条流，
+  让对端归还这条流占的窗口。不关整条通道：01:30 已确认拆通道会让
+  同通道上的所有下载一起中断。
+
+单测 `TestPartialWriteIsNotAnError` 钉住「有进展不当失败」。
+
+## 2026-11-18 00:25 (北京时间)
+
+### 修复：开新流写地址帧没有超时，死连接被无限复用
+
+**wire format 未改动。数据面的 Write 不加超时。**
+
+三边都换成新版后，无限刷新仍然卡死。这次有完整的 goroutine 栈：
+
+```
+客户端（端口 2002）：39 个协程堵在 SendStream.write（流控窗口为 0）
+                    38 个堵在 ReceiveStream.readImpl（在等数据）
+                    发送队列为空，recvLoop 没有堵
+服务端（154.19.186.38）：同一时刻只有 1 条 QUIC 连接，
+                    AcceptStream 空闲，sendQueue 与 txLoop 都在等数据
+```
+
+也就是包发出去了，窗口更新没回来，而客户端没有任何超时能发现这件事：
+保活 ACK 还在流动，QUIC 的 30 秒 idle 永不触发，`Outbound.channel`
+就一直把新请求交给这条死连接。
+
+#### 改动
+
+`flowtls/quic/client.go` 的 `DialConn`：写地址帧固定用
+`openStreamTimeout`（8 秒），不再依赖调用方的 ctx 有没有 deadline。
+超时就异步 `Close()` 整条通道，`Client.Done()` 触发后下一次
+`channel()` 重建。
+
+只限制地址帧（几十字节）。数据 `Write` 的超时是 01:05 之后另加的，
+而且只在连续零进展时放弃这一条流，有进展的写入不当失败。
+
+## 2026-11-17 23:55 (北京时间)
+
+### 撤回 8 秒写超时：它在取消正常的下载流
+
+**wire format 未改动，发送超时未加。**
+
+23:40 那版给每次 `Write` 套了 8 秒上限，超时就 `CancelWrite`。
+部署后无限刷新仍然卡死，而且日志把原因写死了：
+
+```
+15:45:47 ERROR connection download closed: stream 856 canceled by local with error code 0
+15:45:49 ERROR connection download closed: stream 860 canceled by local with error code 0
+15:46:06 ERROR connection download closed: stream 876 canceled by local with error code 0
+```
+
+每条都**正好卡在 8 秒**，取消的是**下载方向**。也就是说客户端的写超时
+在误杀还没写完的正常流；`CancelWrite` 只停写方向，服务端已发出、
+还在接收窗口里的数据不会被归还。随后套接字队列是空的、新请求全部超时——
+16MB 窗口被占满后释放不了。
+
+#### 改动
+
+- 删除两端的 `writeStallTimeout` 与 `Write` 覆盖，写路径回到 quic-go 原样。
+- `rxQueueDepth` 8192 → 16384。8192 × 1332 ≈ 10.9MB，小于 16MB 连接窗口：
+  队列先满 → `deliver` 阻塞 → `recvLoop` 停 → 不再发 ACK →
+  对端等不到 `MAX_DATA`，窗口永远不释放。
+  16384 × 1332 ≈ 21.8MB，留 36% 余量。
+- `flowtls/quic/window_test.go` 加跨包断言：收包队列容量必须 ≥ 连接窗口。
+
+半关闭（`CloseWrite` / `CloseRead`）与关闭时唤醒阻塞写保留。
+
+## 2026-11-17 23:40 (北京时间)
+
+### 修复：流控窗口长期为 0 时 Write 永不返回，半关闭走不到
+
+**wire format 未改动。发送超时、发送队列、`rxQueueDepth`（8192）都没动。**
+
+23:25 那版只在 `Close` / `CloseWrite` 里唤醒阻塞的写。部署到设备后
+无限刷新仍然卡死，因为**写协程堵在 `Write` 里，复制循环根本走不到关闭**：
+
+```
+端口 2002：4 × FIN_WAIT2，Recv-Q 分别约 6.2MB / 6.1MB / 6.1MB / 6.0MB
+对端 LAST_ACK / CLOSING 的 Send-Q 合计约 8.8MB
+3 秒内字节数与状态完全不动，ESTABLISHED 归零
+```
+
+#### 改动
+
+`StreamConn.Write` 与 `streamConn.Write` 给每次写入套 8 秒上限
+（`writeStallTimeout`）。只有「一个字节都没写出去且等满 8 秒」才
+`CancelWrite`：发 `RESET_STREAM`，对端停发并归还连接级窗口。
+有部分进展时原样返回已写字节，不误伤正常下载。
+
+单测 `TestWriteGivesUpWhenWindowStaysClosed`：窗口内写入成功，
+窗口耗尽后 `Write` 在时限内返回，放弃后的再次写入不再阻塞。
+
+## 2026-11-17 23:25 (北京时间)
+
+### 修复：流关闭不唤醒卡在流控上的写，测速时连接停在半关闭
+
+**wire format 未改动，版本号未动。**
+
+上一版（`6461a12e` + `b81bfa11`）用「发送超时 3 秒 + 队列满 8 秒关会话
++ `rxQueueDepth` 8192 → 16384」修挂死，部署后**下载速度明显变差**，
+已在 `53ecdca5` 整批撤回。这次只改流的关闭路径，
+发送超时、发送队列、`rxQueueDepth`（仍是 8192）都没动。
+
+#### 现象
+
+上传测速的同时刷新页面开下载，节点进程还活着、端口还在监听，
+但新请求全部超时。现场（端口 2002）：
+
+```
+4 × CLOSE_WAIT + 4 × FIN_WAIT2，Recv-Q 合计约 2.4MB 数分钟不动
+ESTABLISHED = 0
+```
+
+#### 根因
+
+两层，缺一不可：
+
+1. `StreamConn` / `streamConn` 没有 `CloseWrite`。sing-box 的 relay
+   （`route/conn.go`）用它判断能否半关闭；没有就走 `Close()`，
+   一个方向结束就把整条流关掉，另一个方向的数据没人读。
+2. quic-go 的 `Stream.Close()` **不唤醒**堵在流控窗口上的 `Write`
+   （`send_stream.go` 写明只有写超时会唤醒）。对端 4MB 接收窗口被没读走的
+   数据占满后，写协程永远不返回，收尾逻辑根本走不到。
+
+#### 改动
+
+- `flowtls/quic/client.go`、`sing-box/protocol/flowtls/inbound.go`：
+  补 `CloseWrite` / `CloseRead`；`Close` 与 `CloseWrite` 之后设一个
+  **已经过去**的写超时，只唤醒被堵住的那次 `Write`。
+  已经写入的数据和 FIN 不受影响。这是 hysteria2 的
+  `clientConn.Close` / `serverConn.Close` 的同一做法。
+- `flowtls/quic/duplex_test.go`：用一条真实 quic-go 流把窗口耗尽，
+  断言 `Close` 和 `CloseWrite` 都能在时限内唤醒堵住的写。
+  实测两条都在 0.2 秒内返回。
+
 ## 2026-11-17 13:05 (北京时间)
 
 ### 修补：r9 补丁包修「排序后 haproxy 连不上」（不升版本号）

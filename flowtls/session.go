@@ -25,11 +25,39 @@ import (
 	"time"
 )
 
-// rxQueueDepth 是收包通道深度，与 Rust `mpsc::channel(8192)` 一致。
+// rxQueueDepth 是收包通道深度。
 //
-// Rust 的收包线程用 `blocking_send`：队列满时阻塞，由内核 socket 缓冲区
-// 兜底丢包（QUIC 会重传）。Go 侧同样用阻塞发送，语义一致。
-const rxQueueDepth = 8192
+// **必须装得下整个 QUIC 连接级接收窗口**（quic 包的 receiveWindow = 16MB），
+// 即 rxQueueDepth × 最小包长 ≥ 16MB。否则是死锁而不是普通背压：
+//
+//	对端按窗口把 16MB 发满
+//	→ 队列（8192 × 1332 ≈ 10.9MB）先满
+//	→ deliver 阻塞（这里不能丢包，丢了 quic-go 会误判已交付）
+//	→ recvLoop 停：不再读 socket，也不再发纯 ACK
+//	→ 对端的发送窗口等不到 MAX_DATA，永远不释放
+//	→ 这条连接上的新流全部打不开，只能重启进程
+//
+// 真机（2026-11-17，端口 2002，无限刷新测速页）：
+// 日志里每条都是「connection download closed: stream N canceled by local
+// with error code 0」，随后新请求全部超时，而套接字队列是空的——
+// 数据堵在用户态队列里，内核侧看不出来。
+//
+// 16384 × 1332 ≈ 21.8MB，比 16MB 窗口多 36%。
+// 客户端只有 1 条会话；服务端按会话计。
+// **不要照抄 Rust 的 8192**：Rust 侧 quinn 的窗口与这里不同。
+const rxQueueDepth = 16384
+
+// minQUICPayload 是一个 QUIC 包的最小净载荷（保守值）。
+//
+// 真实载荷通常更大，所以按它算出的容量是上界，
+// 拿去和接收窗口比不会把不够装误判成够装。
+const minQUICPayload = 1332
+
+// RxQueueCapacity 返回收包队列能缓存的最大字节数。
+//
+// 导出是为了让 quic 包的单测能断言「队列容量 ≥ 连接级接收窗口」。
+// 两个值分属不同的包，只写在注释里的话，以后改窗口的人不会想起改队列。
+func RxQueueCapacity() int { return rxQueueDepth * minQUICPayload }
 
 // Session 是一条伪造 TCP 连接，实现 quic-go 需要的 net.PacketConn。
 type Session struct {

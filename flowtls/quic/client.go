@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,17 @@ import (
 // 取 8 秒：超过它几乎必然是「连接已死但 quic-go 尚未检测到」，
 // 此时应尽快报错让上层重建，而不是耗光调用方的全部预算。
 const openStreamTimeout = 8 * time.Second
+
+// localWriteStallTimeout 是「写本地连接连续零进展」的上限。
+//
+// 真机（2026-11-18 01:28，透明代理 1041）积压全在内核收队列，发队列为 0：
+// 数据已经从 QUIC 读出来，卡在 relay 写本地 TCP。浏览器停读时这个 Write
+// 堵在内核里，QUIC 流上的写超时根本不会触发，接收窗口也就还不回去。
+//
+// 与 QUIC 写超时同一标准：一次写入只要有字节出去就重新计时，
+// 慢但一直在收的连接不会被关。8 秒只是「这一次完全没进展」的上限，
+// 不是整条传输的寿命。hysteria 的 TCPStallTimeout 用的是同一判据（默认 10 秒）。
+const localWriteStallTimeout = 8 * time.Second
 
 // ClientOptions 是客户端参数。
 type ClientOptions struct {
@@ -180,13 +192,30 @@ func (c *Client) DialConn(ctx context.Context, target string, port uint16) (net.
 	if err != nil {
 		return nil, fmt.Errorf("打开 QUIC 流失败: %w", err)
 	}
-	// 写地址帧必须设 deadline：quic-go 的 Stream.Write 不看 ctx，
-	// 连接「已死但未检测到」时会挂到 idle 超时（30 秒）。
-	if dl, ok := ctx.Deadline(); ok {
-		_ = stream.SetWriteDeadline(dl)
-	}
+	// 写地址帧必须有自己的上限，不能只看调用方的 ctx。
+	//
+	// quic-go 的 Stream.Write 不看 ctx，而测速页面这类请求的 ctx
+	// 没有 deadline。连接的发送窗口一旦被占满（对端不再发 MAX_DATA），
+	// 这一写就永远堵在 writeChan 上。更糟的是保活 ACK 还在流动，
+	// QUIC 的 30 秒 idle 永不触发，Outbound.channel 就一直复用这条死连接，
+	// 新请求全部超时，直到重启进程。
+	//
+	// 真机（2026-11-18 00:14，端口 2002）：
+	// 39 个协程堵在 SendStream.write，38 个堵在 ReceiveStream.readImpl，
+	// 发送队列是空的、recvLoop 没堵；对端服务端同一时刻完全空闲。
+	// 也就是说包发出去了，窗口更新没回来，而客户端没有任何超时能发现这件事。
+	//
+	// 只限制地址帧（几十字节）。超时就关整条通道：closeCh 关闭后
+	// ReadFrom 返回，Client.Done() 触发，下一次 channel() 会重建。
+	// **不给后续的数据 Write 加超时**——那一版会在第 8 秒把正常的
+	// 下载流 CancelWrite 掉，窗口反而更释放不了。
+	_ = stream.SetWriteDeadline(time.Now().Add(openStreamTimeout))
 	if _, err := stream.Write(frame); err != nil {
 		_ = stream.Close()
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			// 异步关：这里正用着 conn，同步 Close 要等传输层退出，会自锁。
+			go func() { _ = c.Close() }()
+		}
 		return nil, fmt.Errorf("写地址帧失败: %w", err)
 	}
 	// 清掉写 deadline：后续数据由调用方的读写循环自己管理超时。
@@ -209,20 +238,105 @@ type StreamConn struct {
 	closeOnce     sync.Once
 }
 
-var _ net.Conn = (*StreamConn)(nil)
+var (
+	_ net.Conn = (*StreamConn)(nil)
+	// sing-box 的 relay 用 N.WriteCloser / N.ReadCloser 判断能否半关闭
+	// （route/conn.go）。Go 是结构化匹配，这里不导入 sing-common，
+	// 只要方法集对上就满足那两个接口。缺了就是数据面 bug，见 CloseWrite。
+	_ interface{ CloseRead() error }  = (*StreamConn)(nil)
+	_ interface{ CloseWrite() error } = (*StreamConn)(nil)
+)
 
-func (c *StreamConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
-func (c *StreamConn) Write(p []byte) (int, error) { return c.stream.Write(p) }
+func (c *StreamConn) Read(p []byte) (int, error) { return c.stream.Read(p) }
+
+// Write 发送数据。「连续 8 秒零进展」只放弃这一条流，不拆整条通道。
+//
+// 流控有两级：每条流 4MB，整条连接 16MB。一条流的对端不读，
+// 卡住的是它自己的 4MB，同连接上的其他流还能发。
+//
+// 上一版在这里关闭整条通道：一条上传卡住，所有正在进行的下载
+// 一起中断，用户看到的是「卡一下然后全部重来」。
+// 真机记录（2026-11-18 01:12，透明代理 1041）：积压从出现到清空用了
+// 56 秒，期间 60 条连接全部受影响。
+//
+// 现在只 CancelWrite 这一条流：
+//   - 发 RESET_STREAM，对端停掉对应方向并归还这条流占的窗口；
+//   - relay 收到错误后关掉这一对连接（浏览器会重试这一个请求）；
+//   - 同通道上的其他下载原样继续，不重建 QUIC 连接。
+//
+// n > 0 仍当成功返回。把有进展的超时当错误会掐断正常下载
+// （2026-11-17 23:45：每条都正好死在第 8 秒）。
+func (c *StreamConn) Write(p []byte) (int, error) {
+	_ = c.stream.SetWriteDeadline(time.Now().Add(openStreamTimeout))
+	n, err := c.stream.Write(p)
+	_ = c.stream.SetWriteDeadline(time.Time{})
+	if err == nil || n > 0 {
+		return n, nil
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		// 放弃写方向。读方向不动：这条流可能还有没读完的响应，
+		// 交给 relay 的另一个协程读完再收尾。
+		c.stream.CancelWrite(0)
+		return 0, fmt.Errorf("flowtls: 写方向连续 %v 零进展，放弃该流: %w", openStreamTimeout, err)
+	}
+	return 0, err
+}
+
+// unblockStuckWrite 唤醒卡在流控窗口上的 Write。
+//
+// quic-go 的 Stream.Close() 只把 finishedWriting 置位并安排发 FIN，
+// **不唤醒**正堵在 `<-writeChan` 上等窗口的 Write；SetWriteDeadline 会
+// （send_stream.go 原文："and any currently-blocked Write call"）。
+//
+// 窗口为 0 在并发下很容易成立：对端那条流的 4MB 接收窗口被没读走的数据占满。
+// 于是 relay 的写协程不返回 → connectionCopy 走不到收尾 → 没人读 →
+// 窗口永不恢复 → 写协程永远醒不过来。真机上就是端口 2002 的
+// FIN_WAIT2 / CLOSE_WAIT 成对堆积、Recv-Q 数分钟不动、ESTABLISHED 归零。
+//
+// 设一个**已经过去**的 deadline 只让被堵住的那次 Write 返回错误。
+// 已经拷进 STREAM 帧的数据和即将发出的 FIN 都不受影响：deadline 只在
+// write() 的等待循环里检查，不碰发送队列。hysteria2 的
+// clientConn.Close / serverConn.Close 用的是同一做法。
+//
+// **不动发送超时、不动队列深度**：上一版为了防挂死加了 SO_SNDTIMEO
+// 并把 rxQueueDepth 从 8192 加到 16384，部署后下载速度明显变差，已撤回。
+func (c *StreamConn) unblockStuckWrite() {
+	_ = c.stream.SetWriteDeadline(time.Now())
+}
+
+// CloseWrite 只关写方向（对应 TCP 的 FIN，读方向继续）。
+//
+// sing-box 的 relay 在一个方向结束时这样收尾（route/conn.go）：
+//
+//	if isDuplex { duplexDst.CloseWrite() } else { destination.Close() }
+//
+// 没有 CloseWrite 时走 Close()：上传一结束整条流就被关掉，
+// 下载方向还没读完的数据没人收，连接停在半关闭状态。
+func (c *StreamConn) CloseWrite() error {
+	err := c.stream.Close()
+	// 必须在 Close 之后：被唤醒的 Write 看到 finishedWriting 才会返回，
+	// 而不是继续阻塞。
+	c.unblockStuckWrite()
+	return err
+}
+
+// CloseRead 只关读方向：发 STOP_SENDING，让对端停写这条流。
+func (c *StreamConn) CloseRead() error {
+	c.stream.CancelRead(0)
+	return nil
+}
 
 // Close 关闭双向流。
 //
 // 必须先 CancelRead 再 Close：只 Close 只关写方向，服务端会以为我们还在读，
 // 继续往这条流写数据，直到背压水位耗尽才放弃。
+// 最后唤醒可能卡在流控上的写协程，原因见 unblockStuckWrite。
 func (c *StreamConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		c.stream.CancelRead(0)
 		err = c.stream.Close()
+		c.unblockStuckWrite()
 	})
 	return err
 }
@@ -238,6 +352,58 @@ func (c *StreamConn) SetDeadline(t time.Time) error {
 }
 func (c *StreamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
 func (c *StreamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
+
+// GuardLocalWrite 包住 relay 写入的本地入口连接。
+//
+// sing-box 的下载拷贝是 Copy(本地, 本连接)。本地（浏览器）停读时，
+// 这一写堵在内核发送缓冲里，本连接的 Read/Write 都不会再被调用，
+// 所以超时只能加在本地这一端。
+//
+// 连续 localWriteStallTimeout 一个字节都写不进本地，就关闭本条 QUIC 流：
+// CancelRead 让对端停发并归还这条流占的接收窗口。其它流不动。
+func (c *StreamConn) GuardLocalWrite(local net.Conn) net.Conn {
+	return &stalledLocalConn{Conn: local, stream: c}
+}
+
+// stalledLocalConn 只改写的超时，其余全部交给内层连接。
+type stalledLocalConn struct {
+	net.Conn
+	stream *StreamConn
+}
+
+func (c *stalledLocalConn) Write(p []byte) (int, error) {
+	// 每次写入重新计时。上一次写出去了多少，不累加到这一次上，
+	// 所以慢但一直在收的连接不会被关。
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(localWriteStallTimeout))
+	n, err := c.Conn.Write(p)
+	_ = c.Conn.SetWriteDeadline(time.Time{})
+	if err == nil || n > 0 {
+		return n, nil
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		_ = c.stream.Close()
+		return 0, fmt.Errorf("flowtls: 写本地连接连续 %v 零进展，放弃该流: %w", localWriteStallTimeout, err)
+	}
+	return 0, err
+}
+
+// CloseWrite 转给内层。
+//
+// 不转的话这个包装盖住了本地连接自己的 CloseWrite，sing-box relay
+// 的类型断言失败，一个方向结束就会把整条连接关掉。
+func (c *stalledLocalConn) CloseWrite() error {
+	if w, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return w.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *stalledLocalConn) CloseRead() error {
+	if r, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return r.CloseRead()
+	}
+	return nil
+}
 
 // addrForLog 生成一个仅用于日志展示的地址。
 func addrForLog(host string, port uint16) net.Addr {

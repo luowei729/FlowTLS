@@ -315,6 +315,32 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
   会被 uci 换掉。由 `repair`/`apply` 给 FlowTLS 节点固定名，见 DEVTIPS 155。
   内核无改动。
 
+### 发布 rev.10（2026-11-18 02:10）
+
+rev.10 = rev.9 + 挂死处理。wire format 未改。
+发送路径不加 `SO_SNDTIMEO`。内容见 CHANGELOG 同日条目。
+
+### 读方向停滞也只放弃单流（2026-11-18 01:50）
+
+01:30 的写超时覆盖不了「数据已到本机、本地不读」。
+01:28 的收队列堆到约 6MB、发队列为 0，持续约 100 秒。
+
+`StreamConn` 和 `streamConn` 增加 `GuardLocalWrite`，由 `route/conn.go`
+包住真正被写的那一端（客户端包本地入口，服务端包 dial 出去的目标）。
+连续 8 秒零进展只关这一条流。发送路径仍不加 `SO_SNDTIMEO`。
+详见 DEVTIPS 163。
+
+### 挂死修复重做：只动流关闭，不动发送路径（2026-11-17 23:25）
+
+上一版（`6461a12e`、`b81bfa11`）用发送超时和加大 `rxQueueDepth` 修挂死，
+部署后下载速度变差，已撤回并重置到 `53ecdca5`。
+
+重做后只改两处：`flowtls/quic/client.go` 的 `StreamConn` 与
+`sing-box/protocol/flowtls/inbound.go` 的 `streamConn`。
+补 `CloseWrite` / `CloseRead`，并在关闭后设一个已过期的写超时，
+唤醒卡在流控窗口上的 `Write`。`rxQueueDepth` 保持 8192，
+发送 fd 不加 `SO_SNDTIMEO`。详见 DEVTIPS 157。
+
 ### 正式发行流程（2026-11-14 20:19，手动触发）
 
 - 开发者手动同步 sing-box 官方正式 Release 源码及依赖，不自动拉取或更新源码。

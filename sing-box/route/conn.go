@@ -157,8 +157,32 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
+	// 下载方向是 Copy(入口, 远端)。入口不读时这一写堵在内核里，
+	// 远端协议自己的超时都看不见（2026-11-18 01:28：积压全在收队列）。
+	// 谁实现了 GuardLocalWrite 谁负责超时后只放弃自己那条流；
+	// 没实现的协议原样返回，行为与改动前一致。
+	conn = guardStalledWrite(remoteConn, conn)
+	// 上传方向是 Copy(远端, 入口)。服务端这里的「远端」是它 dial 出去的目标，
+	// 目标不读会占住连接级接收窗口。入口是 QUIC 流时由它来包目标连接。
+	remoteConn = guardStalledWrite(conn, remoteConn)
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+}
+
+// stalledDownloadGuard 是远端连接用来包住本地入口的可选能力。
+//
+// 放在 route 而不是某个协议里：NewConnection 同时持有两端，
+// 协议的 DialContext 拿不到本地那一端。不是 flowtls 的连接没有这个方法，
+// 类型断言失败就原样返回，行为与改动前一致。
+type stalledDownloadGuard interface {
+	GuardLocalWrite(local net.Conn) net.Conn
+}
+
+func guardStalledWrite(watcher, watched net.Conn) net.Conn {
+	if g, ok := watcher.(stalledDownloadGuard); ok {
+		return g.GuardLocalWrite(watched)
+	}
+	return watched
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

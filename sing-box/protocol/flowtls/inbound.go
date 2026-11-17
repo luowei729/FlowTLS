@@ -17,6 +17,7 @@ package flowtls
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -595,7 +596,127 @@ type streamConn struct {
 func (c *streamConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *streamConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
-var _ net.Conn = (*streamConn)(nil)
+// writeStallTimeout 与客户端的 openStreamTimeout 同值。
+// 服务端是上传方向的写端，客户端不再读时同样会把整条连接的发送窗口占死。
+const writeStallTimeout = 8 * time.Second
+
+// targetWriteStallTimeout 是「写 dial 出去的目标连续零进展」的上限。
+//
+// 上传方向 relay 把 QUIC 流写进目标连接。目标停读时这一写堵在内核里，
+// 本流的 Read 不会再被调用，客户端那 4MB 接收窗口就一直被占着。
+// 判据与客户端写本地同一套：一次写入有字节出去就重新计时。
+const targetWriteStallTimeout = 8 * time.Second
+
+// Write 与客户端 StreamConn.Write 同一规则：零进展持续一个超时就放弃，
+// 有进展就当成功返回。服务端没有「整条通道重建」这一层（连接是客户端拨进来的），
+// 所以这里只放弃这一条流：CancelWrite 让对端停掉对应方向并释放窗口。
+func (c *streamConn) Write(p []byte) (int, error) {
+	_ = c.Stream.SetWriteDeadline(time.Now().Add(writeStallTimeout))
+	n, err := c.Stream.Write(p)
+	_ = c.Stream.SetWriteDeadline(time.Time{})
+	if err == nil || n > 0 {
+		return n, nil
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		c.Stream.CancelWrite(0)
+		return 0, E.Cause(err, "flowtls: 写方向连续 ", writeStallTimeout, " 零进展，放弃该流")
+	}
+	return 0, err
+}
+
+// unblockStuckWrite 唤醒卡在流控窗口上的 Write。
+//
+// quic-go 的 Stream.Close() 不唤醒阻塞中的 Write，只有写超时会。
+// 设一个已经过去的 deadline 只让那次 Write 返回错误，
+// 已写入的数据和 FIN 不受影响。死锁链条见
+// flowtls/quic/client.go 的 StreamConn.unblockStuckWrite。
+func (c *streamConn) unblockStuckWrite() {
+	_ = c.Stream.SetWriteDeadline(time.Now())
+}
+
+// CloseWrite 只关写方向。
+//
+// 必须显式实现：quic-go 的 Stream 有 Close() 但没有 CloseWrite()，
+// 不实现的话 sing-box relay（route/conn.go）的类型断言失败，
+// 一个方向结束就走 Close() 把整条流关掉。
+func (c *streamConn) CloseWrite() error {
+	err := c.Stream.Close()
+	c.unblockStuckWrite()
+	return err
+}
+
+// CloseRead 只关读方向，让对端停写这条流。
+func (c *streamConn) CloseRead() error {
+	c.Stream.CancelRead(0)
+	return nil
+}
+
+// Close 关闭双向。
+//
+// 嵌入的 Stream.Close() 只关写方向，所以必须覆盖：先 CancelRead 让对端停发，
+// 再 Close 发 FIN，最后唤醒卡在流控上的写协程。
+func (c *streamConn) Close() error {
+	c.Stream.CancelRead(0)
+	err := c.Stream.Close()
+	c.unblockStuckWrite()
+	return err
+}
+
+// GuardLocalWrite 包住 relay 写入的另一端。
+//
+// 服务端的另一端是 dial 出去的目标。客户端上传、目标停读时，
+// 这一写堵在目标连接的内核缓冲里，QUIC 流上的超时都不会被调用，
+// 这条流占的接收窗口就还不回去。
+//
+// 连续 targetWriteStallTimeout 一个字节都写不进目标，就关闭本条流。
+// CancelRead 归还窗口，同连接上的其它流继续。
+func (c *streamConn) GuardLocalWrite(peer net.Conn) net.Conn {
+	return &stalledPeerConn{Conn: peer, stream: c}
+}
+
+// stalledPeerConn 只改写的超时，读、关闭、地址都交给被包的连接。
+type stalledPeerConn struct {
+	net.Conn
+	stream *streamConn
+}
+
+func (c *stalledPeerConn) Write(p []byte) (int, error) {
+	// 每次写入重新计时：有字节出去就当这次成功，慢的目标不会被关。
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(targetWriteStallTimeout))
+	n, err := c.Conn.Write(p)
+	_ = c.Conn.SetWriteDeadline(time.Time{})
+	if err == nil || n > 0 {
+		return n, nil
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		_ = c.stream.Close()
+		return 0, E.Cause(err, "flowtls: 写目标连接连续 ", targetWriteStallTimeout, " 零进展，放弃该流")
+	}
+	return 0, err
+}
+
+// CloseWrite 转给内层。包装不能盖住目标连接自己的半关闭，
+// 否则 relay 在一个方向结束时会把整条连接关掉。
+func (c *stalledPeerConn) CloseWrite() error {
+	if w, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return w.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *stalledPeerConn) CloseRead() error {
+	if r, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return r.CloseRead()
+	}
+	return nil
+}
+
+var (
+	_ net.Conn = (*streamConn)(nil)
+	// 半关闭能力：缺了 relay 就会整条关闭，详见 CloseWrite。
+	_ interface{ CloseRead() error }  = (*streamConn)(nil)
+	_ interface{ CloseWrite() error } = (*streamConn)(nil)
+)
 
 // 屏蔽未使用告警：N 包在本文件里只用于接口断言。
 var _ = N.NetworkName
