@@ -3,6 +3,7 @@
 #
 # 子命令：
 #   apply      幂等注入/刷新补丁（默认）。内容没变化时**不写盘**（省 flash）
+#   repair     修正 FlowTLS 节点的 section 名与 haproxy 引用（apply 也会调）
 #   verify     检查补丁是否在位，返回码 0/1
 #   uninstall  撤销注入，把 PassWall 的三个文件还原成上游内容
 #   status     人类可读的状态摘要
@@ -49,6 +50,7 @@ CMD=$1
 shift
 case "$CMD" in
 	apply) ;;
+	repair) ;;
 	status) ;;
 	verify) ;;
 	uninstall) ;;
@@ -186,6 +188,113 @@ has_marker() {
 	[ -f "$1" ] && grep -qF -e "$MARK_B" "$1" 2>/dev/null
 }
 
+# ------------------------------------------------------- 节点 section 名
+#
+# 为什么必须管这件事：
+# PassWall 的 haproxy 配置（haproxy_config.lbss）是按 **section 名**
+# 记住「这个入口用哪个节点」的。而网页新建的节点在 /etc/config/passwall
+# 里是**匿名** section（只有 `config nodes`，后面没有名字）。
+# uci 给匿名 section 的那些 cfgXXXXXX 名字是**临时的**：每次重写配置
+# （排序、保存、改任何一个字段）都可能换一个。于是 lbss 里存的那个名字
+# 就变成死引用：
+#
+#   haproxy.lua: api.uci_get_c(lbss) 拿到 nil
+#     → 回落成 get_ip_port_from(lbss)
+#     → 服务器地址变成 "cfgXXXXXX"、端口变成空串
+#     → 控制台里出现 M1-cfgXXXXXX:（地址栏上方那个带尾巴冒号的名字）
+#     → 域名解析不出来，后端永远 DOWN，现象是「一改节点顺序就连不上」
+#
+# 修法：把匿名节点改成**显式命名**。名字一旦写进配置文件，uci 就不再
+# 重写它，后面无论怎么排序都不影响 lbss 引用。
+# 顺便把已经失效的 lbss 指回这个节点——只在「本轮恰好一个匿名节点」
+# 且失效值形如 cfgXXXXXX 时才动手，多个匿名节点时无法判断原意，宁可不动。
+
+# node_anon_indexes 输出所有**匿名** nodes section 的下标（对应 @nodes[N]）。
+#
+# 判据用 uci -N export（-N = 不要给匿名 section 起名），匿名的那行就是
+# `config nodes` 后面什么都没有；命名的是 `config nodes 'xxx'`。
+# 不用 grep 找名字，避免名字里带引号/空格时的解析歧义。
+node_anon_indexes() {
+	uci -N export passwall 2>/dev/null | awk '
+		index($0, "config nodes") == 1 {
+			# 前 12 个字符是 "config nodes"，后面还有内容就是显式名字
+			if (substr($0, 13) == "") print n
+			n++
+		}
+	'
+}
+
+# flowtls_node_name 生成一个稳定、合法且不与现有 section 冲突的名字。
+# uci 的 section 名只允许字母、数字、下划线。
+flowtls_node_name() {
+	_i=$1
+	_base=$(uci -q get "passwall.@nodes[$_i].remarks")
+	[ -n "$_base" ] || _base=$(uci -q get "passwall.@nodes[$_i].address")
+	[ -n "$_base" ] || _base="node$_i"
+	_base=$(printf '%s' "$_base" | tr -c 'A-Za-z0-9_' '_' | cut -c1-40)
+	_name="flowtls_$_base"
+	_n=2
+	while [ -n "$(uci -q get "passwall.$_name" 2>/dev/null)" ]; do
+		_name="flowtls_${_base}_$_n"
+		_n=$((_n + 1))
+	done
+	printf '%s' "$_name"
+}
+
+# do_fix_nodes 给 FlowTLS 节点固定名字并修复 haproxy 的死引用。
+# 幂等：节点已经是显式名字时直接返回，一个字节都不写（省 flash）。
+do_fix_nodes() {
+	[ -f /etc/config/passwall ] || return 0
+	_anon=$(node_anon_indexes)
+	[ -n "$_anon" ] || return 0
+
+	# 只改我们自己协议的节点。其他协议的匿名节点不动：用户可能在规则里
+	# 引用了它们的临时名，改名会把那条规则弄断（那不属于本补丁的范围）。
+	_changed=0
+	_renamed=0
+	_new=''
+	# 从大到小改名：@nodes 下标是位置，不是名字；倒序可避免中间出错时
+	# 影响后续下标（改名本身不改变位置，这只是一层保险）。
+	for _i in $(printf '%s\n' $_anon | sort -rn); do
+		[ "$(uci -q get "passwall.@nodes[$_i].protocol")" = flowtls ] || continue
+		_n=$(flowtls_node_name "$_i")
+		if uci -q rename "passwall.@nodes[$_i]=$_n"; then
+			log "已把 FlowTLS 节点改为固定名「$_n」"
+			_changed=1
+			_renamed=$((_renamed + 1))
+			_new=$_n
+		else
+			warn "FlowTLS 节点改名失败（@nodes[$_i] → $_n）"
+		fi
+	done
+	[ "$_renamed" -gt 0 ] || return 0
+	if [ "$_renamed" != 1 ]; then
+		# 多个节点的临时名都变过，lbss 里那个死名字到底指谁已经无法判断。
+		# 改名仍要做（之后不会再变），但引用得让用户自己重选一次。
+		warn "改了 $_renamed 个匿名节点，但无法判断 haproxy 原引用指向哪个；请到 haproxy 页面重新选一次节点"
+		uci -q commit passwall
+		return 0
+	fi
+
+	# 修复失效的 lbss：指向不存在的 section，且形如 uci 的临时名 cfgXXXXXX。
+	# 只在恰好改了一个节点时做（此时那个死名字只可能指它）。
+	for _s in $(uci -q show passwall 2>/dev/null | sed -n 's/^passwall\.\([^.=]*\)\.lbss=.*/\1/p'); do
+		_v=$(uci -q get "passwall.$_s.lbss")
+		[ -n "$_v" ] || continue
+		[ "$_v" = "$_new" ] && continue
+		# 还指向一个存在的 section：不动（那是用户自己选的合法节点）
+		[ -z "$(uci -q get "passwall.$_v" 2>/dev/null)" ] || continue
+		printf '%s' "$_v" | grep -qE '^cfg[0-9a-f]{6}$' || continue
+		if uci -q set "passwall.$_s.lbss=$_new"; then
+			log "已修复 $_s 的节点引用（$_v → $_new）"
+			_changed=1
+		fi
+	done
+
+	[ "$_changed" = 1 ] && uci -q commit passwall
+	return 0
+}
+
 # ---------------------------------------------------------------- apply
 do_apply() {
 	_need=0
@@ -198,6 +307,11 @@ do_apply() {
 	patch_file "$COM"        'return _M'                    "$TMPD/blk_com.lua" || _fail=1
 	patch_file "$OUTBOUND"   '_G.gen_config = gen_config'   "$TMPD/blk_out.lua" || _fail=1
 	patch_file "$SINGBOX_UI" 'api.type_cbi_section(s1, s)'  "$TMPD/blk_ui.lua"  || _fail=1
+
+	# 节点的 section 名必须固定下来，否则一排序 haproxy 就指向死名字。
+	# 放在注入之后：这一步动的是 uci 数据，与文件补丁无关，失败也不该
+	# 让整个 apply 失败（PassWall 本身仍然可用）。
+	do_fix_nodes
 
 	# PassWall 会把「核心版本号」按 stat 元数据缓存在 CACHE_PATH/binver_*。
 	# 我们改了 cmd_version（版本号从 1.14.4-rev.5 变成 1.14.4-r5），
@@ -274,6 +388,17 @@ do_verify() {
 			_bad=1
 		fi
 	done
+	# 节点的 section 名：匿名的那些在排序/保存后会被 uci 换名字，
+	# 而 haproxy 的 lbss 把那个临时名当永久引用存着 → 排序后连不上。
+	if [ -f /etc/config/passwall ]; then
+		_anon_n=$(node_anon_indexes | wc -l)
+		if [ "$_anon_n" = 0 ]; then
+			[ "$CMD" = status ] && printf '  [节点] 已用固定 section 名\n'
+		else
+			[ "$CMD" = status ] && printf '  [节点] 有 %s 个匿名节点，排序后会破坏 haproxy 引用（执行 apply 修复）\n' "$_anon_n"
+		fi
+	fi
+
 	if [ -f /etc/crontabs/root ] && grep -qF "$CRON_TAG" /etc/crontabs/root 2>/dev/null; then
 		[ "$CMD" = status ] && printf '  [自愈] 每 5 分钟\n'
 	else
@@ -290,6 +415,7 @@ do_verify() {
 
 case "$CMD" in
 	apply)     do_apply ;;
+	repair)    do_fix_nodes ;;
 	uninstall) do_uninstall ;;
 	verify|status) do_verify ;;
 esac

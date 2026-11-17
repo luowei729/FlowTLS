@@ -4522,3 +4522,41 @@ rev.8 为了加 `marks` 重排这个字面量，这两行丢了。字段停在 0
 修法两层：字面量把算好的值抄回去；比较前再要求超时 `> 0`，
 这样以后再漏赋值，最坏是不回收，而不是把活会话杀掉。
 `listener_test.go` 的 `TestMaintainLoopHonorsIdleTimeout` 钉住第二种。
+
+### 155. PassWall 节点是匿名 section 时，名字会被 uci 换掉
+
+`/etc/config/passwall` 里网页新建的节点长这样：
+
+```
+config nodes
+        option protocol 'flowtls'
+        option address '203.0.113.10'
+```
+
+`config nodes` 后面**没有名字**，这是匿名 section。`uci show` 会把它
+显示成 `passwall.cfg051c7e`，但那个名字是 **uci 现场合成的临时名**，
+不是配置文件里存在的东西。实测同一个节点在不同时刻叫过
+`cfg041c7e`、`cfg331c7e`、`cfg051c7e`：只要配置被重写（排序、保存、
+改任何一个字段）就可能换一个新的。
+
+后果（PassWall 的 haproxy 功能会中招）：
+
+- `haproxy_config.lbss` 把那个临时名当永久引用存起来；
+- `haproxy.lua` 用 `api.uci_get_c(lbss)` 查节点，名字一变就取不到；
+- 回落分支 `get_ip_port_from(lbss)` 把 **section 名当服务器地址**、
+  端口给空串；
+- 控制台里出现 `M1-cfgXXXXXX:`（尾巴那个冒号就是空端口），
+  域名解析失败、后端永远 DOWN。
+
+用户的描述会是「调一下节点上下顺序就连不上了」。
+
+修法：把匿名节点改成**显式命名**（`uci rename passwall.@nodes[i]=名字`）。
+名字一旦写进配置文件，uci 就不再重写它，之后怎么排序都不影响。
+本项目由 `passwall-flowtls repair`（`apply` 与 cron 自愈都会跑）完成，
+并用 `uci -N export`（`-N` = 不给匿名 section 起名）识别哪些还是匿名的：
+
+```sh
+uci -N export passwall | awk 'index($0,"config nodes")==1 { if (substr($0,13)=="") print n; n++ }'
+```
+
+**不要**用 `uci show` 报出来的 `cfgXXXXXX` 当稳定标识：它随时会变。

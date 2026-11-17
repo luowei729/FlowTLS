@@ -1,5 +1,48 @@
 # CHANGELOG
 
+## 2026-11-17 13:05 (北京时间)
+
+### 修补：r9 补丁包修「排序后 haproxy 连不上」（不升版本号）
+
+**内核代码未改动，也不发新版本**。只重打了 `1.14.4-r9` 的补丁包
+（同名覆盖 Release 里的 `.apk` / `.ipk`），已装 r9 的设备直接替换
+`/usr/bin/passwall-flowtls` 即可。
+
+#### 现象
+
+在「节点列表」里调上/下顺序并保存后，haproxy 控制台 `:1188` 里
+FlowTLS 那一栏变成 `M1-cfgXXXXXX:`（名字是 section 名、端口为空），
+后端 DOWN，经 1181/1182 的流量全部失败。
+
+#### 原因
+
+`haproxy_config.lbss` 按 **section 名**记住节点。网页新建的节点在
+`/etc/config/passwall` 里是匿名 section，uci 给的 `cfgXXXXXX` 是临时名，
+**每次重写配置都可能换一个**：实测 `cfg041c7e → cfg331c7e → cfg051c7e`。
+名字一换，`haproxy.lua` 里 `api.uci_get_c(lbss)` 就取不到节点，回落成
+`get_ip_port_from(lbss)`：服务器地址变成 section 名、端口变空串，
+于是域名解析失败、后端永远 DOWN。
+
+#### 修法
+
+`apply` / `repair` 把匿名 FlowTLS 节点改成**固定名**（`flowtls_<备注>`，
+没备注用地址），写进配置后 uci 不再重写；同时把已失效的 `lbss`
+（指向不存在且形如 `cfgXXXXXX` 的值）指回该节点。
+只在本轮恰好改了一个节点时才自动修引用，多个匿名节点时只改名并提示
+用户重选一次。只动 FlowTLS 自己的节点，其他协议不碰。
+
+`status` 新增一行 `[节点] 已用固定 section 名`。
+
+#### 验证（真机）
+
+- 手工构造坏状态（匿名节点 + `lbss=cfg041c7e`）→ `repair` 后：
+  节点为 `flowtls_sg1`、两处 `lbss` 指回它、匿名节点数 0。
+- 真实执行一次排序往返（移到首位再移回原位）：节点名与 `lbss` 均不变。
+- 重启 PassWall 后生成的 haproxy 配置：
+  `server M1-<服务端地址>:8443 127.0.0.1:2001 ...`（不再是 `M1-cfgXXXXXX:`）。
+- 经 `127.0.0.1:2001` 连续 20 次 `generate_204`：**20/20**。
+- `repair` 重复执行无输出、不写盘（幂等）。
+
 ## 2026-11-17 03:54 (北京时间)
 
 ### 部署：生产 8443 从 rev.3 换成 rev.9

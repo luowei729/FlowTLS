@@ -97,11 +97,37 @@ authID），所以连不上，而且日志里不会有明显线索。这就是�
 ## 命令
 
 ```sh
-passwall-flowtls status      # 补丁是否完整（含自愈状态）
-passwall-flowtls apply       # 重新打补丁（升级 PassWall 之后）
+passwall-flowtls status      # 补丁是否完整（含自愈状态、节点命名状态）
+passwall-flowtls apply       # 重新打补丁（升级 PassWall 之后），含节点修复
+passwall-flowtls repair      # 只修 FlowTLS 节点的 section 名与 haproxy 引用
 passwall-flowtls verify      # 只看结果，返回码 0/1，适合脚本
 passwall-flowtls uninstall   # 还原 PassWall 官方行为
 ```
+
+## 在节点列表里上下排序后会连不上（已修）
+
+**现象**：在「节点列表」里调整顺序或者保存后，haproxy 控制台
+（`http://路由器:1188/`）里 FlowTLS 那一栏的名字变成 `M1-cfgXXXXXX:`
+（后半截是 section 名，带个空端口），后端一直 DOWN，通过 1181/1182
+的流量全部失败。
+
+**原因**：haproxy 的配置（`haproxy_config.lbss`）是按 **section 名**
+记住「这个入口用哪个节点」的。而网页新建的节点在 `/etc/config/passwall`
+里是**匿名** section（`config nodes` 后面没有名字），uci 给的
+`cfgXXXXXX` 只是个临时名，**每次重写配置（排序、保存、改字段）都可能换一个**。
+于是 `lbss` 存的那个名字变成死引用：haproxy 取不到节点，就把 section 名
+当成服务器地址，端口变空 → 域名解析失败 → 后端永远 DOWN。
+
+**修法**：`apply`（以及每 5 分钟的 cron 自愈）会把匿名 FlowTLS 节点改成
+**固定名字**（例如 `flowtls_sg1`，取自备注，没备注就用地址），写进配置后
+uci 不再重写它，之后无论怎么排序都不影响；同时把已经失效的 `lbss`
+指回这个节点。
+
+`status` 里的 `[节点] 已用固定 section 名` 就是这个修复已生效的标志。
+若看到「有 N 个匿名节点」，执行一次 `passwall-flowtls apply` 即可。
+
+> 只改 FlowTLS 自己的节点：其他协议的匿名节点不动，避免误伤用户
+> 规则里对它们的引用。
 
 ## PassWall 升级后会不会失效
 
