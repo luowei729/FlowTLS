@@ -38,6 +38,8 @@ func main() {
 		insecure = flag.Bool("insecure", true, "跳过目标证书校验（自签站点测试用）")
 		request  = flag.String("request", "", "直接发送的原始请求（为空则用默认 HTTP GET）")
 		streams  = flag.Int("streams", 1, "在同一 QUIC 连接上并发打开的流数")
+		upMbps   = flag.Int("up", 0, "上传速率上限 Mbps（0=1000）")
+		downMbps = flag.Int("down", 0, "下载速率上限 Mbps（0=1000）")
 		verbose  = flag.Bool("v", false, "打印 QUIC 统计")
 	)
 	flag.Parse()
@@ -83,6 +85,8 @@ func main() {
 			Logger: flowtls.StdLogger(),
 		},
 		DialTimeout: *timeout,
+		SendBPS:     mbpsFlag(*upMbps),
+		ReceiveBPS:  mbpsFlag(*downMbps),
 		OnStats:     onStats,
 	})
 	if err != nil {
@@ -216,6 +220,14 @@ func runOneStream(
 			return 0, "", rerr
 		}
 	}
+}
+
+// mbpsFlag 把命令行的 Mbps 换成字节/秒。0 表示用库的默认 1 Gbps。
+func mbpsFlag(mbps int) uint64 {
+	if mbps <= 0 {
+		return 0
+	}
+	return uint64(mbps) * 1_000_000 / 8
 }
 
 // splitHostPort 拆 host:port，缺端口时按 443 处理。

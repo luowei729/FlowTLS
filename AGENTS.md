@@ -29,7 +29,7 @@ sing-box 路由（route.rules / DNS / rule_set）
 protocol/flowtls 适配层（adapter.Outbound / adapter.Inbound）
         │
         ▼
-flowtls/quic（quic-go：单连接多流，BBR）
+flowtls/quic（quic-go：单连接多流，Brutal，与 hysteria2 同一实现）
         │  QUIC 数据报（TCP 走双向流，UDP 走 RFC 9221 DATAGRAM）
         ▼
 flowtls 传输层

@@ -70,7 +70,7 @@ udp:
 | `udp.enabled` | —— | DATAGRAM 恒开（不配就是不允许，配了就有） |
 | `udp.max_sessions` | `udp_max_sessions` | 同名；默认 8192（Rust 默认 2048，Go 上调） |
 | `net.mode` | （删掉即可） | 规则改为强制自动写入（优先 nft，无则 iptables） |
-| `net.max_cwnd` | `max_cwnd` | 同名同默认值 8388608；两端必须填同一个值 |
+| `net.max_cwnd` | `up_mbps` / `down_mbps` | 不再限窗口。Brutal 速率，单位 Mbps，默认 1000。建连时协商：发送速率 = min(本端 up, 对端 down)。旧的 `max_cwnd` 仍能解析但不生效 |
 | `tls.cert` / `tls.key` | `masquerade.certificate_path` / `key_path` | 伪装网站的真证书，不是协议证书（见下） |
 | `site.dir` | `masquerade.site_dir` / `proxy_url` | 二选一；`proxy_url` 是 Rust 版没有的能力 |
 

@@ -10,7 +10,7 @@ Go v1/v2 的失败不是个别 bug，而是**架构偏离**：
 | 结果 | RTT = 链路 RTT | 本地排队被 quic-go 计入 RTT（213ms vs 73ms） |
 | 存活判定 | 无（只靠 QUIC idle timeout） | 自造 `lastSeenAt` + `Probe`，被内核 RST 欺骗 |
 | 通道获取 | `ProxyClient.tx` 单一通道 | `getClient`/`dialing`/`attemptCtx`/`invalidate`/`suspectConn` 五层 |
-| 拥塞控制 | BBR + 窗口钳制 | 额外加 Brutal（Rust 没有） |
+| 拥塞控制 | BBR + 窗口钳制 | 2026-11-18 起改用 hysteria2 同款 Brutal（`up_mbps`） |
 | 分流 | IP ID 高字节 + `wscale=9` | 改成 `wscale=12` + conntrack 规则 + BPF |
 
 结论：**只做翻译，不做设计**。凡 Rust 没有的机制一律不引入。
@@ -320,6 +320,20 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 rev.10 = rev.9 + 挂死处理。wire format 未改。
 发送路径不加 `SO_SNDTIMEO`。内容见 CHANGELOG 同日条目。
 
+### 发布 rev.11（2026-11-18 21:45）
+
+rev.11 = rev.10 + hysteria2 同款 Brutal。外层伪 TCP 报文格式未改。
+
+- 拥塞控制从 BBR 换成 `sing-quic/hysteria/congestion.BrutalSender`，
+  与 hysteria2 客户端、服务端调用的是同一个函数。
+- 配置加 `up_mbps` / `down_mbps`（Mbps，省略或 0 = 1000）。
+  QUIC 握手后一条流互报 down，发送速率 = min(本端 up, 对端 down)。
+  服务端谈完才装 Brutal，谈妥前不按本端 up 发。
+- 旧字段 `max_cwnd` 仍能解析但不再生效。删掉会让旧配置启动失败。
+- PassWall 补丁：节点表单改为上传/下载带宽，生成配置不再写 `max_cwnd`。
+  包版本 `1.14.4-r11`。
+- `cappedBbr` 不再装上。自适应窗口（丢包 ×0.9 / ×1.2）停用。
+
 ### 读方向停滞也只放弃单流（2026-11-18 01:50）
 
 01:30 的写超时覆盖不了「数据已到本机、本地不读」。
@@ -581,11 +595,13 @@ bytesLostMultiplier = 2
 | 能力 | hy2 | 我们 |
 |---|---|---|
 | 选 Profile | ✅ `bbrProfile` 配置项 | ❌ 硬编码 `ProfileStandard` |
-| Brutal 拥塞控制 | ✅ | ❌（Rust 也没有，刻意不加） |
-| **窗口上限钳制** | ❌ | ✅ **`cappedBbr`** |
-| 按丢包率自适应窗口 | ❌ | ✅ 每 2s ×0.9 / ×1.2 |
+| Brutal 拥塞控制 | ✅ | ✅ 2026-11-18 起用同一份 `BrutalSender` |
+| 带宽协商 | 认证头 `Hysteria-CC-RX` | QUIC 握手后一条流，公式相同：发送 = min(本端 up, 对端 down) |
+| **窗口上限钳制** | ❌ | ❌ `cappedBbr` 不再装上（代码还在，没有调用方） |
+| 按丢包率自适应窗口 | ❌ | ❌ 已停用。Brutal 按送达率补发，不再 ×0.9 / ×1.2 |
 
-`cappedBbr` 是我们独有的一层，也是唯一能防止 BBR 把窗口打到虚高的机制。
+`cappedBbr` 留在 `flowtls/quic/capped.go`，只因为删它要连测试一起动，
+热路径不再调用。
 
 #### 4. 传输参数差异
 

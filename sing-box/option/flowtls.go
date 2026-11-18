@@ -7,8 +7,12 @@ package option
 //
 // **v1/v2 自造的字段已全部删除**，因为它们没有 Rust 对应物：
 //
-//	up_mbps / brutal_multiplier          —— Rust 没有 Brutal（只有 BBR + 自适应窗口）
+//	brutal_multiplier                    —— 当时 Rust 没有 Brutal
 //	masquerade.proxy_url / rewrite_host  —— Rust 只 serve 静态目录
+//
+// up_mbps / down_mbps 在 2026-11-18 加回来了：拥塞控制换成 hysteria2
+// 同款 Brutal，速率按本端配置，不再用 max_cwnd。max_cwnd 仍能解析，
+// 只为兼容旧配置，Brutal 不读它。
 //	masquerade.enabled                   —— Rust 配了 site 就是开，没配就是关
 //	iptables_mode = "print"              —— Rust 只有 auto / none
 //
@@ -45,10 +49,20 @@ type FlowTLSInboundOptions struct {
 	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
 	// Handshake 对应 Rust `faketcp.handshake`：symbolic（默认）/ none。
 	Handshake string `json:"handshake,omitempty"`
-	// MaxCwnd 对应 Rust `net.max_cwnd`，QUIC 拥塞窗口硬上限（字节，默认 8MB）。
+	// UpMbps / DownMbps 是 Brutal 的目标速率，单位 Mbps，与 hysteria2 的
+	// `up_mbps` / `down_mbps` 同一含义。
 	//
-	// 它同时是自适应算子的上界：服务端按**全部连接**的汇总丢包率每 2 秒
-	// 在此值之下浮动（>20% 缩 10%，<5% 涨 20%）。
+	// 方向按本端看，含义与 hysteria2 相同，建连时互相协商：
+	//   本端发出去的速率 = min(本端 UpMbps, 对端 DownMbps)
+	//   对端发过来的速率 = min(对端 UpMbps, 本端 DownMbps)
+	// 0 表示用默认 1000（千兆）。协商走一条专门的 QUIC 流，
+	// 不改外层伪 TCP 的报文格式。
+	UpMbps   int `json:"up_mbps,omitempty"`
+	DownMbps int `json:"down_mbps,omitempty"`
+	// MaxCwnd 已废弃：Brutal 不读它。
+	//
+	// 保留这个字段只为兼容旧配置。rev.10 之前的 server.json 都写了
+	// max_cwnd，删掉会导致 sing-box 以 unknown field 拒绝启动。
 	MaxCwnd int64 `json:"max_cwnd,omitempty"`
 	// UDPEnabled 对应 Rust `udp.enabled`（默认 true）。
 	//
@@ -137,8 +151,11 @@ type FlowTLSOutboundOptions struct {
 	Handshake string `json:"handshake,omitempty"`
 	// SNI 对应 Rust `sni`，只影响伪 ClientHello 的外观，不参与握手校验。
 	SNI string `json:"sni,omitempty"`
-	// MaxCwnd 对应 Rust `net.max_cwnd`。
-	// **客户端与服务端应保持一致**：两端各算各的窗口，取小值生效。
+	// UpMbps / DownMbps 与入站同名，含义见入站注释。
+	// 客户端的 UpMbps 是上传速率，DownMbps 是下载速率。
+	UpMbps   int `json:"up_mbps,omitempty"`
+	DownMbps int `json:"down_mbps,omitempty"`
+	// MaxCwnd 已废弃，保留只为兼容旧的客户端配置，Brutal 不读它。
 	MaxCwnd int64 `json:"max_cwnd,omitempty"`
 	// UDPEnabled 对应 Rust `udp.enabled`（默认 true）。指针含义见入站同名注释。
 	UDPEnabled *bool `json:"udp_enabled,omitempty"`

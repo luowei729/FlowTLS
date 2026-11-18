@@ -75,12 +75,13 @@
       // （现象是 sendto 返回 EPERM，看着像权限问题）；少了 RST 抑制，
       // 第一个 SYN-ACK 就把 NAT 映射拆掉。
 
-      // QUIC 拥塞窗口上限（字节），默认 8MB（可省略）。
+      // Brutal 目标速率（Mbps），与 hysteria2 的 up_mbps / down_mbps 同一含义。
+      // 省略或填 0 都是 1000（千兆）。
       //
-      // 对应老 Rust 版的 net.max_cwnd。**必须与服务端填同一个值**，
-      // 否则两边自适应上限不同步，容易单侧过早降速。
-      // 小带宽跨境链路（20~50Mbps）建议 1048576（1MB）。
-      "max_cwnd": 8388608
+      // up_mbps 是上传上限，down_mbps 是下载上限。
+      // 建连时和服务端互相取较小值：上传 = min(这里的 up, 服务端的 down)。
+      "up_mbps": 1000,
+      "down_mbps": 1000
     },
 
     { "type": "direct", "tag": "direct" }

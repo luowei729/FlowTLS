@@ -2,7 +2,7 @@
 
 > 状态：P0 已落地（2026-11-13）
 > 基线：sing-box v1.14.4（`git subtree` 引入，位于 `sing-box/`）
-> 版本号：`<上游版本>-rev.<自增>`，当前 `1.14.4-rev.1`
+> 版本号：`<上游版本>-rev.<自增>`，当前 `1.14.4-rev.11`
 
 ## 1. 目标与边界
 
@@ -15,7 +15,7 @@
 |---|---|
 | 代码结构 | 与 hy2/anytls 同级：独立 module + `protocol/flowtls` 适配层 |
 | 二进制名 | **保持 `sing-box`**，只用版本号区分官方版 |
-| 版本号 | `1.14.4-rev.1`（合法 semver prerelease，第三方客户端可 parse） |
+| 版本号 | `1.14.4-rev.11`（合法 semver prerelease，第三方客户端可 parse） |
 | 运行条件 | 无法平级：Linux + IPv4 + root/CAP_NET_RAW + iptables |
 | 上游合并 | 不作为目标（raw socket 类协议维护者通常不收） |
 

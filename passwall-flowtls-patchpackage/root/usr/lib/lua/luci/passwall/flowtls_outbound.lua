@@ -93,7 +93,11 @@ return function(orig)
 		-- 能工作的前提。写个 iptables_mode=none 只会让隧道静默不通。
 		-- 旧配置里若还留着这个字段，一并清掉。
 		result.iptables_mode = nil
-		result.max_cwnd = num(node.max_cwnd)
+		-- 带宽：留空不写字段，核心用默认 1000 Mbps。
+		-- 旧配置里的 max_cwnd 清掉，Brutal 不读它。
+		result.max_cwnd = nil
+		result.up_mbps = num(node.up_mbps)
+		result.down_mbps = num(node.down_mbps)
 
 		-- UDP 三态：留空＝跟随核心默认（开启），1＝开，0＝关。
 		-- 用三态是因为「没填」和「显式关闭」语义不同：

@@ -101,6 +101,19 @@ type cappedBbr struct {
 	// 因此只要自己数丢包，丢包率就能算对。
 	lostPackets atomic.Uint64
 	lostBytes   atomic.Uint64
+
+	// nextSend 是「窗口掉到地板时」下一次允许发包的时刻。
+	//
+	// 只在窗口低于地板阈值时使用。正常窗口下不读它，
+	// 所以不会改变健康连接的发送节奏。
+	nextSend atomic.Int64
+
+	// srtt 是本控制器自己算的平滑 RTT（微秒）。
+	//
+	// 不用内层 BBR 的 RTT：那个字段未导出，而且拥塞控制接口
+	// 不提供读取方法。发送和确认时间都在 OnCongestionEventEx 里，
+	// 自己算一份只为决定「包与包之间隔多久」。
+	srtt atomic.Int64
 }
 
 // newCappedBbr 用给定初始包大小和共享上限构造控制器。
@@ -151,6 +164,63 @@ func (c *cappedBbr) CanSend(bytesInFlight congestion.ByteCount) bool {
 	return c.CongestionControlEx.CanSend(bytesInFlight)
 }
 
+// floorSpreadMinRate 是窗口掉到地板时铺开包的最低速率：1 Mbps。
+//
+// 为什么是 1 Mbps 而不是更大：
+// 它只决定「这几个包之间隔多久」，不增加在途字节。
+// 1 Mbps 在 80ms RTT 下约 10KB，比 BBR 的地板（4 个包，约 5KB）宽一倍，
+// 足够把扎堆的丢包拆开，又不会在真拥塞时硬塞数据。
+// 速率随 RTT 变化：RTT 更大时包之间隔得更开，不需要按线路手调。
+const floorSpreadMinRate = 1_000_000 / 8 // 字节/秒
+
+// TimeUntilSend 在窗口掉到 BBR 地板时，把仅有的几个包均匀铺开。
+//
+// 正常情况下原样交给内层 BBR：它的 pacing 按带宽估计发，
+// 这一层不该改健康连接的节奏。
+//
+// 窗口一旦掉进 recovery（持续丢包时 recoveryWindow 每轮减掉丢失的字节，
+// 减到比 4 个包还小就被钳回 4 个包），内层 pacing 仍按带宽估计把这 4 个包
+// 堆在一个 RTT 的开头一次性打出，剩下几十毫秒空等。
+// 丢包因此扎成一簇，recovery 更难爬出来。
+//
+// 2026-11-18 20:24 新加坡链路实测：cwnd 从 796KB 在 4 秒内掉到 38KB，
+// 随后多次落到 5328 字节（正好 4×1332），客户端下载从 10 Mbps 掉到 1.3 Mbps，
+// 持续约 30 秒。同一时刻 ICMP 丢包 10%、RTT 不抖，链路本身有余量。
+//
+// 这里不抬窗口下限。抬下限等于在真拥塞时硬塞数据，
+// 而这次的丢包是随机的，补发只会让同一条链路丢更多。
+func (c *cappedBbr) TimeUntilSend(bytesInFlight congestion.ByteCount) monotime.Time {
+	inner := c.CongestionControlEx.TimeUntilSend(bytesInFlight)
+	cwnd := c.GetCongestionWindow()
+	if cwnd == 0 || cwnd > 8*initialMTU {
+		// 窗口健康：连「铺开」的必要都没有，保持内层节奏。
+		return inner
+	}
+	rtt := time.Duration(c.srtt.Load())
+	if rtt <= 0 {
+		// 还没有确认过任何包，没有 RTT 可用，保持内层节奏。
+		return inner
+	}
+	// 间隔 = 包长 ÷ 速率，但速率至少要能在一个 RTT 内把当前窗口发完，
+	// 否则人为拉开的间隔会比窗口允许的还慢。
+	rate := congestion.ByteCount(float64(cwnd) / rtt.Seconds())
+	if minRate := congestion.ByteCount(floorSpreadMinRate); rate < minRate {
+		rate = minRate
+	}
+	gap := time.Duration(float64(time.Second) * float64(initialMTU) / float64(rate))
+	now := monotime.Now()
+	scheduled := monotime.Time(c.nextSend.Load())
+	if scheduled < now {
+		scheduled = now
+	}
+	// 只允许比内层更晚，不允许更早：内层若已经在限速，尊重它。
+	if scheduled < inner {
+		scheduled = inner
+	}
+	c.nextSend.Store(int64(scheduled.Add(gap)))
+	return scheduled
+}
+
 // OnCongestionEventEx 在把丢包事件原样交给内层 BBR 之前，先自己记一笔。
 //
 // 这是**唯一**能拿到「本连接被判丢的包」的入口：quic-go 的
@@ -170,7 +240,35 @@ func (c *cappedBbr) OnCongestionEventEx(
 		}
 		c.lostBytes.Add(bytes)
 	}
+	// 取这一批确认里最小的 RTT 当本次采样：同一批里偏大的值
+	// 多半是延迟确认造成的，不代表链路。
+	var sample time.Duration
+	for _, p := range ackedPackets {
+		if p.SentTime == 0 || p.ReceivedTime < p.SentTime {
+			continue
+		}
+		rtt := time.Duration(p.ReceivedTime - p.SentTime)
+		if rtt > 0 && (sample == 0 || rtt < sample) {
+			sample = rtt
+		}
+	}
+	if sample > 0 {
+		c.updateSRTT(sample)
+	}
 	c.CongestionControlEx.OnCongestionEventEx(priorInFlight, eventTime, ackedPackets, lostPackets)
+}
+
+// updateSRTT 用 TCP 的标准权重更新平滑 RTT：srtt += (sample - srtt) / 8。
+//
+// 第一次采样直接采用。之后每次只动八分之一，
+// 单个离群样本不会把发包间隔一下子拉得很开。
+func (c *cappedBbr) updateSRTT(sample time.Duration) {
+	prev := time.Duration(c.srtt.Load())
+	if prev == 0 {
+		c.srtt.Store(int64(sample))
+		return
+	}
+	c.srtt.Store(int64(prev + (sample-prev)/8))
 }
 
 // windowController 管理一组连接的共享窗口上限与自适应循环。

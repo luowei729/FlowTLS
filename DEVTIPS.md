@@ -6,6 +6,32 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 165. 拥塞控制换成 hysteria2 的 Brutal，速率写在 up_mbps（2026-11-18 21:25）
+
+BBR 在常年 15% 丢包的链路上会停在 recovery，窗口被减到 4 个包，
+吞吐掉到 1~3 Mbps，直播就卡。换成 `sing-quic/hysteria/congestion.BrutalSender`，
+和 hysteria2 客户端、服务端调用的是同一个函数，没有自己改参数。
+
+配置与协商（和 hysteria2 同一公式）：
+
+- `up_mbps`：本端发送上限。`down_mbps`：本端接收上限。单位 Mbps。
+- 省略或 0 = 1000（千兆）。换算 `mbps * 1_000_000 / 8` 字节/秒。
+- QUIC 握手后客户端开一条流，带上自己的 down，服务端回自己的 down。
+  发送速率 = min(本端 up, 对端 down)。对端回 0 或更大，就用本端 up。
+- hysteria2 把这两个数放在认证请求的 HTTP 头里。flowtls 没有那次
+  HTTP 认证（第一条流就是代理流），所以用一条专门的 QUIC 流，公式不变。
+- 旧的 `max_cwnd` 仍能解析，Brutal 不读。删掉这个字段会让旧配置
+  以 `unknown field` 拒绝启动（2026-11-18 21:21 新加坡就这样挂过）。
+
+Brutal 自己的常数不要动：送达率低于 0.8 就按 0.8 算
+（丢包超过 20% 不再加码，最多补到 1.25 倍）。这是它的实现，不是我们加的上限。
+
+服务端必须谈完再装 Brutal。谈妥前按本端 up 发，会在「客户端 down 更小」
+的那几秒超发。hysteria2 也是认证响应回来之后才 `NewBrutalSender` 一次。
+
+这条流是 rev.11 起才有的。rev.10 客户端连 rev.11 服务端，服务端等 8 秒
+收不到带宽帧就关掉连接。两端要一起换，不能只升一边。
+
 ## 164. 卡顿先分「链路丢包」还是「我们丢流」，用 ICMP 对照（2026-11-18 20:00）
 
 用户反馈看 Twitch 直播「有时候卡一下」。按下面顺序排，十分钟能有结论。
@@ -47,7 +73,7 @@ journalctl -u sing-box --since "13 min ago" --no-pager | grep "QUIC 路径统计
 在同一台客户端上 ping 服务端，用**同样的路径**测原始丢包：
 
 ```bash
-ssh root@10.0.100.1 'ping -c 40 -q 129.150.44.117'
+ssh root@10.0.100.1 'ping -c 40 -q "$FLOWTLS_SERVER"'
 ```
 
 实测：ICMP 丢 25%，隧道自报 12~15%，两者同量级。

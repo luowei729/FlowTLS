@@ -207,7 +207,7 @@ ok(found, "协议下拉框里已加入 FlowTLS")
 -- 自定义字段里已经没有 source_port / ip_id_mark / iptables_mode
 -- （三者都改为核心自动处理），剩下的字段都要挂 flowtls 依赖，
 -- 否则选其它协议时会全部露出
-local mine = { "sni", "handshake", "max_cwnd", "udp_enabled" }
+local mine = { "sni", "handshake", "up_mbps", "down_mbps", "udp_enabled" }
 for _, n in ipairs(mine) do
 	local o = sec.fields[n]
 	ok(o ~= nil and o.option == "singbox_" .. n,
@@ -272,7 +272,7 @@ local flow = gen(nil, {
 	protocol = "flowtls", address = "203.0.113.10", port = "8443",
 	password = "pw", source_port = "44313", ip_id_mark = "61703",
 	sni = "example.com", handshake = "symbolic", iptables_mode = "none",
-	max_cwnd = "8388608", udp_enabled = "",
+	up_mbps = "200", down_mbps = "1000", udp_enabled = "",
 }, "n1")
 ok(flow.type == "flowtls", "type 保持 flowtls")
 ok(flow.password == "pw", "password 已带出")
@@ -283,7 +283,8 @@ ok(flow.source_port == nil, "source_port 不再输出（交给内核自动分配
 ok(flow.ip_id_mark == nil, "ip_id_mark 不再输出（从 password 派生）")
 ok(flow.sni == "example.com" and flow.handshake == "symbolic", "sni/handshake 已带出")
 ok(flow.iptables_mode == nil, "iptables_mode 不再输出（核心已强制写入规则）")
-ok(flow.max_cwnd == 8388608, "max_cwnd 已转成数字")
+ok(flow.up_mbps == 200 and flow.down_mbps == 1000, "带宽已转成数字")
+ok(flow.max_cwnd == nil, "max_cwnd 不再输出（Brutal 不读它）")
 ok(flow.udp_enabled == nil, "udp_enabled 留空 → 不出字段（跟随核心默认）")
 ok(flow.tls == nil and flow.multiplex == nil, "已清掉 tls/multiplex（flowtls 不认）")
 
@@ -293,10 +294,10 @@ ok(flow2.udp_enabled == false, "udp_enabled=0 → 显式关闭")
 local flow3 = gen(nil, { protocol = "flowtls", address = "192.0.2.1", port = "8443",
 	password = "pw", udp_enabled = "1",
 	-- 旧配置里可能还留着 source_port，包装器必须把它丢掉
-	source_port = "44312", max_cwnd = "" }, "n3")
+	source_port = "44312", up_mbps = "" }, "n3")
 ok(flow3.udp_enabled == true, "udp_enabled=1 → 显式开启")
 ok(flow3.source_port == nil, "旧配置里的 source_port 已被清除")
-ok(flow3.max_cwnd == nil, "空串不产生 0 值字段")
+ok(flow3.up_mbps == nil, "空串不产生 0 值字段")
 
 -- 非 flowtls 必须逐字节等价
 local other = gen(nil, { protocol = "hysteria2", address = "198.51.100.1", port = "443" }, "n4")

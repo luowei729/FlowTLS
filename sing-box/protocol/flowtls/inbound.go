@@ -188,8 +188,11 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 
 	srv, err := ftquic.NewServer(ftquic.ServerOptions{
 		FlowTLS: cfg,
-		MaxCwnd: maxCwndOf(h.opts.MaxCwnd),
-		OnStats: onStats,
+		// 与 hysteria2 同一对：up 限本端发送，down 回给客户端限它的发送。
+		// 真正发出去的是 min(本端 up, 客户端报的 down)。
+		SendBPS:    mbpsToBPS(h.opts.UpMbps),
+		ReceiveBPS: mbpsToBPS(h.opts.DownMbps),
+		OnStats:    onStats,
 	})
 	if err != nil {
 		return E.Cause(err, "flowtls: start server on ", listenAddr)

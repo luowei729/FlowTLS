@@ -248,8 +248,11 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 			Logger: o.logger,
 		},
 		DialTimeout: 15 * time.Second,
-		MaxCwnd:     maxCwndOf(o.opts.MaxCwnd),
-		OnStats:     onStats,
+		// 与 hysteria2 同一对：up 限本端上传，down 告诉服务端限它发往本端的速率。
+		// 真正发出去的是 min(本端 up, 服务端回的 down)。
+		SendBPS:    mbpsToBPS(o.opts.UpMbps),
+		ReceiveBPS: mbpsToBPS(o.opts.DownMbps),
+		OnStats:    onStats,
 	})
 	if err != nil {
 		return nil, err
@@ -410,14 +413,14 @@ func (o *Outbound) CloseIdleConnections() {
 	}
 }
 
-// maxCwndOf 把配置里的 int64 窗口上限归一成 uint64。
+// mbpsToBPS 把配置里的 Mbps 换成 Brutal 要的字节/秒。
 //
-// 为什么需要它：JSON 里的数字由用户手写，负数是完全可能的输入。
-// Go 的 int64 → uint64 转换是位重解释，`uint64(-1)` 会变成 16EB，
-// 等于彻底关掉窗口钳制，BBR 会把链路打爆，而日志里看不到任何异常。
-func maxCwndOf(v int64) uint64 {
-	if v <= 0 {
+// 0 和负数都当成「没配」，返回 0，由 Brutal 用默认 1 Gbps。
+// 用乘法而不是位移：1000 Mbps = 125_000_000 字节/秒，
+// 和 hysteria2 的 `MbpsToBps` 同一换算。
+func mbpsToBPS(mbps int) uint64 {
+	if mbps <= 0 {
 		return 0
 	}
-	return uint64(v)
+	return uint64(mbps) * 1_000_000 / 8
 }

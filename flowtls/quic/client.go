@@ -55,9 +55,12 @@ type ClientOptions struct {
 	QUIC *quicgo.Config
 	// DialTimeout 限制建连（含伪造 TCP 握手与 QUIC 握手）的总时长。
 	DialTimeout time.Duration
-	// MaxCwnd 是 QUIC 拥塞窗口上限（字节），对应 Rust 的 `net.max_cwnd`。
-	// 0 表示 8MB。
-	MaxCwnd uint64
+	// SendBPS 是本端上传速率（字节/秒），对应 hysteria2 的 up。
+	// 0 表示用默认 1 Gbps。真正发出去的速率还要和对方报的 down 取较小值。
+	SendBPS uint64
+	// ReceiveBPS 是本端下载速率（字节/秒），对应 hysteria2 的 down。
+	// 建连时告诉服务端，服务端用它限制发往本端的速率。0 同样是默认 1 Gbps。
+	ReceiveBPS uint64
 	// OnStats 是每 2 秒一次的路径统计回调，可为 nil。
 	OnStats func(PathStats)
 }
@@ -70,9 +73,9 @@ type Client struct {
 	session   *flowtls.Session
 	transport *quicgo.Transport
 	conn      *quicgo.Conn
-	// winCtl 是 BBR + 自适应窗口上限控制器（2 秒周期），
+	// winCtl 是 Brutal 拥塞控制器和统计循环（2 秒周期），
 	// 必须在 Close 时关闭，否则每条重连都会泄漏一个协程。
-	winCtl *windowController
+	winCtl *brutalController
 
 	// udpNext 是 UDP session id 分配器（随机起点，同 Rust）。
 	udpNext atomic.Uint32
@@ -120,10 +123,53 @@ func NewClient(ctx context.Context, opts ClientOptions) (*Client, error) {
 		return nil, fmt.Errorf("QUIC 握手失败: %w", err)
 	}
 
-	winCtl := newWindowController(opts.MaxCwnd, opts.OnStats)
+	// 先按本端 up 装上。带宽帧谈完后换成 min(本端 up, 服务端 down)。
+	// 谈不成就保持本端 up，和 hysteria2「对端回 0 就用自己的」同一退路。
+	winCtl := newBrutalController(opts.SendBPS, opts.OnStats)
 	winCtl.Attach(conn)
 
-	return &Client{session: session, transport: transport, conn: conn, winCtl: winCtl}, nil
+	c := &Client{session: session, transport: transport, conn: conn, winCtl: winCtl}
+	if err := c.negotiateBandwidth(dialCtx, nonzeroBPS(opts.ReceiveBPS)); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// negotiateBandwidth 走 hysteria2 的带宽协商，只是承载换成一条 QUIC 流。
+//
+// 客户端把自己的 down 发给服务端，读回服务端的 down，
+// 然后把自己的发送速率收成 min(本端 up, 服务端 down)。
+// 服务端同时把自己的发送速率收成 min(服务端 up, 客户端 down)。
+//
+// 必须在 DialConn 之前做完：否则第一条代理流会按没谈过的速率发。
+func (c *Client) negotiateBandwidth(ctx context.Context, receiveBPS uint64) error {
+	stream, err := c.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("打开带宽协商流失败: %w", err)
+	}
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(openStreamTimeout))
+	if err := writeBandwidth(stream, receiveBPS); err != nil {
+		return fmt.Errorf("发送带宽失败: %w", err)
+	}
+	peerDown, err := readBandwidth(stream)
+	if err != nil {
+		return fmt.Errorf("读取对端带宽失败: %w", err)
+	}
+	c.winCtl.SetRate(c.conn, actualSendBPS(c.winCtl.bps, peerDown))
+	return nil
+}
+
+// nonzeroBPS 把「没配」换成默认 1 Gbps。
+//
+// 配置里的 0 是「用默认」，不是 hysteria2 那个「请对端自己探测」。
+// 探测需要 BBR 回退，而这里两端都固定用 Brutal。
+func nonzeroBPS(bps uint64) uint64 {
+	if bps == 0 {
+		return defaultBrutalRate
+	}
+	return bps
 }
 
 // Close 关闭通道。

@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"net/netip"
 	"sync"
+	"time"
 
 	quicgo "github.com/sagernet/quic-go"
 
@@ -41,9 +42,12 @@ type ServerOptions struct {
 	TLS *tls.Config
 	// QUIC 为 nil 时使用 ServerConfig()。
 	QUIC *quicgo.Config
-	// MaxCwnd 是窗口上限（字节），0 表示 8MB。
-	// 服务端所有连接共享一份上限（同 Rust 的 Arc<AtomicU64>）。
-	MaxCwnd uint64
+	// SendBPS 是服务端发往客户端的速率上限（字节/秒），对应 hysteria2 的 up。
+	// 真正发出去的是 min(这个值, 客户端报的 down)。0 表示用默认 1 Gbps。
+	SendBPS uint64
+	// ReceiveBPS 是服务端从客户端接收的速率上限（字节/秒），对应 hysteria2 的 down。
+	// 协商时回给客户端，客户端用它限制上传。0 同样是默认 1 Gbps。
+	ReceiveBPS uint64
 	// OnStats 是每 2 秒一次的路径统计回调，可为 nil。
 	OnStats func(PathStats)
 }
@@ -62,7 +66,7 @@ type Server struct {
 	mu    sync.Mutex
 	conns map[*quicgo.Conn]struct{}
 
-	winCtl *windowController
+	winCtl *brutalController
 }
 
 // NewServer 启动服务端。
@@ -94,7 +98,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 		conns:    make(map[*quicgo.Conn]struct{}),
-		winCtl:   newWindowController(opts.MaxCwnd, opts.OnStats),
+		winCtl:   newBrutalController(opts.SendBPS, opts.OnStats),
 	}
 	s.wg.Add(1)
 	go s.acceptLoop(quicConf, tlsConf)
@@ -191,8 +195,22 @@ func (s *Server) serveSession(sess *flowtls.Session, quicConf *quicgo.Config, tl
 		_ = transport.Close()
 		return
 	}
-	// 两端都用 BBR + 窗口上限：只换一端等于「一端猛发、另一端丢包减半」。
+	// 先谈带宽，再装 Brutal。
+	//
+	// hysteria2 也是认证响应回来之后才 NewBrutalSender 一次，
+	// 谈妥前不按「本端 up」发：否则客户端 down 比服务端 up 小的那几秒，
+	// 服务端已经按更大的速率把包打出去了。
+	// QUIC 握手本身不走这条流控，等这一帧不会拖握手。
+	clientDown, err := s.negotiateBandwidth(conn)
+	if err != nil {
+		_ = conn.CloseWithError(0, "bandwidth negotiation failed")
+		_ = listener.Close()
+		_ = sess.Close()
+		_ = transport.Close()
+		return
+	}
 	s.winCtl.Attach(conn)
+	s.winCtl.SetRate(conn, actualSendBPS(s.winCtl.bps, clientDown))
 
 	s.mu.Lock()
 	s.conns[conn] = struct{}{}
@@ -223,4 +241,30 @@ func (s *Server) serveSession(sess *flowtls.Session, quicConf *quicgo.Config, tl
 	_ = listener.Close()
 	_ = sess.Close()
 	_ = transport.Close()
+}
+
+// negotiateBandwidth 读客户端报的 down，再把自己的 down 回给客户端。
+//
+// 返回值是客户端的 down，调用方用它算 min(本端 up, 客户端 down) 再装 Brutal。
+// 不在这里装：谈妥前没有控制器，和 hysteria2「认证完才 NewBrutalSender」一致。
+//
+// 放在交给上层之前：上层一 Accept 就会开代理流，
+// 那些流不该抢在带宽帧前面。
+func (s *Server) negotiateBandwidth(conn *quicgo.Conn) (uint64, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, openStreamTimeout)
+	defer cancel()
+	stream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(openStreamTimeout))
+	clientDown, err := readBandwidth(stream)
+	if err != nil {
+		return 0, err
+	}
+	if err := writeBandwidth(stream, nonzeroBPS(s.opts.ReceiveBPS)); err != nil {
+		return 0, err
+	}
+	return clientDown, nil
 }

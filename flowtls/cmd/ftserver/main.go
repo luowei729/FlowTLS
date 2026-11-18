@@ -33,8 +33,9 @@ func main() {
 		localIP  = flag.String("local-ip", "", "回包源 IP（NAT 云主机填内网地址；留空按路由探测）")
 		ipidMark = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
 
-		maxCwnd = flag.Uint64("max-cwnd", 8388608, "QUIC 拥塞窗口上限（字节）")
-		verbose = flag.Bool("v", false, "打印每 2 秒的路径统计")
+		upMbps   = flag.Int("up", 0, "发往客户端的速率上限 Mbps（0=1000）")
+		downMbps = flag.Int("down", 0, "从客户端接收的速率上限 Mbps（0=1000）")
+		verbose  = flag.Bool("v", false, "打印每 2 秒的路径统计")
 	)
 	flag.Parse()
 
@@ -64,9 +65,10 @@ func main() {
 		onStats = func(s ftquic.PathStats) { ftquic.LogStats(s) }
 	}
 	srv, err := ftquic.NewServer(ftquic.ServerOptions{
-		FlowTLS: cfg,
-		MaxCwnd: *maxCwnd,
-		OnStats: onStats,
+		FlowTLS:    cfg,
+		SendBPS:    mbpsFlag(*upMbps),
+		ReceiveBPS: mbpsFlag(*downMbps),
+		OnStats:    onStats,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
@@ -278,6 +280,14 @@ func serveDatagrams(conn *quicgo.Conn) {
 
 		_, _ = s.pc.Write(payload)
 	}
+}
+
+// mbpsFlag 把命令行的 Mbps 换成字节/秒。0 表示用库的默认 1 Gbps。
+func mbpsFlag(mbps int) uint64 {
+	if mbps <= 0 {
+		return 0
+	}
+	return uint64(mbps) * 1_000_000 / 8
 }
 
 // parseLocalIP 解析配置里的源 IP；空串返回无效地址（由 NewListener 探测）。
