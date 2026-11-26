@@ -109,20 +109,27 @@ func (c *ClientConfig) Validate() error {
 	return nil
 }
 
-// User 是一个用户条目。线上只传 password 派生出的 authID，name 仅用于日志。
-type User struct {
-	Name     string
-	Password string
-}
-
 // ServerConfig 是服务端的传输层参数。
 type ServerConfig struct {
 	// Listen 是监听地址（只用于计算规则与端口，不会 bind 内核端口）。
 	Listen netip.AddrPort
-	// Password 是单用户模式的密码（Users 为空时使用）。
+	// Password 是**单密码**凭据（与 Passwords 互斥）。
+	//
+	// 多个客户端可以共用同一个密码：凭据只有一份，谁拿到都能连，
+	// 服务端不区分设备。这是「一台服务端 + 多台设备」最省事的形态。
 	Password string
-	// Users 是多用户表（非空时优先于 Password）。
-	Users []User
+	// Passwords 是**多密码**凭据表（与 Password 互斥）。
+	//
+	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ip_id_mark。
+	// 多个客户端也可以共用**其中一条**（典型的「默认密码」），
+	// 所以下面这种配置同时表达了「朋友共用一个」与「自己的设备可单独吊销」：
+	//
+	//	Passwords: []string{"family-default", "my-phone", "my-laptop"}
+	//
+	// **不要重复填同一个密码**：同一条密码本来就支持任意多个客户端，
+	// 重复项不会带来额外能力，反而容易被误读成「多用户」。
+	// Validate（NormalizePasswords）会直接拒绝重复项。
+	Passwords []string
 	// LocalIP 是回包时使用的源 IP；为空时按路由探测。
 	//
 	// 与 Rust 一致：**不做「是否真的配在本机网卡上」的校验**。
@@ -163,17 +170,15 @@ func (s *ServerConfig) Validate() error {
 	if !s.Listen.IsValid() || s.Listen.Port() == 0 {
 		return errors.New("flowtls: listen/listen_port 不合法")
 	}
-	users, err := s.effectiveUsers()
-	if err != nil {
+	// 凭据：互斥来源、空值、重复项都收在 NormalizePasswords 里。
+	// 这里不重复实现，避免与 option 层的检查走偏。
+	if _, err := NormalizePasswords(s.Password, s.Passwords, nil); err != nil {
 		return err
 	}
-	if len(users) == 0 {
-		return errors.New("flowtls: 服务端必须配置 password 或 users")
-	}
-	// IPIDMark 参见 Marks()：0 表示按每个用户的 password 各自派生。
-	// 服务端**不再**在这里填一个全局值，因为它要为每个用户维护各自的标记。
+	// IPIDMark 参见 Marks()：0 表示按每条密码各自派生。
+	// 服务端**不再**在这里填一个全局值，因为它要为每条凭据维护各自的标记。
 	if s.IPIDMark != 0 {
-		// 显式配置时所有用户共用一个标记（兼容旧配置与特殊部署）。
+		// 显式配置时所有凭据共用一个标记（兼容旧配置与特殊部署）。
 		s.IPIDMark &= 0xFF00
 		if s.IPIDMark == 0 {
 			return errors.New("flowtls: ip_id_mark 的高字节不能为 0")
@@ -194,37 +199,65 @@ func (s *ServerConfig) Validate() error {
 	return nil
 }
 
-// effectiveUsers 归一出实际生效的用户表（与 Rust `ClientFile::effective_users`
-// / `ServerFile::users` 的取舍一致）：Users 非空则优先，否则退回单用户模式。
-func (s *ServerConfig) effectiveUsers() ([]User, error) {
-	if len(s.Users) > 0 {
-		// 同时填 password 与 users 是**错误**，不是"以 users 为准"。
-		//
-		// 静默忽略顶层 password 会形成一个很难发现的陷阱：
-		//   - 它既不能用来登录（authID 只在 users 里）；
-		//   - 它也不参与 ip_id_mark 派生（mark 只从 users 派生）；
-		//   - 但配置文件里它明明白白写着，运维会以为它是兜底凭据。
-		// 而 ip_id_mark 不一致的症状是"隧道完全不通"，排查成本极高，
-		// 所以这里直接拒绝，逼配置只表达一件事。
-		if s.Password != "" {
-			return nil, errors.New(
-				"flowtls: password 与 users 不能同时配置 —— " +
-					"只配 password 表示单用户；配 users 表示多用户，" +
-					"此时 password 会被完全忽略（既不能登录、也不参与 ip_id_mark 派生）")
-		}
-		out := make([]User, 0, len(s.Users))
-		for _, u := range s.Users {
-			if u.Password == "" {
-				return nil, fmt.Errorf("flowtls: 用户 %q 的 password 不能为空", u.Name)
-			}
-			out = append(out, u)
-		}
-		return out, nil
+// NormalizePasswords 归一并校验凭据来源。
+//
+// 三个参数是**互斥**的来源：单密码、多密码、旧版 users[] 的密码列表
+// （legacy 已废弃，只为让 rev.11 及更早的配置继续能启动）。
+// 必须恰好填一个，返回实际生效的密码列表（保持原顺序）。
+//
+// 两种来源走完全相同的校验：
+//   - 空元素：直接拒绝。空密码等于「谁都能连」，不能靠用户自觉。
+//   - 重复项：直接拒绝。重复的密码会派生出同一个 authID，
+//     而 userTable 以 authID 为 key，后一条会**静默覆盖**前一条 ——
+//     症状是「配了 5 条，启动日志说只有 4 条」，且不说少的是哪条。
+//
+// 为什么把三种来源合到一个函数：互斥判断、空值判断、去重判断分散在
+// option 层和 flowtls 层各写一遍时，`sing-box check` 走的是 option 层、
+// 真正启动走的是 flowtls 层，两边一旦不一致就出现「check 通过但起不来」。
+func NormalizePasswords(single string, multi []string, legacy []string) ([]string, error) {
+	sources := 0
+	if single != "" {
+		sources++
 	}
-	if s.Password != "" {
-		return []User{{Name: "", Password: s.Password}}, nil
+	if len(multi) > 0 {
+		sources++
 	}
-	return nil, nil
+	if len(legacy) > 0 {
+		sources++
+	}
+	if sources > 1 {
+		return nil, errors.New(
+			"flowtls: password、passwords、users 三者互斥，只能填一个 —— " +
+				"单密码填 password；多密码填 passwords（字符串数组）；" +
+				"users 是 rev.11 及更早的旧写法，等价于 passwords")
+	}
+	var list []string
+	switch {
+	case single != "":
+		list = []string{single}
+	case len(multi) > 0:
+		list = multi
+	case len(legacy) > 0:
+		list = legacy
+	default:
+		return nil, errors.New("flowtls: 服务端必须配置 password 或 passwords")
+	}
+	seen := make(map[string]int, len(list))
+	out := make([]string, 0, len(list))
+	for i, p := range list {
+		if p == "" {
+			return nil, fmt.Errorf("flowtls: 第 %d 条 password 不能为空", i+1)
+		}
+		if prev, dup := seen[p]; dup {
+			return nil, fmt.Errorf(
+				"flowtls: 第 %d 条与第 %d 条 password 相同 —— "+
+					"同一条密码本来就支持任意多个客户端，重复项不会带来额外能力",
+				i+1, prev)
+		}
+		seen[p] = i + 1
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // Marks 返回本服务端会接受的全部 ip_id_mark。
@@ -232,15 +265,15 @@ func (s *ServerConfig) effectiveUsers() ([]User, error) {
 // 为什么是**一组**而不是一个：服务端在内核层就要判断「这个包是不是我们的」
 // （rules.go 写 drop 规则）和「这个 SYN 要不要回 SYN-ACK」
 // （listener.go 的 protocolOwned），而这两件事都发生在**解密之前** ——
-// 那时还不知道是哪个用户。
+// 那时还不知道对方用的是哪条凭据。
 //
-// 所以只能把每个用户的 password 都派生一遍，全部纳入识别范围：
+// 所以只能把每条密码都派生一遍，全部纳入识别范围：
 //
-//	用户 A → password_A → mark_A
-//	用户 B → password_B → mark_B
+//	凭据 A → password_A → mark_A
+//	凭据 B → password_B → mark_B
 //	服务端接受 mark_A 与 mark_B
 //
-// 包数很少（用户数十个量级），所以 nft 规则数与 map 大小都可以忽略。
+// 凭据数很少（几条到几十条量级），所以 nft 规则数与 map 大小都可以忽略。
 //
 // 显式配置了 ip_id_mark 时只返回那一个值（兼容旧配置：
 // 旧部署可能已经和客户端约定了一个手工值）。
@@ -248,17 +281,17 @@ func (s *ServerConfig) Marks() []uint16 {
 	if s.IPIDMark != 0 {
 		return []uint16{s.IPIDMark & 0xFF00}
 	}
-	users, err := s.effectiveUsers()
-	if err != nil || len(users) == 0 {
+	passwords, err := NormalizePasswords(s.Password, s.Passwords, nil)
+	if err != nil || len(passwords) == 0 {
 		// Validate 已校验过，这里只是防御：退回默认值，
 		// 保证不会返回空集（空集会让服务端一个包都认不出来）。
 		return []uint16{IPIDMark}
 	}
-	out := make([]uint16, 0, len(users))
-	seen := make(map[uint16]struct{}, len(users))
-	for _, u := range users {
-		m := DeriveIPIDMark(u.Password)
-		// 去重：不同部署/不同用户理论上有极小概率派生出同一个标记，
+	out := make([]uint16, 0, len(passwords))
+	seen := make(map[uint16]struct{}, len(passwords))
+	for _, p := range passwords {
+		m := DeriveIPIDMark(p)
+		// 去重：不同部署/不同凭据理论上有极小概率派生出同一个标记，
 		// 那样规则会重复写两遍（无害但脏），去重更干净。
 		if _, dup := seen[m]; dup {
 			continue

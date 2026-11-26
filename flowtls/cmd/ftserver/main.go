@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,20 +27,38 @@ import (
 	ftquic "github.com/luowei729/flowtls/quic"
 )
 
+// passwordList 让 -password 可以重复给出（flag.Var）。
+//
+// 每给一次就是一条**独立凭据**（各自派生 authID 与 ip_id_mark）：
+//
+//	ftserver -password shared -password my-phone
+//
+// 只给一次时等价于单密码模式，多个客户端可以共用它。
+type passwordList []string
+
+func (p *passwordList) String() string { return strings.Join(*p, ",") }
+
+func (p *passwordList) Set(v string) error {
+	*p = append(*p, v)
+	return nil
+}
+
 func main() {
 	var (
-		listen   = flag.String("listen", "0.0.0.0:8443", "监听地址")
-		password = flag.String("password", "", "密码")
-		localIP  = flag.String("local-ip", "", "回包源 IP（NAT 云主机填内网地址；留空按路由探测）")
-		ipidMark = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
+		listen = flag.String("listen", "0.0.0.0:8443", "监听地址")
+		// 可重复：每次一条凭据。用引号包住含空格的密码。
+		passwords passwordList
+		localIP   = flag.String("local-ip", "", "回包源 IP（NAT 云主机填内网地址；留空按路由探测）")
+		ipidMark  = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
 
 		upMbps   = flag.Int("up", 0, "发往客户端的速率上限 Mbps（0=1000）")
 		downMbps = flag.Int("down", 0, "从客户端接收的速率上限 Mbps（0=1000）")
 		verbose  = flag.Bool("v", false, "打印每 2 秒的路径统计")
 	)
+	flag.Var(&passwords, "password", "密码（可重复，每次一条凭据）")
 	flag.Parse()
 
-	if *password == "" {
+	if len(passwords) == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -49,9 +68,9 @@ func main() {
 		os.Exit(2)
 	}
 	cfg := flowtls.ServerConfig{
-		Listen:   addr,
-		Password: *password,
-		IPIDMark: uint16(*ipidMark),
+		Listen:    addr,
+		Passwords: passwords,
+		IPIDMark:  uint16(*ipidMark),
 
 		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,
@@ -75,7 +94,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer srv.Close()
-	fmt.Printf("✓ flowtls 服务端已就绪 %s（用户 %d 个）\n", srv.Addr(), srv.Users())
+	fmt.Printf("✓ flowtls 服务端已就绪 %s（凭据 %d 条）\n", srv.Addr(), srv.Credentials())
 	fmt.Printf("  发送路径: %s\n", srv.SendMode())
 
 	for {

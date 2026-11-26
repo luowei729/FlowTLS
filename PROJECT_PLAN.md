@@ -320,6 +320,28 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 rev.10 = rev.9 + 挂死处理。wire format 未改。
 发送路径不加 `SO_SNDTIMEO`。内容见 CHANGELOG 同日条目。
 
+### 发布 rev.12（2026-11-26 北京时间）
+
+rev.12 = rev.11 + 凭据形态收敛。**外层伪 TCP 报文格式未改，也没有 wire
+format 变更**：authID 仍由 `HKDF(password)` 派生，服务端查表逻辑不变。
+
+改动只有配置层与日志层：
+
+- 去掉用户名。`users[].name` 不再参与任何逻辑（字段保留只为让旧配置能被
+  解析——删了会以 unknown field 拒绝启动）。
+- 新增 `passwords: ["a","b"]`（多密码），与 `password`（单密码）互斥。
+  **一条密码本来就支持任意多个客户端共用**，所以「多设备共用一个默认密码」
+  只需要一条 `password`。
+- 重复密码从「静默覆盖」改为**直接报错**：同密码派生同一个 authID，
+  map 覆盖会让启动日志的凭据数少于配置项，且不说少的是哪条。
+- 日志身份标识改为 `u` + authID 前 4 字节，`Listener.Users()` →
+  `Credentials()`，启动日志「用户 N 个」→「凭据 N 条」。
+- PassWall 节点表单删除「认证方式」与「用户名」，另加一条 FlowTLS 专属的
+  密码提示行（不改共享的 password 控件）。包版本 `1.14.4-r12`。
+- `ftserver -password` 可重复给出，便于联调多密码。
+
+详见 `DEVTIPS.md` 第 166 条。
+
 ### 发布 rev.11（2026-11-18 21:45）
 
 rev.11 = rev.10 + hysteria2 同款 Brutal。外层伪 TCP 报文格式未改。

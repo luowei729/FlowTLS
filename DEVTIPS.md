@@ -6,6 +6,57 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 166. 去掉用户名，凭据收敛成 password / passwords（2026-11-26 北京时间）
+
+需求来自真实部署：**多台设备要共用一个默认密码**。原来的 `users[]`
+形态有两个毛病：
+
+1. `name` 被当成「用户」来理解，但服务端从来只有凭据——线上只传
+   `HKDF(password)` 派生的 authID，`name` 连日志之外没有任何用处。
+   多一个字段就多一处「填了以为有用」的误解。
+2. `newUserTable` 以 authID 为 map key，**重复密码会静默覆盖**前一条：
+   `t.byAuthID[c.AuthID()] = &userEntry{...}`。症状是「配了 5 条、
+   启动日志说只有 4 条」，而且不说少的是哪条。
+   而「共用一个默认密码」最常见的误用就是把同一条密码复制成多行。
+
+现在的形态：
+
+| 写法 | 含义 | 状态 |
+|---|---|---|
+| `"password": "x"` | 一条凭据，**支持任意多个客户端共用** | 推荐 |
+| `"passwords": ["a","b"]` | 每条一条凭据，各自派生 authID 与 mark | 推荐 |
+| `"users": [{"password":"x"}]` | 等价于 `passwords`，`name` 被忽略 | 已废弃，仅为兼容 |
+
+- 三者**互斥**，同填报错。判断收在 `flowtls.NormalizePasswords` 一处：
+  `sing-box check` 走 option 层、真正启动走传输层，两份规则一旦走偏就会
+  出现「check 通过但起不来」。
+- **重复密码直接报错**，不再静默去重。空元素也报错（空密码 = 谁都能连）。
+- 日志里的身份标识改为 `u` + authID 前 4 字节（形如 `u3f1c2d4`）：
+  跨重启稳定、不额外汇漏（authID 本来就明文在首包里）、
+  且语义正确——它标识的是**凭据**，共用一条密码的设备天然同名。
+- `Listener.Users()` → `Credentials()`，启动日志「用户 N 个」→「凭据 N 条」。
+  它数的是密码条数，不是在线设备数。
+
+配套改动（都在这轮里）：
+
+- `option.FlowTLSInboundOptions` 增加 `passwords`，`users` 保留但标记废弃。
+  **不能删** `users` / `name` 字段：sing-box 以 unknown field 拒绝启动，
+  删了会让所有旧 `server.json` 起不来（`max_cwnd` 是同一个道理）。
+- PassWall 节点表单删掉「认证方式」与「用户名」：前者从未影响生成的配置，
+  后者不会发送；密码提示改成一条 **FlowTLS 专属**的 DummyValue 只读行。
+  **不能直接改共享的 `password` 控件说明**：那是 `1_sing-box.lua` 给所有
+  sing-box 协议共用的同一个对象，我们的措辞里有「IP ID 标记」这种
+  FlowTLS 专有名词，改它会弄脏 hysteria2 / vless / trojan 的界面。
+- `luatest.lua` 的假 CBI 曾忽略 `Section:option` 的 class 参数，只调
+  `mkopt`，于是「控制器传进来的 class 是否被用上」这件事根本没被测到——
+  `DummyValue` 那条分支就这样静默失效过一次。现在改成与真实 CBI 一致：
+  `option(self, ...)` 委托给值对象构造，并用 `package.preload` 注入假
+  `luci.cbi` 把那条分支真正跑到。
+- `ftserver` 的 `-password` 改为可重复（每次一条凭据），便于联调多密码。
+
+对应单测：`TestCredentialSources`、`TestDuplicatePasswordRejected`、
+`TestCredentialIDStable`、`TestMarksMultiUser`。
+
 ## 165. 拥塞控制换成 hysteria2 的 Brutal，速率写在 up_mbps（2026-11-18 21:25）
 
 BBR 在常年 15% 丢包的链路上会停在 recovery，窗口被减到 4 个包，
@@ -4542,6 +4593,10 @@ _f(m, s, s1)
 "界面上少几个字段"本身不报错，不留痕就只能靠猜。
 
 ## 149. `password` 与 `users` 同填时顶层密码是死配置（2026-11-17 00:40）
+
+> **已被第 166 条取代**：从 rev.12 起没有 `users[].name`，且 `password` /
+> `passwords` / `users` 三者互斥，重复密码直接报错。本文记录的是当时的
+> 二选一形态与为什么必须报错，结论（"不要静默忽略"）仍然成立。
 
 服务端的凭据有两条路径，`effectiveUsers()` 里是**二选一**：
 

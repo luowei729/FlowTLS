@@ -19,7 +19,7 @@ package flowtls
 //	自动一致 —— 客户端用自己那份 password 算，服务端用同一个 password 算，
 //	            不需要任何手工同步；
 //	自动不同 —— 不同部署的 password 不同，mark 自然不同；
-//	自动支持多用户 —— 服务端为**每个**用户的 password 各算一个 mark。
+//	自动支持多凭据 —— 服务端为**每条**密码各算一个 mark。
 //
 // ## 为什么用 HKDF 而不是直接 hash
 //

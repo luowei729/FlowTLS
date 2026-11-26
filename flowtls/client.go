@@ -89,7 +89,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	// ip_id_mark 用着默认值时必须明确提醒。
 	//
 	// 它不能像 source_port 那样自动生成：服务端与**所有**客户端必须用同
-	// 一个值（服务端靠它判断伪包），而多用户部署下每个用户 password 不同，
+	// 一个值（服务端靠它判断伪包），而多凭据部署下每条密码不同，
 	// 「从 password 派生」在两端会算出不同结果。所以只能显式配置，
 	// 唯一能做的就是提醒部署方别留着公开默认值。
 	if IsDefaultIPIDMark(cfg.IPIDMark) {

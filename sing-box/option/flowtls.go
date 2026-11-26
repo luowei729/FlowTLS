@@ -28,9 +28,33 @@ package option
 // listen / listen_port 用于计算 iptables 规则与伪装网站，隧道本身不占用。
 type FlowTLSInboundOptions struct {
 	ListenOptions
-	// Password 同时是外层 AEAD 的密钥来源（HKDF 输入）。对应 Rust `password`。
+	// Password 是**单密码**凭据（与 passwords / users 互斥）。
+	//
+	// 同时是外层 AEAD 的密钥来源（HKDF 输入），对应 Rust `password`。
+	//
+	// **多个客户端可以共用同一个密码**：凭据只有一份，谁拿到都能连。
+	// 这是「一台服务端 + 多台设备」最省事的形态，也是推荐形态。
 	Password string `json:"password,omitempty"`
-	// Users 对应 Rust `users`；为空时只用 Password 做单用户认证。
+	// Passwords 是**多密码**凭据表（与 password / users 互斥）。
+	//
+	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ip_id_mark
+	// （见 flowtls/mark.go）。多个客户端也可以共用其中一条（"默认密码"），
+	// 所以下面这种配置同时表达了「朋友共用一个」与「自己的设备可单独吊销」：
+	//
+	//	"passwords": ["family-default", "my-phone", "my-laptop"]
+	//
+	// **不要重复填同一个密码**：一条密码本来就支持任意多个客户端，
+	// 重复项会派生出同一个 authID 而被直接拒绝（静默去重会让日志里的
+	// 凭据数少于配置项，那种故障极难查）。
+	//
+	// 没有用户名字段：线上只传 password 派生出的 authID，
+	// 日志里的 uXXXXXXXX 同样从 authID 派生，无法反推密码。
+	Passwords []string `json:"passwords,omitempty"`
+	// Users 已废弃（rev.11 及更早的旧写法），仅为让旧配置继续启动：
+	// 等价于 Passwords，其中 name 被**忽略**。
+	//
+	// 保留而不是删除，是因为 sing-box 会以 unknown field 拒绝启动，
+	// 直接删字段会让所有旧 server.json 起不来。新配置请用 passwords。
 	Users []FlowTLSUser `json:"users,omitempty"`
 	// LocalIP 是回包时使用的源 IP。**留空即可，不需要配**。
 	//
@@ -113,9 +137,17 @@ type FlowTLSMasqueradeOptions struct {
 	KeyPath         string `json:"key_path,omitempty"`
 }
 
-// FlowTLSUser 对应 Rust `UserFile`。
+// FlowTLSUser 是已废弃的旧写法（rev.11 及更早），用 `passwords: ["..."]` 代替。
+//
+// 保留这个结构只为让旧配置不因 unknown field 而启动失败。
 type FlowTLSUser struct {
-	Name     string `json:"name,omitempty"`
+	// Name 已废弃且**被忽略**。
+	//
+	// 服务端从 rev.12 起没有「用户」概念，只有「凭据」：一条密码就是一个
+	// 凭据，多个客户端可以共用同一条。日志里的 uXXXXXXXX 由 authID 派生，
+	// 不需要也不应该由配置提供——这样共用密码的设备天然不可区分。
+	Name string `json:"name,omitempty"`
+	// Password 是这条凭据的密码，等价于 passwords 数组里的一个元素。
 	Password string `json:"password,omitempty"`
 }
 

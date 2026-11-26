@@ -208,7 +208,7 @@ func TestNftServerScriptShape(t *testing.T) {
 		"add rule inet flowtls out_8443 tcp sport 8443 notrack",
 		"add chain inet flowtls in_8443 { type filter hook prerouting priority raw; policy accept; }",
 		"add rule inet flowtls in_8443 tcp dport 8443 notrack",
-		// 每个用户的派生标记各一条（多用户部署的核心）
+		// 每条凭据的派生标记各一条（多凭据部署的核心）
 		"add rule inet flowtls in_8443 tcp dport 8443 ip id & 0xff00 == 0x1e00 drop",
 		"add rule inet flowtls in_8443 tcp dport 8443 ip id & 0xff00 == 0xc500 drop",
 	}
@@ -280,27 +280,27 @@ func TestDeriveIPIDMarkIsStableAndDiffers(t *testing.T) {
 	}
 }
 
-// TestMarksMultiUser 钉住多用户服务端的标记集合。
+// TestMarksMultiUser 钉住多凭据服务端的标记集合。
 //
-// 多用户是 mark 必须**从 password 派生**而不是全局配置的根本原因：
-// 服务端在内核层判断「是不是我们的包」时还没解密，不知道对端是谁，
-// 所以只能把每个用户的派生标记都纳入识别范围。
+// 多凭据是 mark 必须**从 password 派生**而不是全局配置的根本原因：
+// 服务端在内核层判断「是不是我们的包」时还没解密，不知道对方用的是
+// 哪条凭据，所以只能把每条凭据的派生标记都纳入识别范围。
 func TestMarksMultiUser(t *testing.T) {
 	cfg := &ServerConfig{
-		Users: []User{
-			{Name: "a", Password: "password-a"},
-			{Name: "b", Password: "password-b"},
-			{Name: "c", Password: "password-a"}, // 同一口令 → 同一标记
-		},
+		// 三条互不相同的密码：NormalizePasswords 会拒绝重复项，
+		// 所以这里验证的是「三条凭据 → 三个标记」这条主线。
+		// （「同一条密码被多台设备共用」是另一回事：它只有一条凭据、
+		//  一个标记，见 TestCredentialSources 的单密码分支。）
+		Passwords: []string{"password-a", "password-b", "password-c"},
 	}
 	marks := cfg.Marks()
-	if len(marks) != 2 {
-		t.Fatalf("三个用户（其中两个同口令）应得到 2 个标记，得到 %d: %v",
-			len(marks), marks)
+	if len(marks) != 3 {
+		t.Fatalf("三条凭据应得到 3 个标记，得到 %d: %v", len(marks), marks)
 	}
 	want := []uint16{
 		DeriveIPIDMark("password-a"),
 		DeriveIPIDMark("password-b"),
+		DeriveIPIDMark("password-c"),
 	}
 	for _, w := range want {
 		found := false

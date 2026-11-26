@@ -48,7 +48,6 @@ udp:
       "listen": "0.0.0.0",
       "listen_port": 8443,
       "password": "换成你自己的密码",
-      "users": [{ "name": "alice", "password": "alice-pass" }],
       "udp_session_timeout": 120
     }
   ],
@@ -62,7 +61,7 @@ udp:
 |---|---|---|
 | `listen: "0.0.0.0:8443"` | `listen` + `listen_port` | 拆成两个字段 |
 | `password` | `password` | 一致；外层 AEAD 的密钥来源 |
-| `users[].name/password` | `users[].name/password` | 一致；`users` 非空时忽略 `password` |
+| `users[].name/password` | `passwords: ["…"]` | **字段换了**：服务端从 rev.12 起没有「用户」概念，只有「凭据」。`users` 仍能解析（`name` 忽略），但新配置请用 `passwords` |
 | `faketcp.ip_id_magic` | （删掉即可） | 新版由 `HKDF(password)` 自动派生，两端一致 |
 | `faketcp.local_ip` | （删掉即可） | 新版用「客户端本次发往的地址」作为回包源地址，NAT / 多 IP 主机都对 |
 | `faketcp.handshake` | —— | 服务端恒为「标准三次握手」，无开关 |
@@ -198,7 +197,7 @@ net:
 
 | 项 | Rust | sing-box |
 |---|---|---|
-| 多用户 | `users` 列表 | `users` 列表（`authID` 由密码派生，用户名只进日志） |
+| 多凭据 | `users` 列表 | `passwords` 数组（`authID` 由密码派生，rev.12 起没有用户名） |
 | UDP | SOCKS5 UDP ASSOCIATE | QUIC DATAGRAM，任意入站都能用 |
 | 路由 | 无 | 全套（`route.rules`、DNS、`rule_set`） |
 | TUN | 无 | 有 |

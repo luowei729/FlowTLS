@@ -74,22 +74,22 @@ type Inbound struct {
 
 // NewInbound 只校验参数。真正的监听在 Start(StartStateStart)。
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.FlowTLSInboundOptions) (adapter.Inbound, error) {
-	if options.Password == "" && len(options.Users) == 0 {
-		return nil, C.ErrFlowTLSRequirePassword
-	}
-	// 凭据二选一：password（单用户）与 users（多用户）不能同时配置。
+	// 凭据：password（单密码）/ passwords（多密码）/ users（旧写法）
+	// **三者互斥**，且空值、重复项都要在这里拦住。
 	//
-	// 放在这里而不只在 flowtls.ServerConfig.Validate 里，是因为
+	// 放在 NewInbound 而不只在 flowtls.ServerConfig.Validate 里，是因为
 	// `sing-box check` 只走 NewInbound、不走 Start —— 而"配置校验不需要
 	// root"是项目的硬要求，错误必须在 check 阶段就暴露。
 	//
-	// 为什么必须报错而不是"以 users 为准"：users 非空时顶层 password
-	// 既不参与登录、也不参与 ip_id_mark 派生，留着只会让人以为它是
-	// 兜底凭据，而 mark 不一致的症状是隧道完全不通（DEVTIPS 149）。
-	if options.Password != "" && len(options.Users) > 0 {
-		return nil, E.New("flowtls: password 与 users 不能同时配置 —— " +
-			"只配 password 表示单用户；配 users 表示多用户，" +
-			"此时 password 会被完全忽略（既不能登录、也不参与 ip_id_mark 派生）")
+	// 同时填多个来源必须报错而不是"以某个为准"：被忽略的那个既不参与
+	// 登录、也不参与 ip_id_mark 派生，留着只会让人以为它是兜底凭据，
+	// 而 mark 不一致的症状是隧道完全不通（DEVTIPS 149）。
+	//
+	// 复用 ft.NormalizePasswords 而不是在这里重写一遍判断：
+	// 互斥/空值/去重三套规则分散在两层各写一份，一旦走偏就会出现
+	// 「check 通过但起不来」这种最难查的不一致。
+	if _, err := ft.NormalizePasswords(options.Password, options.Passwords, legacyPasswords(options.Users)); err != nil {
+		return nil, err
 	}
 	if options.ListenPort == 0 {
 		return nil, E.New("flowtls: listen_port is required")
@@ -132,6 +132,21 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}, nil
 }
 
+// legacyPasswords 把已废弃的 users[] 压成密码列表。
+//
+// name 被丢弃：服务端从 rev.12 起只有「凭据」概念，没有「用户」。
+// 留在结构里只为让旧配置能被解析（删字段会触发 unknown field 拒绝启动）。
+func legacyPasswords(users []option.FlowTLSUser) []string {
+	if len(users) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+		out = append(out, u.Password)
+	}
+	return out
+}
+
 // Start 在 StartStateStart 阶段监听。
 //
 // 必须在 Start 里调用 NewServer：它会申请 raw socket（需要 root），
@@ -149,10 +164,16 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if err != nil {
 		return err
 	}
+	// 凭据归一（NewInbound 已校验过一次，这里拿到实际生效的列表）。
+	// 两处都调同一个函数，所以不会出现「check 用一套规则、启动用另一套」。
+	passwords, err := ft.NormalizePasswords(h.opts.Password, h.opts.Passwords, legacyPasswords(h.opts.Users))
+	if err != nil {
+		return err
+	}
 
 	cfg := ft.ServerConfig{
 		Listen:         listenAddr,
-		Password:       h.opts.Password,
+		Passwords:      passwords,
 		Handshake:      handshake,
 		IPIDMark:       h.opts.IPIDMark,
 		UDPEnabled:     &h.udpOn,
@@ -164,9 +185,6 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		// 注入之后，flowtls 传输层（握手上失败、收包失败、截断告警、
 		// 清理旧会话等）全部受 `log.level` 控制；不注入则完全静默。
 		Logger: h.logger,
-	}
-	for _, u := range h.opts.Users {
-		cfg.Users = append(cfg.Users, ft.User{Name: u.Name, Password: u.Password})
 	}
 	if h.opts.LocalIP != "" {
 		a, perr := netip.ParseAddr(h.opts.LocalIP)
@@ -199,7 +217,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	h.server = srv
 	h.logger.Info("flowtls 服务端已就绪 ", srv.Addr(),
-		"（用户 ", srv.Users(), " 个）; 发送路径: ", srv.SendMode())
+		"（凭据 ", srv.Credentials(), " 条）; 发送路径: ", srv.SendMode())
 
 	// 伪装网站：与 Rust 一样**真 bind 内核 TCP 端口**。
 	// 伪包在 raw 表被 DROP，剩下的包才落到这个站点上。

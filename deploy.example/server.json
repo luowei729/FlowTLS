@@ -15,29 +15,38 @@
       "listen": "0.0.0.0",
       "listen_port": 8443,
 
-      // **凭据二选一：单用户填 password，多用户填 users。不要同时填。**
+      // **凭据三选一：password（单密码）/ passwords（多密码）/ users（旧写法）。
+      // 只填其中一个，同填会直接报错。**
       //
       // password 是外层 AEAD 的密钥来源（HKDF-SHA256），
       // ip_id_mark 也从它派生，所以客户端必须完全一致。
+      //
+      // **多个客户端可以共用这一条密码**——这是「一台服务端 + 多台设备」
+      // 最省事的形态。不需要为了多台设备把它复制成多行。
       "password": "CHANGE_ME_STRONG_PASSWORD",
 
-      // 多用户（可选）。结构与 sing-box 的 hysteria2 / anytls 一致：
-      //   - name 只用于日志，可留空；
-      //   - password 才是凭证，同时是 AEAD 密钥来源。
-      // 线上不会传 name，也不会传 password 本身，只传 password 派生出的
-      // 16 字节不透明 authID，服务端用它查表选密钥（O(1)，不逐个试解）。
+      // 多密码（可选，与上面的 password 互斥）。
       //
-      // 一旦启用 users（即数组非空），上面那个 password 就必须**删掉**——
-      // 同填两处会直接报错（不是"以 users 为准"）。
-      // 原因：顶层 password 那时既不参与登录、也不参与 ip_id_mark 派生，
-      // 留着只会让人以为它是兜底凭据，而 mark 不一致的症状是"隧道完全不通"。
+      // 每个元素是一条独立凭据，各自派生自己的 authID 与 ip_id_mark。
+      // 多个客户端可以共用其中一条（典型的「默认密码」），所以下面这种
+      // 写法同时表达了「朋友共用一个」与「自己的设备可单独吊销」：
       //
-      // 每个用户的 password 都会派生**各自**的 ip_id_mark，服务端把全部
-      // 标记都纳入识别范围（内核层判断时还没解密，不知道对端是谁）。
-      "users": [
-        // { "name": "alice", "password": "CHANGE_ME_ALICE_STRONG_PASSWORD" },
-        // { "name": "bob",   "password": "CHANGE_ME_BOB_STRONG_PASSWORD" }
-      ],
+      // "passwords": [
+      //   "CHANGE_ME_FAMILY_DEFAULT_PASSWORD",
+      //   "CHANGE_ME_MY_PHONE_PASSWORD",
+      //   "CHANGE_ME_MY_LAPTOP_PASSWORD"
+      // ],
+      //
+      // **不要重复填同一条密码**：一条密码本来就支持任意多个客户端，
+      // 重复项会派生出同一个 authID 而被直接拒绝（静默去重会让日志里的
+      // 凭据数少于配置项，那种故障极难查）。
+      //
+      // 线上只传 authID，不传密码本身：16 字节不透明标识，
+      // 服务端用它查表选密钥（O(1)，不逐个试解）。
+      // 日志里的 uXXXXXXXX 也由 authID 派生，无法反推密码。
+      //
+      // users 是 rev.11 及更早的旧写法，等价于 passwords 且 name 被忽略：
+      // 保留只为让旧配置能继续启动（删字段会以 unknown field 拒绝启动）。
 
       // **不需要配 local_ip**：服务端用「客户端本次发往的地址」作为
       // 回包源地址（即入包的 IP 头目的地址），零配置且永远正确。
@@ -55,8 +64,8 @@
       //
       // 不再需要手填：password 本来就是两端共享、且每个部署各不相同的
       // 秘密，从它派生 mark 能同时满足「两端一致」与「部署间不同」。
-      // 多用户时服务端会为每个用户的 password 各派生一个标记，
-      // 全部纳入识别范围（内核层判断时还没解密，不知道对端是谁）。
+      // 每条凭据的 password 都会派生**各自**的 ip_id_mark，服务端把全部
+      // 标记都纳入识别范围（内核层判断时还没解密，不知道对方用哪条凭据）。
       //
       // 填了就用你填的值（所有客户端必须填同一个），仅在需要兼容旧部署时用。
 

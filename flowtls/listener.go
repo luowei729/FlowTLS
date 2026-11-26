@@ -17,7 +17,9 @@ package flowtls
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"time"
@@ -39,8 +41,8 @@ type synState struct {
 	at      time.Time
 	// mark 是这条 SYN 命中的 ip_id_mark。
 	//
-	// 首包的 IP ID 低字节已经递增，多用户时 `markOf` 可能命中
-	// 另一个用户的标记（匹配是 `ip_id & m == m`，不是高字节相等）。
+	// 首包的 IP ID 低字节已经递增，多凭据时 `markOf` 可能命中
+	// 另一条凭据的标记（匹配是 `ip_id & m == m`，不是高字节相等）。
 	// 回包必须继续用握手时认下的那个，否则客户端内核规则对不上。
 	mark uint16
 }
@@ -60,14 +62,19 @@ type ListenerOptions struct {
 
 // Listener 是服务端入口：接收伪造 TCP 连接并交给上层（quic.Transport）。
 type Listener struct {
-	raw   *rawSocket
-	users *userTable
+	raw *rawSocket
+	// creds 是凭据表（authID → 该凭据的编解码器）。
+	//
+	// 叫 creds 而不是 users：本轮改动去掉了用户名，服务端认识的是
+	// **密码**（凭据），不是「人」。多条客户端共用同一条密码时，
+	// 它们在这里就是同一条记录，本来就应当不可区分。
+	creds *userTable
 	port  uint16
-	// marks 是本服务端接受的**全部** ip_id_mark（每个用户一个）。
+	// marks 是本服务端接受的**全部** ip_id_mark（每条凭据一个）。
 	//
 	// 为什么是一组：内核层要判断「这个包是不是我们的」时还没解密，
-	// 不知道对端是哪个用户，所以只能把每个用户的派生标记都纳入范围
-	// （见 ServerConfig.Marks）。这也是多用户部署下「mark 从 password
+	// 不知道对方用的是哪条凭据，所以只能把每条凭据的派生标记都纳入范围
+	// （见 ServerConfig.Marks）。这也是多凭据部署下「mark 从 password
 	// 派生」能成立的关键 —— 服务端不需要预先知道谁来连。
 	marks []uint16
 	// logger 是诊断日志出口，恒非 nil（构造时经 loggerOr 归一）。
@@ -113,16 +120,25 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 		opts.AcceptQueue = 64
 	}
 
-	users, err := newUserTable(mustEffectiveUsers(&cfg))
+	// 凭据：Validate 已经校验过一次，这里取实际生效的列表。
+	//
+	// 再调一遍而不复用 Validate 的中间结果，是因为 NormalizePasswords
+	// 是纯函数、开销只有几次 map 操作，而把结果缓存到 ServerConfig
+	// 里会让「配置结构体被调用方复用」时出现脏值。
+	passwords, err := NormalizePasswords(cfg.Password, cfg.Passwords, nil)
+	if err != nil {
+		return nil, err
+	}
+	creds, err := newUserTable(passwords)
 	if err != nil {
 		return nil, err
 	}
 	// 日志出口先归一：后面 newRawSocket 与收包协程都要用。
 	logger := loggerOr(cfg.Logger)
 
-	// marks 是每个用户 password 派生出的 ip_id_mark（见 ServerConfig.Marks）。
+	// marks 是每条 password 派生出的 ip_id_mark（见 ServerConfig.Marks）。
 	// 服务端在内核层判断「是不是我们的包」时还没解密，所以必须把所有
-	// 用户的标记都纳入识别范围。
+	// 凭据的标记都纳入识别范围。
 	marks := cfg.Marks()
 
 	// 探测用的目的地址**不能是监听地址**。
@@ -163,7 +179,7 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	l := &Listener{
 		raw:    raw,
 		port:   cfg.Listen.Port(),
-		users:  users,
+		creds:  creds,
 		marks:  marks,
 		logger: logger,
 		// 这两个必须从 opts 抄过来。漏掉时字段是 0，
@@ -186,16 +202,6 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	return l, nil
 }
 
-// mustEffectiveUsers 取实际生效的用户表（Validate 已保证非空）。
-func mustEffectiveUsers(cfg *ServerConfig) []User {
-	users, err := cfg.effectiveUsers()
-	if err != nil || len(users) == 0 {
-		// Validate 已校验过，这里只是防御。
-		return nil
-	}
-	return users
-}
-
 // Addr 返回监听地址。
 func (l *Listener) Addr() netip.AddrPort {
 	return netip.AddrPortFrom(l.raw.localIP, l.port)
@@ -207,8 +213,11 @@ func (l *Listener) LocalIP() netip.Addr { return l.raw.localIP }
 // SendMode 返回底层发送路径描述，供上层记启动日志。
 func (l *Listener) SendMode() string { return l.raw.SendMode() }
 
-// Users 返回用户表大小（供启动日志展示）。
-func (l *Listener) Users() int { return l.users.len() }
+// Credentials 返回凭据条数（供启动日志展示）。
+//
+// 它是**密码的条数**，不是在线客户端数：多条客户端共用一条密码时
+// 这里仍然是 1。这个语义是刻意的 —— 共用密码的设备本来就不可区分。
+func (l *Listener) Credentials() int { return l.creds.len() }
 
 // Accept 阻塞等待一条已鉴权的会话。
 //
@@ -664,7 +673,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 		if !ok || ver != ProtocolVersion {
 			continue
 		}
-		e, found := l.users.lookup(authID)
+		e, found := l.creds.lookup(authID)
 		if !found {
 			continue
 		}
@@ -699,7 +708,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	l.mu.Unlock()
 
 	var peerISN, ourISN, ts uint32
-	// 有 pending 就用 SYN 认下的标记。首包再 markOf 一次会在多用户时
+	// 有 pending 就用 SYN 认下的标记。首包再 markOf 一次会在多凭据时
 	// 命中别的标记，回包的 IP ID 高字节就和客户端规则不一致。
 	mark := l.markOf(p)
 	if hasPending {
@@ -862,33 +871,60 @@ func (l *Listener) maintainLoop() {
 	}
 }
 
-// userEntry 是一条用户记录（密码 + 该用户专属编解码器）。
+// userEntry 是一条凭据的服务端记录（密码 + 该凭据专属的编解码器）。
 type userEntry struct {
-	name  string
+	// id 是给日志用的公开短标识，由 authID 前 4 字节派生（形如 u3f1c2d4）。
+	//
+	// 为什么从 authID 派生而不是随机生成：
+	//   - 稳定：同一条密码在重启前后是同一个 id，日志能对上；
+	//   - 不额外泄漏：authID 本来就明文出现在首包里，写进日志不增加暴露面；
+	//   - 语义正确：它标识的是**凭据**而不是「人」。共用一条密码的客户端
+	//     本来就应当显示成同一个 id —— 这也正是去掉用户名的理由。
+	//
+	// 4 字节是折中：65536 个取值下多条凭据撞 id 的概率约 n²/2^33，
+	// 十条以内可以忽略；真撞了也只是日志里两行同名，不影响鉴权。
+	id    string
 	codec *Codec
 }
 
 // userTable 用 authID 做 O(1) 查表。
 //
-// 不能遍历试解：100 用户就是 100 倍 AEAD 开销，且试验次数可被计时。
+// 不能遍历试解：100 条凭据就是 100 倍 AEAD 开销，且试验次数可被计时。
 type userTable struct {
 	byAuthID map[[AuthIDLen]byte]*userEntry
 }
 
-// newUserTable 由用户列表构造查表结构。
-func newUserTable(users []User) (*userTable, error) {
-	if len(users) == 0 {
-		return nil, errors.New("flowtls: 服务端必须配置 password 或 users")
+// newUserTable 由密码列表构造查表结构。
+//
+// **重复密码必须报错，不能静默覆盖**：同一条密码派生同一个 authID，
+// 而 map 以 authID 为 key，后一条会覆盖前一条 —— 症状是「配了 5 条、
+// 启动日志只说 3 条」，且不告诉少的是哪条。NormalizePasswords 已经在
+// 明文层面拦了重复，这里只兜底「两条不同密码派生出同一 authID」
+// （概率 2^-128，正常不可能发生）。
+func newUserTable(passwords []string) (*userTable, error) {
+	if len(passwords) == 0 {
+		return nil, errors.New("flowtls: 服务端必须配置 password 或 passwords")
 	}
-	t := &userTable{byAuthID: make(map[[AuthIDLen]byte]*userEntry, len(users))}
-	for _, u := range users {
-		c, err := NewServerCodec(u.Password)
+	t := &userTable{byAuthID: make(map[[AuthIDLen]byte]*userEntry, len(passwords))}
+	for i, password := range passwords {
+		c, err := NewServerCodec(password)
 		if err != nil {
 			return nil, err
 		}
-		t.byAuthID[c.AuthID()] = &userEntry{name: u.Name, codec: c}
+		authID := c.AuthID()
+		if prev, dup := t.byAuthID[authID]; dup {
+			return nil, fmt.Errorf(
+				"flowtls: 第 %d 条 password 与凭据 %s 派生出同一个 authID（密码重复？）",
+				i+1, prev.id)
+		}
+		t.byAuthID[authID] = &userEntry{id: credentialID(authID), codec: c}
 	}
 	return t, nil
+}
+
+// credentialID 把 authID 压成日志用的短标识：u + 前 4 字节十六进制。
+func credentialID(authID [AuthIDLen]byte) string {
+	return "u" + hex.EncodeToString(authID[:4])
 }
 
 func (t *userTable) lookup(authID [AuthIDLen]byte) (*userEntry, bool) {

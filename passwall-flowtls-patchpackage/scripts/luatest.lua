@@ -154,15 +154,33 @@ local function mkopt(map, section, option, title, desc)
 		value = function(self, v, label) self.values[#self.values + 1] = v end,
 	}
 end
-_G.Value = function(...) local o = mkopt(...); made[#made + 1] = o; return o end
+-- 假的值对象构造器：与真实 CBI 一样签名为 (section, option, title, desc)。
+-- 必须把 section.map 当成第一个参数传给 mkopt，否则 o.map 会错位成 section，
+-- 后续按 config_option 登记字段时就取不到正确名字。
+_G.Value = function(section, option, title, desc)
+	local o = mkopt(section.map, section, option, title, desc)
+	made[#made + 1] = o
+	return o
+end
 _G.ListValue = _G.Value
 
 local function mksection()
 	local sec = { fields = {}, children = {}, option_prefix = "singbox_" }
-	function sec:option(class, name, title, desc)
-		local o = mkopt(self.map, self, name, title, desc)
+	-- 与真实 CBI 一致：Section:option(option, ...) 就是 `option(self, ...)`，
+	-- 由值对象自己完成构造。早先的 mock 忽略了 class 参数、直接调 mkopt，
+	-- 于是「控制器传进来的 class 是否被使用」这件事根本没被测到——
+	-- DummyValue 那条分支就这样静默失效了一次。
+	function sec:option(class, ...)
+		local o
+		if type(class) == "function" then
+			o = class(self, ...)
+		else
+			o = mkopt(self.map, self, ...)
+		end
 		made[#made + 1] = o
-		self.fields[name] = o
+		if o and o.config_option then
+			self.fields[o.config_option] = o
+		end
 		return o
 	end
 	return sec
@@ -216,39 +234,54 @@ for _, n in ipairs(mine) do
 		string.format("字段 %s 已挂 flowtls 依赖", n))
 end
 
--- ------------------------------------------------- 认证方式（单用户 / 多用户）
-print("== 认证方式 ==")
-local mode = sec.fields["auth_mode"]
-ok(mode ~= nil, "认证方式字段已创建")
-if mode then
-	-- 默认必须是单用户：多用户是少数情况，默认值要覆盖大多数部署
-	ok(mode.default == "single",
-		"认证方式默认 single（单用户，填全局密码），实际 " .. tostring(mode.default))
-	local hasSingle, hasMulti = false, false
-	for _, v in ipairs(mode.values or {}) do
-		if v == "single" then hasSingle = true end
-		if v == "multi" then hasMulti = true end
-	end
-	ok(hasSingle and hasMulti, "认证方式同时提供 single 与 multi 两个取值")
-	ok(has_flowtls_dep(mode), "认证方式挂了 flowtls 依赖")
-end
+-- ------------------------------------------------- 已删除的字段（回归护栏）
+print("== 已删除字段 ==")
+-- 认证方式 / 用户名在 rev.12 被删除：
+--   - 认证方式从未影响生成的配置（客户端永远只填一个 password），
+--     只是"该填哪一条密码"的提示，现在合并成一条只读提示行；
+--   - 用户名服务端已不再有这个概念（日志里的 uXXXXXXXX 由密码派生）。
+-- 钉住它们不被重新加回来，否则就是又增加配置项。
+ok(sec.fields["auth_mode"] == nil, "认证方式字段已删除（不再让用户选单/多用户）")
+ok(sec.fields["auth_user"] == nil, "用户名字段已删除（服务端没有用户概念）")
 
--- 用户名只在多用户模式下出现。
+-- 密码提示必须是 **FlowTLS 专属** 的提示行，不能去改共享的 password 控件：
+-- 那个控件被 hysteria2 / vless / trojan 等协议共用，改它的说明会连带
+-- 改掉别人的界面文案，而我们的措辞里有「IP ID 标记」这种 FlowTLS 专有名词。
 --
--- 这里要盯的是 **AND 条件必须并进同一个 depends 表**：
--- LuCI 的 depends 每条之间是 OR，写成两次 depends() 会变成
--- 「protocol=flowtls 或 auth_mode=multi」，于是选任何协议 + 多用户时
--- 这个字段都会跑出来。所以断言「只有一条依赖，且同时含两个键」。
-local user = sec.fields["auth_user"]
-ok(user ~= nil, "用户名字段已创建")
-if user then
-	local deps = user.depsset or {}
-	ok(#deps == 1,
-		string.format("user 应只有 1 条 depends（多条是 OR，会误显示），实际 %d 条", #deps))
-	local d = deps[1] or {}
-	ok(d.protocol == "flowtls" and d.auth_mode == "multi",
-		"用户名依赖应为 {protocol=flowtls, auth_mode=multi}（同一表内 AND），实际 "
-			.. tostring(d.protocol) .. "/" .. tostring(d.auth_mode))
+-- 这里用 package.preload 注入一个假的 luci.cbi，让 DummyValue 那条分支
+-- 在测试里真的被执行到（否则 require 失败会静默跳过，等于没测）。
+local dummyMade = {}
+package.preload["luci.cbi"] = function()
+	return {
+		DummyValue = function(section, title, value)
+			local o = mkopt(section.map, section, "dummy_" .. (#dummyMade + 1), title, value)
+			dummyMade[#dummyMade + 1] = o
+			return o
+		end,
+	}
+end
+-- 重新跑一次扩展，让新注入的 luci.cbi 生效
+local sec2 = mksection()
+sec2.map = {}
+for _, n in ipairs(shared) do
+	local o = mkopt(sec2.map, sec2, n, n, "")
+	o.depsset[1] = { protocol = "socks" }
+	sec2.fields[n] = o
+end
+sec2.fields["protocol"] = {
+	keylist = { "socks", "http", "shadowsocks" },
+	value = function(self, v) self.keylist[#self.keylist + 1] = v end,
+}
+local ran2, err2 = pcall(mod, sec2.map, sec2, sec2)
+ok(ran2, "注入 luci.cbi 后调用不抛异常" .. (ran2 and "" or ("：" .. tostring(err2))))
+ok(#dummyMade == 1, string.format("密码提示行已创建 1 条，实际 %d 条", #dummyMade))
+if dummyMade[1] then
+	ok(has_flowtls_dep(dummyMade[1]), "密码提示行已挂 flowtls 依赖（不会出现在别的协议下）")
+	ok(sec2.fields["password"].description == nil
+		or sec2.fields["password"].description == "",
+		"共享 password 控件的说明未被改动（否则会波及 hysteria2/vless/trojan）")
+	ok(tostring(dummyMade[1].desc):find("分给", 1, true) ~= nil,
+		"提示文案说明了「填分给这台设备的那一条密码」")
 end
 
 -- ---------------------------------------------------------------- 4) 出站包装

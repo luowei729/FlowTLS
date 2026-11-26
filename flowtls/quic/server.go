@@ -126,8 +126,10 @@ func (s *Server) SendMode() string { return s.listener.SendMode() }
 // LocalIP 返回回包实际使用的源 IP。
 func (s *Server) LocalIP() netip.Addr { return s.listener.LocalIP() }
 
-// Users 返回用户数（供启动日志）。
-func (s *Server) Users() int { return s.listener.Users() }
+// Credentials 返回凭据条数（供启动日志）。
+//
+// 它是密码条数，不是在线客户端数：多条客户端共用一条密码时仍然是 1。
+func (s *Server) Credentials() int { return s.listener.Credentials() }
 
 // Close 停止服务并关闭所有连接。
 func (s *Server) Close() error {
