@@ -53,6 +53,12 @@ flowtls 传输层
     （`DEVTIPS.md` 第 149、166 条）。
     **不要加回用户名字段**：服务端只有「凭据」没有「用户」，
     日志里的 `uXXXXXXXX` 由 authID 派生，共用密码的设备天然不可区分。
+    **prerouting 侧的 nft 规则必须带 `fib daddr type local`**：
+    prerouting 是「所有进机包」的入口，路由器上它也管转发。少了这个限定，
+    路由器会把它替 LAN 客户端转发回来的 SYN-ACK/数据一并 drop 掉
+    （服务端 SYN-ACK 的 IP ID 就是 mark，同密码即同 mark），
+    现象是「LAN 客户端握手超时，而两端日志都正常」
+    （`DEVTIPS.md` 第 167 条）。
     **不要改回「配置里手填一个固定值」**：那会重新引入公开指纹。
     **不要改成 wscale 判断**：v1 曾用 `wscale=12`，但 wscale 必须做得和真实
     Linux 一样（9~10）才不像伪造，一旦改成真实的就失去了识别能力。

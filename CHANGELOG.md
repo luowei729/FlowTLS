@@ -2,6 +2,42 @@
 
 ## 2026-11-26 (北京时间)
 
+### 发布：v1.14.4-rev.13 —— 修复路由器上客户端规则误伤转发流量
+
+**wire format 未改动。** 只改 nft 规则的匹配条件。
+
+真机故障：OpenWrt 路由器上开了一个 FlowTLS 客户端，它下面的 PC 也开一个
+（**同一个密码**，连**同一台服务端**），PC 一直
+`flowtls 握手失败: context deadline exceeded`，而服务端日志里能看到
+SYN 到达、SYN-ACK 也发了出去——两端都说自己没错。
+
+根因在客户端写的那条 nft 规则：
+
+```
+prerouting  ip saddr <服务端> tcp sport 8443 ip id & 0xff00 == <mark> drop
+```
+
+`prerouting` 是**所有进机包**的入口，路由器上它也管转发。而 FlowTLS
+服务端发的 SYN-ACK 的 IP ID 就是**它自己凭据的 mark**
+（`listener.go`：`IPID: RandomIPID(mark)`）。于是路由器把替 LAN 客户端
+转发回来的 SYN-ACK 一并丢掉了。
+
+同一条链上的 `notrack` 同样有害：转发流量绕过 conntrack 后，fw4 匹配
+不到 established，按默认策略丢掉。
+
+修法：prerouting 侧每条规则加 `fib daddr type local`。伪包的目的地址
+永远是本机（回程发往本机的伪源端口），所以不削弱任何防护，只放过转发
+流量。服务端的同类规则（`tcp dport <port>`）一并加上——软路由上做服务端
+时会遇到同样的问题。
+
+**自愈**：`EnsureClient` 每次建连都会 flush 并重写链，所以升级后第一次
+连接就会把旧的错误规则换成新的，不需要手工清理。
+
+新增回归测试 `TestPreroutingScopedToLocal`，逐行检查 prerouting 链里
+每条规则都带 local 限定。
+
+## 2026-11-26 (北京时间)
+
 ### 发布：v1.14.4-rev.12 —— 去掉用户名，凭据改为单密码 / 多密码
 
 **外层伪 TCP 报文格式未改动，也没有 wire format 变更。**

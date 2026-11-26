@@ -386,12 +386,30 @@ func clientChains(server netip.AddrPort) (outChain, inChain string) {
 // 与旧版的区别只在匹配字段：以前是 `tcp sport <源端口>`，现在是
 // `ip daddr/saddr <服务端>`。语义上更窄（只影响这一个服务端），
 // 同时因为是「按目的地址」而不是「按源端口」，源端口才能动态分配。
+//
+// **prerouting 两条必须加 `fib daddr type local`**（见 srcLocal 的注释）。
 func nftClientScript(server netip.AddrPort, magic uint16) string {
 	outChain, inChain := clientChains(server)
 	ip := server.Addr().String()
 	portStr := strconv.Itoa(int(server.Port()))
 	dst := " ip daddr " + ip + " tcp dport " + portStr
 	src := " ip saddr " + ip + " tcp sport " + portStr
+	// **只对「发给本机」的回程包生效**。
+	//
+	// 这两条规则的目的是「让内核不要碰我们的伪连接」：AF_PACKET 在
+	// netfilter 之前就能拿到包，所以在这里 DROP/notrack 不影响我们收数据。
+	// 而回程包的目的地址就是本机的伪源端口，所以判据天然是「dst 是本机」。
+	//
+	// 缺了这个条件，路由器上会连**它替 LAN 客户端转发**的回程包一起处理：
+	//   - drop 用的是凭据派生出的 mark，而服务端发的 SYN-ACK 的 IP ID 正是
+	//     它自己凭据的 mark（listener.go 的 `IPID: RandomIPID(mark)`），
+	//     于是 LAN 客户端**永远收不到 SYN-ACK**，表现为「握手超时」；
+	//   - notrack 让转发流量绕过 conntrack，fw4 匹配不到 established，
+	//     按默认策略丢掉。
+	//
+	// 典型场景：OpenWrt 路由器自己开一个客户端，它下面的 PC 用**同一个密码**
+	// 连**同一台服务端**——同密码同 mark，PC 的 SYN-ACK 被路由器当面丢掉。
+	srcLocal := src + " fib daddr type local"
 	markExpr := " ip id & 0xff00 == 0x" +
 		strconv.FormatUint(uint64(magic&0xFF00), 16)
 
@@ -406,8 +424,8 @@ func nftClientScript(server netip.AddrPort, magic uint16) string {
 		"add chain inet " + notrackTable + " " + inChain +
 			" { type filter hook prerouting priority raw; policy accept; }",
 		"flush chain inet " + notrackTable + " " + inChain,
-		"add rule inet " + notrackTable + " " + inChain + src + " notrack",
-		"add rule inet " + notrackTable + " " + inChain + src + markExpr + " drop",
+		"add rule inet " + notrackTable + " " + inChain + srcLocal + " notrack",
+		"add rule inet " + notrackTable + " " + inChain + srcLocal + markExpr + " drop",
 	}
 	return strings.Join(append(lines, ""), "\n")
 }
@@ -467,6 +485,17 @@ func nftRuleLines(script string) []string {
 func nftServerScript(port uint16, marks []uint16) string {
 	outChain, inChain := notrackChains(port)
 	portStr := strconv.Itoa(int(port))
+	// **入向规则要限定「发给本机」**（`fib daddr type local`）。
+	//
+	// 服务端通常不转发，但一旦跑在软路由上，prerouting 会同时看到
+	// 「替 LAN 主机转发出去」的包：
+	//   - `tcp dport <端口> notrack` 会让 dport 恰好是该端口的转发流量
+	//     绕过 conntrack，fw4 匹配不到 established 就按默认策略丢掉；
+	//   - `ip id & 0xff00 == <mark> drop` 会丢掉 LAN 主机发往别处、
+	//     而 IP ID 高字节恰好撞上标记的包。
+	// 伪包的目的地址永远是本机（客户端发往的就是这个监听端口），
+	// 所以限定 local 不削弱任何防护。
+	inLocal := " tcp dport " + portStr + " fib daddr type local"
 	lines := []string{
 		"add table inet " + notrackTable,
 		"add chain inet " + notrackTable + " " + outChain +
@@ -477,8 +506,7 @@ func nftServerScript(port uint16, marks []uint16) string {
 		"add chain inet " + notrackTable + " " + inChain +
 			" { type filter hook prerouting priority raw; policy accept; }",
 		"flush chain inet " + notrackTable + " " + inChain,
-		"add rule inet " + notrackTable + " " + inChain +
-			" tcp dport " + portStr + " notrack",
+		"add rule inet " + notrackTable + " " + inChain + inLocal + " notrack",
 	}
 	for _, magic := range marks {
 		m := magic & 0xFF00
@@ -486,7 +514,7 @@ func nftServerScript(port uint16, marks []uint16) string {
 			continue
 		}
 		lines = append(lines, "add rule inet "+notrackTable+" "+inChain+
-			" tcp dport "+portStr+" ip id & 0xff00 == 0x"+
+			inLocal+" ip id & 0xff00 == 0x"+
 			strconv.FormatUint(uint64(m), 16)+" drop")
 	}
 	return strings.Join(append(lines, ""), "\n")

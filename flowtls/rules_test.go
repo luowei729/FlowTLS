@@ -146,8 +146,8 @@ func TestClientNftRulesByServerAddr(t *testing.T) {
 	for _, want := range []string{
 		"ip daddr 203.0.113.9 tcp dport 8443 notrack",
 		"ip daddr 203.0.113.9 tcp dport 8443 tcp flags & rst == rst drop",
-		"ip saddr 203.0.113.9 tcp sport 8443 notrack",
-		"ip saddr 203.0.113.9 tcp sport 8443 ip id & 0xff00 == 0xf100 drop",
+		"ip saddr 203.0.113.9 tcp sport 8443 fib daddr type local notrack",
+		"ip saddr 203.0.113.9 tcp sport 8443 fib daddr type local ip id & 0xff00 == 0xf100 drop",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("nft 脚本缺少：%s\n实际：\n%s", want, script)
@@ -158,6 +158,59 @@ func TestClientNftRulesByServerAddr(t *testing.T) {
 	outB, inB := clientChains(netip.MustParseAddrPort("203.0.113.10:8443"))
 	if outA == outB || inA == inB {
 		t.Fatalf("不同服务端应有不同链名：%s/%s vs %s/%s", outA, inA, outB, inB)
+	}
+}
+
+// TestPreroutingScopedToLocal 钉住「prerouting 规则只能作用于发给本机的包」。
+//
+// 这是 2026-11-26 真机故障的回归防护。现场拓扑：
+//
+//	OpenWrt 路由器自己开一个 flowtls 客户端（密码 P）
+//	它下面的 Windows 也开一个 flowtls 客户端（同一个密码 P）→ 同一台服务端
+//
+// 两个客户端的 password 相同 ⇒ 派生出的 ip_id_mark 相同。而服务端发回的
+// SYN-ACK 里 IP ID 就是**服务端凭据的** mark（listener.go: `IPID:
+// RandomIPID(mark)`）。路由器上那条没有限定 local 的
+//
+//	prerouting  ip saddr <服务端> tcp sport 8443 ip id & 0xff00 == <mark> drop
+//
+// 于是把**它替 LAN 客户端转发回来的 SYN-ACK**也一起丢了，LAN 侧表现为
+// 「flowtls 握手失败: context deadline exceeded」，而服务端日志里能看到
+// SYN 到达、SYN-ACK 也发出了——两端都说自己没错，问题在中间的转发设备。
+//
+// 修法：prerouting 侧每条规则都加 `fib daddr type local`。伪包的目的地址
+// 永远是本机（客户端发往的就是这个监听端口 / 回程发往本机的伪源端口），
+// 所以限定 local 不削弱任何防护，只放过转发流量。
+func TestPreroutingScopedToLocal(t *testing.T) {
+	client := nftClientScript(netip.MustParseAddrPort("198.51.100.7:8443"), 0x6500)
+	server := nftServerScript(8443, []uint16{0x6500})
+
+	check := func(name, script, needle string) {
+		seen := 0
+		for _, ln := range strings.Split(script, "\n") {
+			if !strings.Contains(ln, needle) || !strings.Contains(ln, "add rule") {
+				continue
+			}
+			seen++
+			// 这条规则落在 prerouting 链里，必须带 local 限定。
+			if !strings.Contains(ln, "fib daddr type local") {
+				t.Errorf("%s：prerouting 规则缺 fib daddr type local，"+
+					"会导致路由器丢弃替 LAN 客户端转发的包：%s", name, ln)
+			}
+		}
+		if seen == 0 {
+			t.Fatalf("%s：没有找到任何 prerouting 规则（%q）", name, needle)
+		}
+	}
+	check("客户端", client, "ip saddr 198.51.100.7 tcp sport 8443")
+	check("服务端", server, "tcp dport 8443")
+
+	// output 链本来就是本机流量，不需要也不能加 local 限定。
+	for _, ln := range strings.Split(client, "\n") {
+		if strings.Contains(ln, "add rule") && strings.Contains(ln, "ip daddr") &&
+			strings.Contains(ln, "fib daddr type local") {
+			t.Errorf("output 链不该加 fib daddr type local：%s", ln)
+		}
 	}
 }
 
@@ -207,10 +260,11 @@ func TestNftServerScriptShape(t *testing.T) {
 		"add chain inet flowtls out_8443 { type filter hook output priority raw; policy accept; }",
 		"add rule inet flowtls out_8443 tcp sport 8443 notrack",
 		"add chain inet flowtls in_8443 { type filter hook prerouting priority raw; policy accept; }",
-		"add rule inet flowtls in_8443 tcp dport 8443 notrack",
+		// 入向必须限定「发给本机」：路由器上的 prerouting 会看到转发流量
+		"add rule inet flowtls in_8443 tcp dport 8443 fib daddr type local notrack",
 		// 每条凭据的派生标记各一条（多凭据部署的核心）
-		"add rule inet flowtls in_8443 tcp dport 8443 ip id & 0xff00 == 0x1e00 drop",
-		"add rule inet flowtls in_8443 tcp dport 8443 ip id & 0xff00 == 0xc500 drop",
+		"add rule inet flowtls in_8443 tcp dport 8443 fib daddr type local ip id & 0xff00 == 0x1e00 drop",
+		"add rule inet flowtls in_8443 tcp dport 8443 fib daddr type local ip id & 0xff00 == 0xc500 drop",
 	}
 	for _, m := range musts {
 		if !strings.Contains(s, m) {

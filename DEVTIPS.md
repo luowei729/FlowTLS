@@ -6,6 +6,67 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 167. prerouting 规则必须限定「发给本机」，否则路由器会吃掉 LAN 客户端的 SYN-ACK（2026-11-26 北京时间）
+
+现场拓扑（用户真机）：
+
+```
+OpenWrt 路由器（ip_forward=1）  客户端A：password P → 192.0.2.10:8443
+      └─ PC（另一台机器）       客户端B：password P → 同一台服务端
+```
+
+A 正常，B 一直 `flowtls 握手失败: context deadline exceeded`。
+
+排查路径（值得记）：
+
+1. 服务端日志里只有**一个** peer，换端口重连才变成另一个——说明 B 的包
+   从未到过服务端。
+2. 服务端抓 SYN/SYN-ACK：只看到 A 的。
+3. 同机 22 端口可达、另一台服务端（公网 IP 直绑网卡）的 8443 也可达
+   → 不是出口封锁。
+4. 从第三方公网机器连同一台服务端 8443 **可达** → 服务端本身没问题。
+5. 最后在路由器上 `nft list table inet flowtls` 看到：
+
+```
+chain cin_<hash>_8443 {
+        type filter hook prerouting priority raw; policy accept;
+        ip saddr 192.0.2.10 tcp sport 8443 notrack
+        ip saddr 192.0.2.10 tcp sport 8443 ip id & 65280 == 25856 drop
+}
+```
+
+25856 = 0x6500，正是 `HKDF(password)` 派生的 ip_id_mark。而**服务端发的
+SYN-ACK 的 IP ID 用的就是服务端自己凭据的 mark**（`listener.go` 的
+`IPID: RandomIPID(mark)`）。A 和 B 用同一个密码 → 同样的 mark → 路由器
+把替 B 转发回来的 SYN-ACK 也一起 drop 了。
+
+`notrack` 的副作用更隐蔽：转发流量绕过 conntrack 后，fw4 匹配不到
+`ct state established`，直接按默认策略丢掉。现象同样是「静默不通」。
+
+修法：prerouting 侧每条规则加 `fib daddr type local`。
+
+```
+ip saddr <服务端> tcp sport 8443 fib daddr type local notrack
+ip saddr <服务端> tcp sport 8443 fib daddr type local ip id & 0xff00 == <mark> drop
+```
+
+伪包的目的地址永远是本机（回程发往本机的伪源端口），所以限定 local
+不削弱任何防护，只放过转发流量。服务端侧的 `tcp dport <port>` 同样加上。
+
+**为什么以前没发现**：绝大多数部署是「客户端在一台普通主机上」
+（`ip_forward=0`，prerouting 基本等价于本机入站），或者「路由器上只有
+一个客户端、LAN 里没有第二个」。只有当 **同一台路由器既是客户端、又要
+替 LAN 里的另一个客户端转发**时才暴露——而且必须**同密码**（同 mark）
+才会被 drop 规则命中。
+
+**排查提示**：两端日志都说自己没问题、服务端能看到 SYN 却没有 SYN-ACK
+回来时，先看**中间设备的 prerouting**，不要只盯着两端。
+
+顺带一条工具坑：`nft list` 把数值渲染成**十进制**（`ip id & 65280 == 25856`），
+写脚本按 `0x[0-9a-f]+` 去正则匹配 mark 会全部匹配失败，导致「只 flush
+不重写」——链被清空、客户端失去 RST 防护。改规则时务必先 dump 再逐条构造，
+不要用正则从 `nft list` 里抠值。
+
 ## 166. 去掉用户名，凭据收敛成 password / passwords（2026-11-26 北京时间）
 
 需求来自真实部署：**多台设备要共用一个默认密码**。原来的 `users[]`
