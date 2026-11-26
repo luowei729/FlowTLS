@@ -6,66 +6,86 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
-## 167. prerouting 规则必须限定「发给本机」，否则路由器会吃掉 LAN 客户端的 SYN-ACK（2026-11-26 北京时间）
+## 167. 客户端入向规则必须挂 input 钩子；`fib daddr type local` 在 NAT 后无效（2026-11-26 北京时间）
 
-现场拓扑（用户真机）：
+现场拓扑（用户的多层环回路由，简化版）：
 
 ```
-OpenWrt 路由器（ip_forward=1）  客户端A：password P → 192.0.2.10:8443
-      └─ PC（另一台机器）       客户端B：password P → 同一台服务端
+10.0.0.253（开发机）
+  -> 10.0.0.1   （傻瓜路由）
+  -> 10.0.100.1 （op / OpenWrt，**跑着 flowtls 客户端**）
+  -> 192.168.100.1 -> 10.0.0.1 -> 192.168.1.1 -> ...
 ```
 
-A 正常，B 一直 `flowtls 握手失败: context deadline exceeded`。
-
-排查路径（值得记）：
-
-1. 服务端日志里只有**一个** peer，换端口重连才变成另一个——说明 B 的包
-   从未到过服务端。
-2. 服务端抓 SYN/SYN-ACK：只看到 A 的。
-3. 同机 22 端口可达、另一台服务端（公网 IP 直绑网卡）的 8443 也可达
-   → 不是出口封锁。
-4. 从第三方公网机器连同一台服务端 8443 **可达** → 服务端本身没问题。
-5. 最后在路由器上 `nft list table inet flowtls` 看到：
+op 是**必经的转发设备**。它自己的客户端连服务端时写的 nft 规则：
 
 ```
 chain cin_<hash>_8443 {
         type filter hook prerouting priority raw; policy accept;
-        ip saddr 192.0.2.10 tcp sport 8443 notrack
-        ip saddr 192.0.2.10 tcp sport 8443 ip id & 65280 == 25856 drop
+        ip saddr <服务端> tcp sport 8443 notrack
+        ip saddr <服务端> tcp sport 8443 ip id & 65280 == 25856 drop
 }
 ```
 
-25856 = 0x6500，正是 `HKDF(password)` 派生的 ip_id_mark。而**服务端发的
-SYN-ACK 的 IP ID 用的就是服务端自己凭据的 mark**（`listener.go` 的
-`IPID: RandomIPID(mark)`）。A 和 B 用同一个密码 → 同样的 mark → 路由器
-把替 B 转发回来的 SYN-ACK 也一起 drop 了。
+25856 = 0x6500 = `HKDF(password)` 派生的 mark。而**服务端发的 SYN-ACK 的
+IP ID 就是服务端自己凭据的 mark**（`listener.go` 的
+`IPID: RandomIPID(mark)`）。LAN 里另一台机器用**同一个密码**连**同一台
+服务端** -> 同 mark -> 它的 SYN-ACK 被 op 在 prerouting 丢掉了。
 
-`notrack` 的副作用更隐蔽：转发流量绕过 conntrack 后，fw4 匹配不到
-`ct state established`，直接按默认策略丢掉。现象同样是「静默不通」。
+现象：LAN 侧「握手超时 / context deadline exceeded」，服务端日志里 SYN
+到达、SYN-ACK 也发了，两端都说自己没错。
 
-修法：prerouting 侧每条规则加 `fib daddr type local`。
+### 第一个错误修法（rev.13）：加 `fib daddr type local`
+
+想当然地认为「伪包目的是本机，加 local 限定就能只作用于本机回程」。
+**实测完全无效** —— 带 counter 的两条等价规则计数一模一样：
 
 ```
-ip saddr <服务端> tcp sport 8443 fib daddr type local notrack
-ip saddr <服务端> tcp sport 8443 fib daddr type local ip id & 0xff00 == <mark> drop
+规则 A  ip saddr <服务端> tcp sport 8443                    counter -> 2
+规则 B  ip saddr <服务端> tcp sport 8443 fib daddr type local counter -> 2
 ```
 
-伪包的目的地址永远是本机（回程发往本机的伪源端口），所以限定 local
-不削弱任何防护，只放过转发流量。服务端侧的 `tcp dport <port>` 同样加上。
+原因：客户端做了 NAT。转发给 LAN 主机的回程包，在 prerouting 阶段
+（raw 优先级，**早于 dstnat**）目的地址**仍然是本机 WAN 地址**，
+`fib daddr type local` 对本机回程和转发回程同时成立。
 
-**为什么以前没发现**：绝大多数部署是「客户端在一台普通主机上」
-（`ip_forward=0`，prerouting 基本等价于本机入站），或者「路由器上只有
-一个客户端、LAN 里没有第二个」。只有当 **同一台路由器既是客户端、又要
-替 LAN 里的另一个客户端转发**时才暴露——而且必须**同密码**（同 mark）
-才会被 drop 规则命中。
+### 正确修法（rev.14）：入向规则挂 input 钩子
 
-**排查提示**：两端日志都说自己没问题、服务端能看到 SYN 却没有 SYN-ACK
-回来时，先看**中间设备的 prerouting**，不要只盯着两端。
+`input` 钩子只在内核判定「这个包交给本机」之后执行，转发路径根本不进它。
+实测对比：
 
-顺带一条工具坑：`nft list` 把数值渲染成**十进制**（`ip id & 65280 == 25856`），
-写脚本按 `0x[0-9a-f]+` 去正则匹配 mark 会全部匹配失败，导致「只 flush
-不重写」——链被清空、客户端失去 RST 防护。改规则时务必先 dump 再逐条构造，
-不要用正则从 `nft list` 里抠值。
+```
+流量来源            prerouting 计数   input 计数
+LAN 主机（转发）          2              0
+本机自己                  9              9
+```
+
+所以客户端的「挡内核处理回程包」规则必须挂在 input 钩子上，
+并且**去掉入向的 notrack**：
+- 它在 input 钩子已经晚于 conntrack，做了也没用；
+- 它在 prerouting 时会误伤转发流量（绕过 conntrack -> fw4 判 untracked ->
+  forward policy drop）。
+
+去掉 notrack 后伪包回程会被 conntrack 判 INVALID，但本规则在 input 钩子的
+raw 优先级（-300）就丢掉了包，早于 fw4 的 filter 链（0）；AF_PACKET 更是
+在 netfilter 之前就取走了数据，收包不受影响。fw4 的 input 本身是
+`policy drop`，多一层兜底。
+
+**服务端侧相反，`fib daddr type local` 要保留**：服务端不做 NAT，
+转发流量的 daddr 不是本机，local 判定有效（软路由上做服务端时确实需要）。
+
+### 排查要点
+
+1. **两端日志都说正常、服务端能看到 SYN 却没有 SYN-ACK 回来时，先查
+   中间设备的 prerouting/input**，不要只盯两端。
+2. 用 `fib daddr type local` 之前先想清楚：这台设备做 NAT 吗？做 NAT 就无效。
+3. `nft list` 把数值渲染成**十进制**（`ip id & 65280 == 25856`）。写脚本
+   按 `0x[0-9a-f]+` 去正则抠 mark 会全部失败，导致「只 flush 不重写」——
+   链被清空、客户端失去 RST 防护。改规则务必先 dump 再逐条构造。
+4. 用 counter 做二分：先只计数不 drop，确认规则到底命中哪些包，再决定
+   drop 条件。这一轮就是靠 counter 才发现 `fib local` 完全没有区分能力。
+5. 这类规则**写后不清理**，客户端关了规则还在。排查时先
+   `nft delete table inet flowtls` 再复测，能一刀切掉所有嫌疑。
 
 ## 166. 去掉用户名，凭据收敛成 password / passwords（2026-11-26 北京时间）
 

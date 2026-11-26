@@ -146,8 +146,10 @@ func TestClientNftRulesByServerAddr(t *testing.T) {
 	for _, want := range []string{
 		"ip daddr 203.0.113.9 tcp dport 8443 notrack",
 		"ip daddr 203.0.113.9 tcp dport 8443 tcp flags & rst == rst drop",
-		"ip saddr 203.0.113.9 tcp sport 8443 fib daddr type local notrack",
-		"ip saddr 203.0.113.9 tcp sport 8443 fib daddr type local ip id & 0xff00 == 0xf100 drop",
+		// 入向规则必须落在 **input** 钩子：prerouting 阶段看不到 NAT 还原后的
+		// 目的地址，无法区分「本机回程」与「替 LAN 转发的回程」。
+		"add chain inet flowtls cin_",
+		"ip saddr 203.0.113.9 tcp sport 8443 ip id & 0xff00 == 0xf100 drop",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("nft 脚本缺少：%s\n实际：\n%s", want, script)
@@ -161,55 +163,53 @@ func TestClientNftRulesByServerAddr(t *testing.T) {
 	}
 }
 
-// TestPreroutingScopedToLocal 钉住「prerouting 规则只能作用于发给本机的包」。
+// TestClientIngressUsesInputHook 钉住「客户端入向规则挂在 input 钩子」。
 //
-// 这是 2026-11-26 真机故障的回归防护。现场拓扑：
+// 这是 2026-11-26 真机事故的回归防护，也是本仓库踩过的最隐蔽的一个坑。
+// 现场拓扑（用户的多层环回路由，这里是简化版）：
 //
-//	OpenWrt 路由器自己开一个 flowtls 客户端（密码 P）
-//	它下面的 Windows 也开一个 flowtls 客户端（同一个密码 P）→ 同一台服务端
+//	LAN 主机 ── 路由器A ── 路由器B ── ... ── 互联网
+//	              └─ 也跑 flowtls 客户端（同密码 P）→ 同一台服务端
 //
-// 两个客户端的 password 相同 ⇒ 派生出的 ip_id_mark 相同。而服务端发回的
-// SYN-ACK 里 IP ID 就是**服务端凭据的** mark（listener.go: `IPID:
-// RandomIPID(mark)`）。路由器上那条没有限定 local 的
+// 路由器A 替 LAN 主机转发时，回程包在 **prerouting** 阶段的目的是
+// 「路由器A 的 WAN 地址」（NAT 还没被 dstnat 还原），所以
+// `fib daddr type local` 对「本机回程」和「转发的回程」**同时成立**——
+// 实测两条规则计数完全相同（2 和 2），一条都区分不出来。
 //
-//	prerouting  ip saddr <服务端> tcp sport 8443 ip id & 0xff00 == <mark> drop
+// 而 `input` 钩子只在「内核判定这个包交给本机」之后执行，转发路径根本
+// 不进它。实测对比：
 //
-// 于是把**它替 LAN 客户端转发回来的 SYN-ACK**也一起丢了，LAN 侧表现为
-// 「flowtls 握手失败: context deadline exceeded」，而服务端日志里能看到
-// SYN 到达、SYN-ACK 也发出了——两端都说自己没错，问题在中间的转发设备。
+//	流量来源          prerouting   input
+//	LAN 主机（转发）      2          0
+//	本机自己              9          9
 //
-// 修法：prerouting 侧每条规则都加 `fib daddr type local`。伪包的目的地址
-// 永远是本机（客户端发往的就是这个监听端口 / 回程发往本机的伪源端口），
-// 所以限定 local 不削弱任何防护，只放过转发流量。
-func TestPreroutingScopedToLocal(t *testing.T) {
-	client := nftClientScript(netip.MustParseAddrPort("198.51.100.7:8443"), 0x6500)
-	server := nftServerScript(8443, []uint16{0x6500})
+// 所以入向规则必须挂 input。少了这条，路由器会把它替 LAN 客户端转发回来的
+// SYN-ACK 一并丢掉（服务端 SYN-ACK 的 IP ID 就是它凭据的 mark，同密码即
+// 同 mark），表现为「LAN 客户端握手超时，而两端日志都正常」。
+func TestClientIngressUsesInputHook(t *testing.T) {
+	script := nftClientScript(netip.MustParseAddrPort("198.51.100.7:8443"), 0x6500)
 
-	check := func(name, script, needle string) {
-		seen := 0
-		for _, ln := range strings.Split(script, "\n") {
-			if !strings.Contains(ln, needle) || !strings.Contains(ln, "add rule") {
-				continue
-			}
-			seen++
-			// 这条规则落在 prerouting 链里，必须带 local 限定。
-			if !strings.Contains(ln, "fib daddr type local") {
-				t.Errorf("%s：prerouting 规则缺 fib daddr type local，"+
-					"会导致路由器丢弃替 LAN 客户端转发的包：%s", name, ln)
-			}
-		}
-		if seen == 0 {
-			t.Fatalf("%s：没有找到任何 prerouting 规则（%q）", name, needle)
+	if !strings.Contains(script, "type filter hook input priority raw") {
+		t.Errorf("客户端入向链必须挂在 input 钩子，实际：\n%s", script)
+	}
+	// prerouting 上不许再有任何客户端规则。nft 里 prerouting 是「所有进机包」
+	// 的入口，在路由器上它也管转发，挂在这上面的 drop/notrack 一定会误伤。
+	for _, ln := range strings.Split(script, "\n") {
+		if strings.Contains(ln, "hook prerouting") {
+			t.Errorf("客户端不该再建 prerouting 链（会误伤转发流量）：%s", ln)
 		}
 	}
-	check("客户端", client, "ip saddr 198.51.100.7 tcp sport 8443")
-	check("服务端", server, "tcp dport 8443")
+	// fib daddr type local 是无效修法，钉住它不要再被加回来。
+	if strings.Contains(script, "fib daddr type local") {
+		t.Errorf("客户端不能用 fib daddr type local：NAT 之后它对转发的回程包同样成立")
+	}
 
-	// output 链本来就是本机流量，不需要也不能加 local 限定。
-	for _, ln := range strings.Split(client, "\n") {
-		if strings.Contains(ln, "add rule") && strings.Contains(ln, "ip daddr") &&
-			strings.Contains(ln, "fib daddr type local") {
-			t.Errorf("output 链不该加 fib daddr type local：%s", ln)
+	// 服务端侧相反：它不做 NAT，转发流量 daddr 不是本机，fib local 有效。
+	server := nftServerScript(8443, []uint16{0x6500})
+	for _, ln := range strings.Split(server, "\n") {
+		if strings.Contains(ln, "tcp dport 8443") &&
+			!strings.Contains(ln, "fib daddr type local") {
+			t.Errorf("服务端入向规则缺 fib daddr type local（软路由上会误伤转发）：%s", ln)
 		}
 	}
 }

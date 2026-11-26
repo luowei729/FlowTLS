@@ -2,7 +2,49 @@
 
 ## 2026-11-26 (北京时间)
 
-### 发布：v1.14.4-rev.13 —— 修复路由器上客户端规则误伤转发流量
+### 发布：v1.14.4-rev.14 —— 客户端入向规则改挂 input 钩子（rev.13 的修法是错的）
+
+**wire format 未改动。** 只改 nft 规则的钩子位置。
+
+**rev.13 的修法无效，不要用。** rev.13 给 prerouting 规则加了
+`fib daddr type local`，实测**完全挡不住**：客户端做了 NAT 后，转发给 LAN
+主机的回程包在 prerouting 阶段（raw 优先级，早于 dstnat）目的地址**仍然
+是本机的 WAN 地址**，`fib daddr type local` 对「本机回程」与「转发的回程」
+同时成立。实测对比（op 上带 counter 的两条等价规则）：
+
+```
+规则 A  ip saddr <服务端> tcp sport 8443                    counter  → 2
+规则 B  ip saddr <服务端> tcp sport 8443 fib daddr type local counter  → 2
+```
+
+正确修法：客户端入向规则改挂 **input 钩子**。input 钩子只在内核判定
+「这个包交给本机」之后才执行，转发路径根本不进它。实测对比：
+
+```
+流量来源            prerouting 计数   input 计数
+LAN 主机（转发）          2              0
+本机自己                  9              9
+```
+
+同时去掉入向的 `notrack`：一是它在 input 钩子已经晚于 conntrack，做了
+也没用；二是它在 prerouting 时会误伤转发流量。去掉之后伪包回程会被
+conntrack 判成 INVALID，但本规则在 input 钩子的 raw 优先级（-300）就把包
+丢掉了，早于 fw4 的 filter 链（0），而 AF_PACKET 更是在 netfilter 之前就
+拿走了数据，收包不受影响。fw4 的 input 本就是 `policy drop`，作了一层兜底。
+
+服务端侧**保留** `fib daddr type local`：服务端不做 NAT，转发流量的 daddr
+不是本机，local 判定有效（软路由上做服务端时确实需要它）。
+
+`chainHasRules` 改为可变条件：客户端入场链只需 `drop`（不再要求 `notrack`），
+服务端两条链仍要 `notrack`。
+
+回归测试 `TestClientIngressUsesInputHook` 同时钉住两件事：
+客户端入向必须在 input 钩子、且不能用 `fib daddr type local`；
+服务端入向必须带 `fib daddr type local`。
+
+## 2026-11-26 (北京时间)
+
+### 发布：v1.14.4-rev.13 —— （作废）修复路由器上客户端规则误伤转发流量
 
 **wire format 未改动。** 只改 nft 规则的匹配条件。
 

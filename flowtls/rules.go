@@ -380,36 +380,47 @@ func clientChains(server netip.AddrPort) (outChain, inChain string) {
 //	方向        规则                                          作用
 //	output      daddr=<server> dport=<port> notrack            伪包不进 conntrack
 //	output      daddr=<server> dport=<port> rst drop           挡内核回的 RST
-//	prerouting  saddr=<server> sport=<port> notrack            回程包不进 conntrack
-//	prerouting  saddr=<server> sport=<port> ip id mark drop    挡内核处理回程包
+//	input       saddr=<server> sport=<port> ip id mark drop    挡内核处理回程包
 //
 // 与旧版的区别只在匹配字段：以前是 `tcp sport <源端口>`，现在是
 // `ip daddr/saddr <服务端>`。语义上更窄（只影响这一个服务端），
 // 同时因为是「按目的地址」而不是「按源端口」，源端口才能动态分配。
 //
-// **prerouting 两条必须加 `fib daddr type local`**（见 srcLocal 的注释）。
+// **入向规则必须挂在 `input` 钩子，不能挂 `prerouting`**。
+// 这一条是 2026-11-26 真机事故的结论，论证见 inSrc 的注释。
 func nftClientScript(server netip.AddrPort, magic uint16) string {
 	outChain, inChain := clientChains(server)
 	ip := server.Addr().String()
 	portStr := strconv.Itoa(int(server.Port()))
 	dst := " ip daddr " + ip + " tcp dport " + portStr
-	src := " ip saddr " + ip + " tcp sport " + portStr
-	// **只对「发给本机」的回程包生效**。
+	inSrc := " ip saddr " + ip + " tcp sport " + portStr
+	// 入向规则挂 **input** 钩子，靠钩子本身的语义把「转发流量」排除掉。
 	//
-	// 这两条规则的目的是「让内核不要碰我们的伪连接」：AF_PACKET 在
-	// netfilter 之前就能拿到包，所以在这里 DROP/notrack 不影响我们收数据。
-	// 而回程包的目的地址就是本机的伪源端口，所以判据天然是「dst 是本机」。
+	// 为什么不能用 prerouting + `fib daddr type local`：
+	// prerouting 阶段（raw 优先级，早于 dstnat）看到的**所有**回程包，目的
+	// 地址都是本机的 WAN 地址 —— 客户端做了 NAT，转发给 LAN 主机的回程包
+	// 这时还没被 DNAT 还原，daddr 就是本机 WAN IP。于是 `fib daddr type
+	// local` 对「本机回程」和「转发的回程」**同时成立**，一条都区分不出来
+	// （实测：两条规则计数完全相同）。
 	//
-	// 缺了这个条件，路由器上会连**它替 LAN 客户端转发**的回程包一起处理：
-	//   - drop 用的是凭据派生出的 mark，而服务端发的 SYN-ACK 的 IP ID 正是
-	//     它自己凭据的 mark（listener.go 的 `IPID: RandomIPID(mark)`），
-	//     于是 LAN 客户端**永远收不到 SYN-ACK**，表现为「握手超时」；
-	//   - notrack 让转发流量绕过 conntrack，fw4 匹配不到 established，
-	//     按默认策略丢掉。
+	// 而 `input` 钩子只在内核判定「这个包要交给本机」之后才执行，转发路径
+	// 根本不会进它。实测对比：
 	//
-	// 典型场景：OpenWrt 路由器自己开一个客户端，它下面的 PC 用**同一个密码**
-	// 连**同一台服务端**——同密码同 mark，PC 的 SYN-ACK 被路由器当面丢掉。
-	srcLocal := src + " fib daddr type local"
+	//	流量来源        prerouting 计数   input 计数
+	//	LAN 机器(转发)        2               0
+	//	本机自己              9               9
+	//
+	// 少了这条，路由器会把它替 LAN 客户端转发回来的 SYN-ACK 一并 drop 掉：
+	// 服务端发的 SYN-ACK 的 IP ID 就是**它自己凭据的 mark**
+	// （listener.go 的 `IPID: RandomIPID(mark)`），LAN 客户端若用同一个密码
+	// 就连同一台服务端 → 同 mark → SYN-ACK 被路由器当面丢掉，表现为
+	// 「LAN 客户端握手超时，而两端日志都正常」。
+	//
+	// 代价：回程包不再 notrack，会被 conntrack 判成 INVALID（我们的 SYN 在
+	// output 侧 notrack 过，conntrack 没见过它）。但本规则在 input 钩子的
+	// raw 优先级（-300）就会把包丢掉，早于 fw4 的 filter 链（0），所以
+	// fw4 的 `ct state invalid drop` 根本轮不到；AF_PACKET 更是在 netfilter
+	// 之前就拿走了数据，收包不受影响。
 	markExpr := " ip id & 0xff00 == 0x" +
 		strconv.FormatUint(uint64(magic&0xFF00), 16)
 
@@ -422,10 +433,9 @@ func nftClientScript(server netip.AddrPort, magic uint16) string {
 		"add rule inet " + notrackTable + " " + outChain + dst +
 			" tcp flags & rst == rst drop",
 		"add chain inet " + notrackTable + " " + inChain +
-			" { type filter hook prerouting priority raw; policy accept; }",
+			" { type filter hook input priority raw; policy accept; }",
 		"flush chain inet " + notrackTable + " " + inChain,
-		"add rule inet " + notrackTable + " " + inChain + srcLocal + " notrack",
-		"add rule inet " + notrackTable + " " + inChain + srcLocal + markExpr + " drop",
+		"add rule inet " + notrackTable + " " + inChain + inSrc + markExpr + " drop",
 	}
 	return strings.Join(append(lines, ""), "\n")
 }
@@ -452,7 +462,10 @@ func checkNftClient(server netip.AddrPort) bool {
 		return false
 	}
 	outChain, inChain := clientChains(server)
-	return chainHasRules(outChain) && chainHasRules(inChain)
+	// out 链有 notrack + RST drop；**入向链只有 drop**
+	// （回程包不在 input 钩子做 notrack —— 那里已经晚于 conntrack，做了也没用）。
+	return chainHasRules(outChain, "notrack", "drop") &&
+		chainHasRules(inChain, "drop")
 }
 
 // nftRuleLines 从批处理脚本里挑出 add rule 行并加 nft 前缀（日志用）。
@@ -568,15 +581,24 @@ func runNftScript(script string) bool {
 	return !strings.Contains(string(out), "Error:")
 }
 
-// chainHasRules 报告链存在且同时含 notrack 与 drop 两条规则。
-func chainHasRules(name string) bool {
+// chainHasRules 报告链存在，且包含 must 里的全部子串。
+//
+// 用可变参数而不是写死「notrack + drop」：客户端入向链只要 drop
+// （回程包的 notrack 已随 prerouting 钩子一起去掉——在 input 钩子做
+// notrack 已经晚于 conntrack，没有意义），服务端两条链才都要 notrack。
+func chainHasRules(name string, must ...string) bool {
 	out, err := exec.Command(nftPath, "list", "chain", "inet",
 		notrackTable, name).CombinedOutput()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(out), "notrack") &&
-		strings.Contains(string(out), "drop")
+	chain := string(out)
+	for _, m := range must {
+		if !strings.Contains(chain, m) {
+			return false
+		}
+	}
+	return true
 }
 
 // checkNftServer 报告服务端规则是否已就位。
@@ -588,7 +610,8 @@ func checkNftServer(port uint16, marks []uint16) bool {
 		return false // 交给调用方走 iptables
 	}
 	outChain, inChain := notrackChains(port)
-	if !chainHasRules(outChain) || !chainHasRules(inChain) {
+	if !chainHasRules(outChain, "notrack") ||
+		!chainHasRules(inChain, "notrack", "drop") {
 		return false
 	}
 	// 标记条数也要核对：PassWall/用户改了 ips 时规则必须跟着变。
