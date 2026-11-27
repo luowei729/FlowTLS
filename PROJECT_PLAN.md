@@ -329,6 +329,12 @@ rev.10 = rev.9 + 挂死处理。wire format 未改。
 - 新增 `/etc/sysctl.d/99-flowtls-relay.conf`：`nf_conntrack_tcp_be_liberal=1`、
   `nf_conntrack_max=65536`。前者修「时通时不通」（伪 TCP 被判 INVALID）。
 - 已验证经该路径能跑通代理流量；结论与限制见 `DEVTIPS.md` 第 168 条。
+- 新增部署辅助脚本 `deploy.example/relay.sh`（add / del / list / status /
+  install / uninstall）。规则写独立 nft 表，避开 1Panel `dnat.service`
+  对 `ip nat` 表的周期性 flush。
+- 2026-11-27 内把跳板机 `9443` 从 1Panel `dnat.service` 迁到 `flowtls-relay`：
+  先加新后摘旧，零中断；`ip nat` 表里已无 9443，验证 `dnat` 重启两次新表
+  不受影响。`34444` 仍由 1Panel 管（未动）。
 
 ### 发布 rev.12（2026-11-26 北京时间）
 

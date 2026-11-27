@@ -19,6 +19,69 @@
 - 客户端改法：`server` 填 `203.0.113.20`、`server_port` 填 `9443`，
   其余字段不变（服务端看到的源 IP 全变成跳板机地址）。
 
+### 新增：`deploy.example/relay.sh` 跳板机一键脚本
+
+**wire format 未改动，不影响任何已有部署。** 只是一个部署辅助脚本。
+
+```bash
+./relay.sh add 9443 198.51.100.20 8443   # 加转发（**默认自动持久化**）
+./relay.sh list / status / del 9443
+./relay.sh install / uninstall [--purge]  # 只重装持久化 / 撤销
+```
+
+- **持久化是默认行为**，不需要额外步骤：`add` 自动装脚本到
+  `/usr/local/sbin/flowtls-relay`、写 `sysctl.d`、写并启用 systemd unit。
+  三个文件内容没变就不重写（不磨损 flash、不白跑 `daemon-reload`），
+  所以重复 `add` / `install` 零副作用。临时试验用 `--no-persist`。
+- 规则写在独立 nft 表 `table ip flowtls_relay` 里，**不碰 `ip nat` 表**。
+  原因很硬：1Panel 的 `dnat.service` 会 `iptables -t nat -F PREROUTING` /
+  `-F POSTROUTING` 后重写全部规则（在服务重启、首轮、或其 conf 变化时触发），
+  写在那里的规则会被一并抹掉。
+- SNAT 源地址用 `ip route get <目标>` 推导，NAT 云主机（网卡只有内网地址）
+  也能正确工作；DNAT 带 `fib daddr type local`，只劫持发往本机的包。
+- `install` 写 `net.ipv4.ip_forward`、`nf_conntrack_tcp_be_liberal=1`、
+  `nf_conntrack_max=65536` 三条 sysctl，并用 systemd oneshot 开机重建规则表；
+  `ExecStop=/bin/true`（规则写后不清理，与服务端一致，要撤销请用 `uninstall`）。
+  运行中若有人手工 `sysctl -w` 改回去，下次 `add` / `install` 会自动补回。
+- unit 是 oneshot + `RemainAfterExit`，**必须 start 过一次才 active**，否则
+  `systemctl reload` 报 `is not active`；`install` / `add` 会顺手启动它。
+- conf 为空时不留空表（`add table` + `delete table` 同一事务）。
+- `status` 自带体检：`ip_forward` / conntrack 参数 / DNAT↔SNAT 计数是否配对 /
+  与其它转发工具的端口冲突 / 持久化是否已装。
+- 沙箱与真链路验证：临时表 `ftrelay_test` + 临时端口 `19443`，
+  `curl -k` 得到 200，DNAT/SNAT 计数各 1 包 60 字节，验证后立即删除；
+  生产 `9443` 的 handle 47~50 全程未变。详 `DEVTIPS.md` 第 168 条。
+
+### 运维：跳板机 `9443` 从 1Panel `dnat.service` 迁到 `flowtls-relay`（无代码改动）
+
+**wire format 未改动，客户端配置不变（仍然连 9443）。**
+
+顺序：**先加新的、再摘旧的**，全程零中断：
+
+```
+1. flowtls-relay add 9443 <服务端> 8443       # 两套并存，安全
+2. 实测新连接已被新表接住（新表 counter +1，旧表停在 14254）
+3. grep -v '^9443>' /etc/dnat/conf > …        # 从 1Panel 摘掉
+   systemctl restart dnat                      # 触发 flush 重写
+4. rm -f /etc/dnat/9443IP                      # 清陈旧标记文件
+```
+
+并存为何安全：两条都是 DNAT，先匹配者改完地址后后一条条件
+（端口 / `fib daddr type local`）不再成立，不会双重 DNAT；SNAT 重复幂等。
+
+验证结果：
+
+- `curl -k https://<跳板机>:9443/` → 200，TCP 78ms / TLS 167ms；
+  DNAT 2 包 ↔ SNAT 2 包完美配对。
+- `systemctl restart dnat` **两次**后 `table ip flowtls_relay` 仍完整持有 4 条
+  规则 —— 证实独立表方案不会被 iptables 兼容层 flush 波及。
+- `ip nat` 表里已无 9443，1Panel 只剩 `34444`。
+- 持久化：`/etc/flowtls-relay/conf` 一条 `9443 …`，unit `enabled` + `active`。
+
+踩到的细节：`dnat.service` 重启后要 ~3 秒才走到 flush（卡在
+`apt install dnsutils`），用 `nft -a` 的 handle 变化判断比 `sleep` 可靠——
+本次 34444 拿到新 handle、9443 仍留旧 handle，就是“还没 flush”的铁证。
+
 ## 2026-11-26 (北京时间)
 
 ### 发布：v1.14.4-rev.14 —— 客户端入向规则改挂 input 钩子（rev.13 的修法是错的）

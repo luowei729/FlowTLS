@@ -59,6 +59,88 @@ net.netfilter.nf_conntrack_max = 65536          # 默认 8192，多设备转发�
 与 counter 的两次读数。handle 不变说明规则没被重建；counter 在涨而本地
 一个包都没发，说明是设备自己的流量在通。
 
+### 一键脚本 `deploy.example/relay.sh`
+
+跳板机上直接跑，不用再手敲规则。**持久化是默认行为**，不用额外步骤：
+
+```bash
+./relay.sh add 9443 198.51.100.20 8443    # 加转发（立刻生效 + 自动持久化）
+./relay.sh list                           # 配置 + 实时规则 + 计数
+./relay.sh status                         # 体检：ip_forward / conntrack / 冲突 / 持久化
+./relay.sh del 9443
+./relay.sh install                        # 只重新安装持久化（修复 / 手动同步）
+./relay.sh uninstall [--purge]
+```
+
+`add` 会自动：装自己到 `/usr/local/sbin/flowtls-relay`、写
+`/etc/sysctl.d/99-flowtls-relay.conf`、写并启用并**启动** systemd unit。三个
+文件**内容没变就不重写**（不磨损 flash、不白跑 `daemon-reload`），所以重复
+`add` / 重复 `install` 都是零副作用。只做临时试验时加 `--no-persist`。
+
+两个容易踩的细节：
+
+- unit 是 `Type=oneshot` + `RemainAfterExit=yes`，**必须 start 过一次才 active**，
+  否则 `systemctl reload flowtls-relay` 会报 `is not active, cannot reload`。
+  所以 `install` / `add` 会顺手把它拉起来。
+- conf 为空时**不留空表**：渲染结果是 `add table` + `delete table`，两者在同一个
+  `nft -f` 事务里必定成功，跑完内核里干干净净（否则空 base chain 会让 `status`
+  看起来像「有配置却不出规则」）。
+
+脚本的三条设计要点（改它之前必读）：
+
+1. **规则写在自己的 nft 表里**（`table ip flowtls_relay`），**绝不写 `ip nat` 表的
+   PREROUTING/POSTROUTING**。1Panel 的 `dnat.service`
+   （`/usr/local/bin/dnat.sh`）会 `iptables -t nat -F PREROUTING` +
+   `-F POSTROUTING` 后重写全部规则——**不是每 60 秒都 flush**（只在服务重启、
+   首轮、或它自己的 `/etc/dnat/conf` 变化时触发），但每次触发都会把别人写在
+   那两个链里的规则一并抹掉，表现为「重启一下 dnat 服务，我的规则就没了」。
+   独立表不受 iptables 兼容层 flush 影响。
+2. SNAT 源地址用 `ip route get <目标>` 推导，不用「排除私有网段」的启发式——
+   后者在 NAT 云主机（网卡只有内网地址）上挑不到地址。
+3. DNAT 带 `fib daddr type local`，只劫持「目的地就是本机」的包，
+   不误伤经过本机、目的端口恰好相同的**转发**流量。
+   （这与第 167 条方向相反：那条是想**排除**转发流量，在 prerouting 阶段
+   靠 `fib` 判不出来，所以改挂 input 钩子。）
+
+验证过的判读方法：`list` 里同一映射的 **DNAT 与 SNAT 计数应同量级**。
+SNAT 远低于 DNAT = 回程没走通；DNAT 在涨但 `bytes ≈ packets × 60` = 全是
+无载荷 SYN，服务端回程到不了客户端。
+
+### 从 1Panel `dnat.service` 迁到 `flowtls-relay` 的正确顺序
+
+**先加新的、再摘旧的**，全程零中断：
+
+```bash
+# 1. 先加到自己的表（此时两套并存，安全）
+flowtls-relay add 9443 <服务端IP> 8443
+# 2. 实测新连接已被新表接住（新表 counter +1，旧表 counter 停住）
+# 3. 从 1Panel 的 conf 里摘掉，并重启它的服务立刻触发重写
+cp -a /etc/dnat/conf /etc/dnat/conf.bak.$(date +%Y%m%d-%H%M%S)
+grep -v '^9443>' /etc/dnat/conf > /tmp/c && cat /tmp/c > /etc/dnat/conf
+systemctl restart dnat      # 不等 60 秒轮询
+# 4. 清理 1Panel 留下的陈旧标记文件
+rm -f /etc/dnat/9443IP
+```
+
+两套并存的为什么安全：两条都是 DNAT，先匹配的那条改完地址后，后一条的
+匹配条件（端口 / `fib daddr type local`）自然不再成立，**不会双重 DNAT**。
+SNAT 重复执行也是幂等的（同一个源地址）。
+
+三个实测细节：
+
+- `dnat.service` 重启后 **flush 真的会发生**，且**只作用于 `ip nat` 表的
+  PREROUTING/POSTROUTING**，`table ip flowtls_relay` 完全不受影响
+  （重启两次后新表仍完整持有 4 条规则）。这条是独立表方案的核心收益。
+- 判断 flush 到底跑没跑，看 handle：`nft -a` 里被重建的规则 handle 会变。
+  本次 1Panel 的 34444 拿到新 handle、9443 保留旧 handle → 说明当时
+  flush 尚未发生（服务还在 `apt install dnsutils` 阶段，约 3 秒），
+  等到日志出现 `更新iptables规则[DONE]` 后 9443 才真正消失。
+  **不要用 `sleep 3` 然后下结论**，要盯 journal 里那一行。
+- 迁移后要清 `/etc/dnat/<端口>IP` 这类缓存文件，否则下次排查会被它误导。
+
+迁移结果（本跳板机现状）：`9443 → flowtls-relay`（`/etc/flowtls-relay/conf`），
+`34444 → 1Panel dnat.service`（`/etc/dnat/conf`），两者互不干扰。
+
 ## 167. 客户端入向规则必须挂 input 钩子；`fib daddr type local` 在 NAT 后无效（2026-11-26 北京时间）
 
 现场拓扑（用户的多层环回路由，简化版）：
