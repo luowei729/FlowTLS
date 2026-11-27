@@ -16,11 +16,11 @@ import (
 // localIP 必须有值，否则构包时 As4() 会 panic。
 func newTestListener() *Listener {
 	return &Listener{
-		raw:      newTestRawSocket(),
-		port:     8443,
+		raw:     newTestRawSocket(),
+		port:    8443,
 		isnMarks: []uint16{0xF107},
-		byAddr:   make(map[netip.AddrPort]*Session),
-		pending:  make(map[netip.AddrPort]*synState),
+		byAddr:  make(map[netip.AddrPort]*Session),
+		pending: make(map[netip.AddrPort]*synState),
 		// 手工构造会绕过 NewListener 的 loggerOr 归一，
 		// 必须显式给个实现：nil 接口调方法会 panic。
 		logger: nopLogger{},

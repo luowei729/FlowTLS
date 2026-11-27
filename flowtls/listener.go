@@ -176,13 +176,13 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	}
 
 	l := &Listener{
-		raw:   raw,
-		port:  cfg.Listen.Port(),
+		raw:    raw,
+		port:   cfg.Listen.Port(),
 		creds: creds,
 		// isnMarks 漏传时字段是 nil，`isnMarkOf` 恒返回 0，现象是
 		// 「服务端永远不回 SYN-ACK」，而且日志上完全看不出原因。
 		isnMarks: isnMarks,
-		logger:   logger,
+		logger: logger,
 		// 这两个必须从 opts 抄过来。漏掉时字段是 0，
 		// maintainLoop 里 `idleFor() > 0` 对任何刚收到包的会话都成立，
 		// 下一秒就把会话关掉。客户端还以为隧道在，请求全部超时，
@@ -676,7 +676,7 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, isnMark uint
 		Seq:   isn,
 		Ack:   p.Seq + 1,
 		Flags: TCPSYN | TCPACK,
-		IPID:  synIPID,
+		IPID: synIPID,
 		// SYN 阶段用未缩放的原始窗口（缩放因子在 ESTABLISHED 后才生效）
 		Window:  65535,
 		TSVal:   ts,
