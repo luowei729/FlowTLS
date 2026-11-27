@@ -320,6 +320,16 @@ Rust 内层 cwnd 始终 ≥1.5MB），`ProfileConservative` 替换实验无效�
 rev.10 = rev.9 + 挂死处理。wire format 未改。
 发送路径不加 `SO_SNDTIMEO`。内容见 CHANGELOG 同日条目。
 
+### 运维：经跳板机三层转发（2026-11-27 北京时间）
+
+无代码改动、无发布，只改一台第三方跳板机。
+
+- 跳板机 `203.0.113.20` 上 `9443` DNAT → `198.51.100.20:8443`，
+  配 POSTROUTING SNAT，三层透传伪造 TCP。
+- 新增 `/etc/sysctl.d/99-flowtls-relay.conf`：`nf_conntrack_tcp_be_liberal=1`、
+  `nf_conntrack_max=65536`。前者修「时通时不通」（伪 TCP 被判 INVALID）。
+- 已验证经该路径能跑通代理流量；结论与限制见 `DEVTIPS.md` 第 168 条。
+
 ### 发布 rev.12（2026-11-26 北京时间）
 
 rev.12 = rev.11 + 凭据形态收敛。**外层伪 TCP 报文格式未改，也没有 wire

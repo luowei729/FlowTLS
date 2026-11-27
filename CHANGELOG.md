@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 2026-11-27 (北京时间)
+
+### 运维：经跳板机 `9443` → `8443` 的三层转发打通（无代码改动）
+
+**wire format 未改动，二进制未改动，两端都不需要升级或重启。**
+
+- 跳板机 `203.0.113.20`：`9443` DNAT 到 `198.51.100.20:8443`，配套
+  POSTROUTING SNAT 回跳板机（TCP/UDP 各一条），`ip_forward=1`，FORWARD 放行。
+- 新增 `/etc/sysctl.d/99-flowtls-relay.conf` 并立即生效：
+  `nf_conntrack_tcp_be_liberal=1`（伪 TCP 不被 conntrack 判 INVALID）、
+  `nf_conntrack_max=65536`（原 8192）。用 `sysctl --system` 复验，
+  开机路径下取值一致。
+- 实测：`curl -k https://203.0.113.20:9443/` → 200，TCP 84ms / TLS 180ms；
+  服务端日志出现 `connection from 203.0.113.20` 与 `connection download finished`。
+- 四条硬约束（DNAT/SNAT 成对、不能在本机测、只能三层转发、不能加 `notrack`）
+  见 `DEVTIPS.md` 第 168 条。
+- 客户端改法：`server` 填 `203.0.113.20`、`server_port` 填 `9443`，
+  其余字段不变（服务端看到的源 IP 全变成跳板机地址）。
+
 ## 2026-11-26 (北京时间)
 
 ### 发布：v1.14.4-rev.14 —— 客户端入向规则改挂 input 钩子（rev.13 的修法是错的）

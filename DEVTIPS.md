@@ -6,6 +6,59 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 168. 跳板机端口转发只支持三层；DNAT 与 SNAT 必须成对，并要放宽 conntrack 窗口校验（2026-11-27 北京时间）
+
+需求形态：客户端连 A 机（`203.0.113.20`），A 用 nft 把 `9443` 转发到
+B 机（`198.51.100.20`）的 `8443`。**能做**，但只能是三层改地址，不终止连接。
+
+```
+table ip nat {
+  chain PREROUTING  { type nat hook prerouting priority dstnat;
+                      meta l4proto tcp tcp dport 9443 counter dnat to 198.51.100.20:8443 }
+  chain POSTROUTING { type nat hook postrouting priority srcnat;
+                      meta l4proto tcp ip daddr 198.51.100.20 tcp dport 8443 \
+                      counter snat to 203.0.113.20 }
+}
+```
+
+四条硬约束：
+
+1. **DNAT 与 SNAT 必须成对**。只做 DNAT 时 B 的回程包按源地址直接发给
+   客户端，源变成 `B:8443`；而客户端 `Session.matchPeer` 只认
+   `p.Src == peer.Addr() && p.SrcPort == remotePort && p.DstPort == localPort`，
+   地址或端口任一不符就整包丢弃 → 客户端只会反复重发纯 SYN。
+   指纹：A 的 PREROUTING counter 在涨、字节数 ≈ 包数 × 60（全是无载荷 SYN），
+   而 B 的日志里连一条 `connection from` 都没有。
+
+2. **不能从跳板机本机测 `A:9443`**。DNAT 挂在 PREROUTING，本机产生的流量
+   走 OUTPUT，永远不经过它 → 本机 curl/telnet 必然超时，很容易误判成
+   「不支持端口转发」。要从第三方机器测。
+
+3. **必须是三层转发，不能是终止型**。socat / nginx stream / haproxy /
+   gost `-L tcp` 都会先用内核 TCP 接住连接再另起一条，B 看到的是内核发的
+   无标记 SYN：握手能成，但数据进不了 AF_PACKET 收包路径（B 的 `in_8443`
+   只对带 mark 的包放行），表现为「连上了但没数据」。
+
+4. **不要给转发端口加 `notrack`**。B 机（服务端自己）可以加，A 机不行：
+   没有 conntrack 条目时 `nf_nat_inet_fn()` 直接 NF_ACCEPT，DNAT/SNAT 会
+   一起失效。A 机要的是 `be_liberal=1`，不是 `notrack`。
+
+A 机必设的两条 sysctl（写 `/etc/sysctl.d/99-flowtls-relay.conf`）：
+
+```
+net.netfilter.nf_conntrack_tcp_be_liberal = 1   # 伪 TCP 序号不符窗口时不判 INVALID
+net.netfilter.nf_conntrack_max = 65536          # 默认 8192，多设备转发容易满
+```
+
+`be_liberal=0`（默认）时，超出 conntrack 窗口跟踪的段会被判 INVALID 丢弃，
+而伪造 TCP 的序号/窗口是协议自己造的，不保证符合窗口跟踪。症状是
+**「隧道时通时不通，换个源端口重连又好」**——客户端重连换四元组，
+产生新 conntrack 条目，于是恢复。
+
+排查手法（避免把「本来就通」误判成自己修好了）：记录 `nft -a` 的 handle
+与 counter 的两次读数。handle 不变说明规则没被重建；counter 在涨而本地
+一个包都没发，说明是设备自己的流量在通。
+
 ## 167. 客户端入向规则必须挂 input 钩子；`fib daddr type local` 在 NAT 后无效（2026-11-26 北京时间）
 
 现场拓扑（用户的多层环回路由，简化版）：
