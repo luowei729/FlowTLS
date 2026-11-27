@@ -109,6 +109,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.IPIDMark == 0 {
 		options.IPIDMark = ft.DeriveIPIDMark(options.Password)
 	}
+	// 没配带宽时明确告警：本包会静默按 1 Gbps 兑底，而它在高 RTT 公网
+	// 链路上会让 loss_pct 虚高（详见 warnIfNoBandwidth 的注释）。
+	warnIfNoBandwidth(logger, options.UpMbps, options.DownMbps)
 	// 握手参数在这里就解析：拼错时要报错，而不是拖到建连时才变成
 	// 一句「握手超时」。Rust 的 config 校验同样在建连前。
 	if _, err := ft.ParseHandshake(options.Handshake); err != nil {
@@ -145,6 +148,33 @@ func udpOn(v *bool) bool {
 		return true
 	}
 	return *v
+}
+
+// warnIfNoBandwidth 在没配 up_mbps/down_mbps 时发出**明确告警**。
+//
+// 为什么必须告警而不是默默兑底：本包（flowtls/quic）在 bps == 0 时
+// 静默用 1 Gbps（见 defaultBrutalRate）。这在本地回环或局域网完全没问题，
+// 但在**高 RTT 的公网链路上会出事**：
+//
+//	1 Gbps 的目标速率下，在途字节 = 速率 × RTT ≈ 125MB/s × 0.08s = 10MB，
+//	远超链路的实际缓冲区，于是包在中间设备排队；
+//	排队延迟抖动让后发的包先到，quic-go 的丢包判定阀值
+//	packetThreshold = 3（internal/ackhandler，const 不可调）会把乱序当丢包，
+//	loss_pct 于是被高估。
+//
+// 真实案例（2026-11-28）：Windows 客户端经跳板机到 sg1，跳板机 nft 内核
+// 计数显示转发 255,968/255,984 包（丢 0.006%），网卡 dropped=0，
+// 但服务端报 loss_pct=35，inflight 堆到 3.8MB。配上 down_mbps 后恢复正常。
+//
+// 不报错（不学 hysteria2 的 E.New("missing upload speed")）是因为：
+// 现有部署的配置里全都没这个字段，改成报错会让它们升级后直接启动不了。
+func warnIfNoBandwidth(logger log.ContextLogger, upMbps, downMbps int) {
+	if upMbps > 0 && downMbps > 0 {
+		return
+	}
+	logger.Warn("flowtls: 未配置带宽（up_mbps / down_mbps），按 1000 Mbps 兜底。",
+		"高 RTT 公网链路上这会超发，使在途字节堆积、乱序被判为丢包（loss_pct 虚高），",
+		"请按实际线路带宽填写 up_mbps / down_mbps（例如 30 / 150）")
 }
 
 // Start 在 StartStateStart 阶段建立通道。

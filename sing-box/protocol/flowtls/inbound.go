@@ -105,6 +105,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if _, err := ft.ParseHandshake(options.Handshake); err != nil {
 		return nil, err
 	}
+	// 同客户端：没配带宽时明确告警（服务端 1 Gbps 兑底同样会让 loss_pct 虚高）。
+	// 服务端这一侧尤其重要 —— 它上报的 loss_pct 被运维用来判断链路质量，
+	// 而兑底超发造成的假丢包会把人引向错误的方向（排查过一整天）。
+	warnIfNoBandwidth(logger, options.UpMbps, options.DownMbps)
 	if options.Masquerade != nil {
 		if options.Masquerade.CertificatePath == "" || options.Masquerade.KeyPath == "" {
 			return nil, E.New("flowtls: masquerade 需要 certificate_path 与 key_path（必须是真证书）")

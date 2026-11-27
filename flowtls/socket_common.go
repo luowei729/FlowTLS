@@ -18,6 +18,24 @@ import "errors"
 // 只有 64（`txQueueDepth`），一次排空就够。
 const maxSendBatch = 64
 
+// recvHandoffDepth 是「收包协程 → 主循环」交接队列的深度。
+//
+// **这是 Rust 原版的值，Go 移植时被误改成了 1**。
+// `legacy-rust:src/client.rs:485` 的原文：
+//
+//	// 用有界 channel：下行大流量时最多积压 8192 个包，超过后收包线程阻塞，
+//	// 由内核 socket 缓冲区兜底丢包（QUIC 会重传），避免 unbounded 把内存吃光。
+//	let (pkt_tx, mut pkt_rx) = mpsc::channel::<...>(8192);
+//
+// 容量为 1 时的后果：主循环一旦卡在 deliver（rx 满时阻塞），读协程最多
+// 再塞 1 个包就阻塞在 `frames <-`，socket 不再被读，内核 AF_PACKET 队列
+// 积压后被丢弃；同时主循环回不到 select，5ms 心跳失效，延迟确认也跟着停摆。
+// Rust 的抗抖动能力是 Go 的 8192 倍。
+//
+// 恢复该值属于**对齐参考实现**，不引入任何新语义（队列满时仍是阻塞，不丢包）。
+// 内存代价：8192 个切片头（约 200KB）+ 引用指向的帧数据（受内核队列背压限制）。
+const recvHandoffDepth = 8192
+
 // socketRole 是建 socket 时需要的角色信息。
 //
 // **只有 Windows 用得到**：WinDivert 的过滤器在 Open() 时固定，必须知道

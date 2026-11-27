@@ -283,7 +283,7 @@ func (l *Listener) recvLoop() {
 	// 客户端请求到达服务端后，服务端的 TCP ACK 是 221ms 后才离开本机网卡，
 	// 而服务端自己的网卡上 0.08ms 就发出了。差额是客户端看到的时间，
 	// 因为客户端同样把 ACK 压着；服务端这一侧用同一个 5ms 截断补上。
-	frames := make(chan recvResult, 1)
+	frames := make(chan recvResult, recvHandoffDepth)
 	go func() {
 		scratch := make([]byte, recvBufSize)
 		for {

@@ -100,6 +100,11 @@ type brutalController struct {
 type brutalEntry struct {
 	conn *quicgo.Conn
 	cc   *brutalSender
+
+	// prevSent / prevLost 是该连接上一次采样时的累计值，
+	// 用于算它**自己**在本周期的丢包率（理由见 connEntry 同名字段）。
+	prevSent uint64
+	prevLost uint64
 }
 
 // newBrutalController 创建并启动统计循环。
@@ -197,7 +202,6 @@ func (c *brutalController) loop() {
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 
-	var lastSent, lastLost uint64
 	for {
 		select {
 		case <-c.stop:
@@ -212,42 +216,41 @@ func (c *brutalController) loop() {
 		}
 		c.mu.Unlock()
 
-		if len(entries) == 0 {
-			lastSent, lastLost = 0, 0
+		// 没有活跃连接就什么都不用做：每条连接各自记基线，
+		// 不再需要维护全局基线（也就没有「断开期间当成一次采样」
+		// 把窗口放大那个问题了）。
+		if len(entries) == 0 || c.onStats == nil {
 			continue
-		}
-		if c.onStats == nil {
-			continue
-		}
-
-		var totalSent, totalLost uint64
-		for _, e := range entries {
-			totalSent += e.conn.ConnectionStats().PacketsSent
-			totalLost += e.cc.lostPackets.Load()
-		}
-		var dSent, dLost uint64
-		if totalSent > lastSent {
-			dSent = totalSent - lastSent
-		}
-		if totalLost > lastLost {
-			dLost = totalLost - lastLost
-		}
-		lastSent, lastLost = totalSent, totalLost
-
-		loss := 0.0
-		if dSent > 0 {
-			loss = float64(dLost) / float64(dSent)
 		}
 
 		for _, e := range entries {
 			s := e.conn.ConnectionStats()
+
+			// 本连接自己的周期增量（不打印全局聚合值，否则同一次采样的
+			// 所有连接会显示同一个丢包率，见 connEntry 的注释）。
+			sent := s.PacketsSent
+			lost := e.cc.lostPackets.Load()
+			var dSent, dLost uint64
+			if sent > e.prevSent {
+				dSent = sent - e.prevSent
+			}
+			if lost > e.prevLost {
+				dLost = lost - e.prevLost
+			}
+			e.prevSent, e.prevLost = sent, lost
+
+			loss := 0.0
+			if dSent > 0 {
+				loss = float64(dLost) / float64(dSent)
+			}
+
 			c.onStats(PathStats{
 				Remote:      e.conn.RemoteAddr().String(),
 				RTT:         s.LatestRTT,
 				SmoothedRTT: s.SmoothedRTT,
 				MinRTT:      s.MinRTT,
-				SentPackets: s.PacketsSent,
-				LostPackets: e.cc.lostPackets.Load(),
+				SentPackets: sent,
+				LostPackets: lost,
 				LossPct:     uint64(loss * 100),
 				// WinCap 在 Brutal 下表示这条连接当前的发送速率（字节/秒）。
 				// 协商之后它是 min(本端 up, 对端 down)，不再是配置原值。

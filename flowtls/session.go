@@ -656,7 +656,7 @@ func (s *Session) recvLoop() {
 	// 而服务端自己从收到请求到发出响应只有 26ms（2026-11-14 两端对抓）。
 	// 这里用 5ms 把阻塞的 Recv 截断一次：没有新包也把已经到期的 ACK 发出去。
 	// fd 仍是阻塞的，超时由单独的计时器负责，不碰 socket 选项。
-	frames := make(chan recvResult, 1)
+	frames := make(chan recvResult, recvHandoffDepth)
 	go func() {
 		scratch := make([]byte, recvBufSize)
 		for {

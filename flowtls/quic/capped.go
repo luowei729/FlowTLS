@@ -295,6 +295,18 @@ type windowController struct {
 type connEntry struct {
 	conn *quicgo.Conn
 	cc   *cappedBbr
+
+	// prevSent / prevLost 是该连接上一次采样时的累计值。
+	//
+	// **必须按连接各自记录，不能共用一份全局基线**：
+	// `loss_pct` 描述的是「这条连接在本采样周期的丢包率」，
+	// 若用全部连接加总的 Δ 再打印到每一行，同一次采样的所有连接会显示
+	// 同一个数字。真机上出现过 `sent=1368 lost=0 loss_pct=26` 这种荒谬
+	// 结果 —— 那条连接一个包都没丢，26% 是别的连接丢的。
+	//
+	// 注意字段只由 loop 单协程读写（entries 快照后独占），不需要额外加锁。
+	prevSent uint64
+	prevLost uint64
 }
 
 // PathStats 是一次采样周期内的 QUIC 路径统计（对应 Rust 的「QUIC 路径统计」日志）。
@@ -488,15 +500,35 @@ func (w *windowController) loop() {
 				// 主动读一次窗口：quic-go 只在有数据要发时才调
 				// GetCongestionWindow，空闲连接会一直停在旧值。
 				_ = e.cc.GetCongestionWindow()
+
+				// 本连接自己的周期增量。上面的 `loss` 是**全局聚合**的，
+				// 只能用于窗口自适应（窗口本身就是全局的），
+				// 打印时必须换成 per-conn 值，否则每条连接都显示同一个数。
+				sent := s.PacketsSent
+				lost := e.cc.lostPackets.Load()
+				var connDSent, connDLost uint64
+				if sent > e.prevSent {
+					connDSent = sent - e.prevSent
+				}
+				if lost > e.prevLost {
+					connDLost = lost - e.prevLost
+				}
+				e.prevSent, e.prevLost = sent, lost
+
+				connLoss := 0.0
+				if connDSent > 0 {
+					connLoss = float64(connDLost) / float64(connDSent)
+				}
+
 				w.onStats(PathStats{
 					Remote:      e.conn.RemoteAddr().String(),
 					RTT:         s.LatestRTT,
 					SmoothedRTT: s.SmoothedRTT,
 					MinRTT:      s.MinRTT,
-					SentPackets: s.PacketsSent,
+					SentPackets: sent,
 					// 同上：必须用自建计数，否则日志里丢包率永远是 0。
-					LostPackets: e.cc.lostPackets.Load(),
-					LossPct:     uint64(loss * 100),
+					LostPackets: lost,
+					LossPct:     uint64(connLoss * 100),
 					WinCap:      next,
 					Cwnd:        e.cc.lastCwnd.Load(),
 					InFlight:    e.cc.lastInFlight.Load(),
