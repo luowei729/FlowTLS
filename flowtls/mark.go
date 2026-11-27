@@ -47,7 +47,37 @@ import (
 // 与 codec.go 的 AEAD 密钥、authID 用**不同的 info**，保证三者无关。
 // 带版本号：将来若要改派生方式，只要改这里的 v1 → v2，
 // 新旧部署不会因为算法不一致而静默不通（会表现为握手失败，很明显）。
-const markDeriveInfo = "flowtls ip id mark v1"
+const markDeriveInfo = "flowtls isn mark v1"
+
+// DeriveISNMark 从 password 派生 TCP ISN 分流标记（16 位，全位可用）。
+//
+// 同一对 password 在客户端与服务端**必然**得到同一个值 —— 这就是
+// 零配置同步的全部原理。
+//
+// # 为什么标记在 TCP ISN 而不是 IP ID
+//
+// 早期实现放在 IP ID 高字节，但 IP ID 会被中间设备随机化（RFC 6528 的
+// 防侧信道要求，多数 NAT / 云网关实现得更粗暴）。2026-11-28 三角测量实测：
+// 同一客户端经 hk1 到 sg1 正常，到 tk3 却握手超时 —— 差别只在中间路径
+// 有没有改写 IP ID 的设备。ISN 没有任何设备会改写（改了 TCP 就废了），
+// 是唯一可靠且可被 nft 静态匹配的载体。
+//
+// 完整论证与字段对比表见 packet.go 的 `---- TCP ISN 分流标记 ----`。
+func DeriveISNMark(password string) uint16 {
+	k, err := hkdf.Key(sha256.New, []byte(password), []byte(hkdfSalt),
+		markDeriveInfo, 2)
+	if err != nil {
+		// hkdf.Key 只在参数非法时失败；长度固定 2，实际不可能触发。
+		panic("flowtls: hkdf isn mark: " + err.Error())
+	}
+	mark := uint16(k[0])<<8 | uint16(k[1])
+	// mark == 0 在代码里表示「未配置」，会让调用方退回默认值。
+	// 派生出 0 的概率 1/65536，换成一个固定的替换值。
+	if mark == 0 {
+		mark = 0x4D4B
+	}
+	return mark
+}
 
 // DeriveIPIDMark 从 password 派生 ip_id_mark（返回 0xNN00 形式）。
 //

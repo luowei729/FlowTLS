@@ -113,7 +113,13 @@ type Session struct {
 	// 我们的分流是按四元组做的，所以要在握手一开始就判断。
 	peerISN uint32
 	ipid    uint16
-	mark    uint16
+	// isnMark 是本条会话在 SYN 上使用的分流标记（0 表示本端是客户端
+	// 且用的是 cfg.ISNMark，或本端是服务端但从对端 SYN 里没提取到）。
+	//
+	// **只用于回包的 SYN-ACK**：服务端回 SYN-ACK 时要把同一个标记写回
+	// 自己这一侧的 ISN，客户端才能确认对面是我们的服务端（而不是同端口
+	// 的真网站）。后续数据包不带任何标记 —— 序列号从 ISN+1 正常递增。
+	isnMark uint16
 	clock   *TcpClock
 	ackPend int
 	lastAck time.Time
@@ -427,7 +433,7 @@ func (s *Session) appendSegmentLocked(dst, payload []byte, flags uint8) []byte {
 		s.localPort, s.remotePort, seg)
 	// TCP 语义：序号按载荷推进
 	s.seq += seqLen(flags, len(payload))
-	s.ipid = NextIPID(s.mark, s.ipid)
+	s.ipid = NextIPID(s.ipid)
 	return dst
 }
 

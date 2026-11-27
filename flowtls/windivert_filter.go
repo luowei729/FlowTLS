@@ -349,16 +349,6 @@ func wdivSplitBatch(buf []byte) [][]byte {
 	return out
 }
 
-// wdivIPIDMarkRange 返回 IP ID 标记的取值区间（闭区间）。
-//
-// `NextIPID` 保持高字节不变、低字节递增回绕，所以一条连接的 IP ID 落在
-// `[mark, mark|0xFF]`。目前只用于日志与文档，不作为过滤器条件
-// （原因见 wdivFieldZero 处注释）。
-func wdivIPIDMarkRange(mark uint16) (lo, hi uint16) {
-	m := mark & 0xFF00
-	return m, m | IPIDLowMask
-}
-
 // wdivSrcAddrOf 从完整 IP 报文里读源地址（仅用于日志/诊断）。
 func wdivSrcAddrOf(pkt []byte) (netip.Addr, bool) {
 	if len(pkt) < 20 {

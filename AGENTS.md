@@ -38,11 +38,20 @@ flowtls 传输层
   - 标准三次握手：SYN → SYN-ACK → ACK，之后才发数据
     （严格 NAT 会丢弃握手完成前的数据包；零等待版本已废弃）
   - AEAD 密钥 = HKDF-SHA256(password)，解密成功即鉴权
-  - 伪包识别特征 = **IP ID 高字节标记**（与 Rust 逐条一致）
-    `(ip_id & mark) == mark` 且 SYN 且无载荷；mark 由
-    `HKDF-SHA256(password, "flowtls ip id mark v1")` **派生**（见
+  - 伪包识别特征 = **TCP ISN 低 16 位标记**（rev.17 起，不再用 IP ID）
+    SYN 的序列号低 16 位 == mark 且无载荷；mark 由
+    `HKDF-SHA256(password, "flowtls isn mark v1")` **派生**（见
     `flowtls/mark.go`），两端自动一致、部署间自动不同。
     每条凭据各派生一个，全部纳入识别范围。
+    **为什么不用 IP ID（早期做法，已废弃）**：IP ID 会被中间设备
+    随机化（RFC 6528 的防侧信道要求），一旦被改写服务端就认不出伪包，
+    且两端日志毫无线索。TCP 序列号没有任何设备会改写（改了 TCP 就废了）。
+    2026-11-28 实测：`hk1→tk3` 路径同时改写 IP ID 与 ISN（源端口保留、
+    ISN 全变、MSS 被钳制），这种路径上伪 TCP 根本无法工作；
+    而 `家宽→tk3`、`hk1→sg1` 两条路径 ISN 完好，隧道正常。
+    **数据包不靠标记**：ISN 标记只在 SYN 上一个包；同一条流的后续包靠
+    nft **动态集合**（键 `ip saddr . tcp sport`，超时10m）匹配 DROP。
+    真实浏览器（同端口的伪装站）不命中任何标记规则，落到 `notrack` 兜底。
     **凭据三选一**：`password`（单密码）与 `passwords`（多密码数组）
     **不能同时配置**，同填会直接报错；`users` 是已废弃的旧写法
     （等价于 `passwords`，`name` 被忽略，删字段会让旧配置以
@@ -197,9 +206,9 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
 13. **iptables 规则刻意不自动删除**。重启期间规则必须继续生效，
     否则内核会回 RST 打断重建中的隧道。`mode` 只有 `auto` / `none`
     两个合法值（与 Rust 一致），没有 `print`。
-14. **服务端分流必须按 IP ID 高字节判断**（与 Rust 一致），且**纯 SYN 判断
-    要优先于「已有会话」**。IP ID 用 `& 0xFF00` 掩掉低字节（低字节是按包
-    递增的序号）。
+14. **服务端分流必须按 TCP ISN 低 16 位判断**（rev.17 起，不再用 IP ID），
+    且**纯 SYN 判断要优先于「已有会话」**。ISN 标记用满 16 位（不做
+    归一化），数据包的归属靠 nft 动态集合而不是标记。
 15. **收包缓冲必须 ≥ 256KB**：网卡 GRO 会把多个 TCP 段合并成超过 64KB 的
     skb，缓冲不足时 `recvmmsg` **静默截断**（QUIC 的 `lost=` 恒为 0，
     只表现为握手慢、RTT 虚高）。同时必须保留 `MSG_TRUNC` 检测
@@ -214,7 +223,7 @@ sudo ./dist/sing-box-1.14.4-rev.1-linux-amd64 run -c client.json   # 客户端
     `203.0.113.x` / `198.51.100.x` / `192.0.2.x`（RFC 5737 文档段）和
     `example.com`；真实值只放在被忽略的 `deploy/` 与 `DEPLOY_CREDENTIALS.md`。
     FakeTCP 的抗探测能力全靠「IP + SNI + password 都不公开」，三者同时
-    泄露等于把部署指纹交出去（ip_id_mark 由 password 派生，所以它跟着
+    泄露等于把部署指纹交出去（ISN 标记由 password 派生，所以它跟着
     password 一起安全或一起泄露）。`docs/leak_check.sh` 用白名单扫描被跟踪文件，
     `make verify` 与 CI 每次都会跑（`DEVTIPS.md` 第 119 条）。
     **测量/运维脚本连接哪台机器必须从环境变量取**（如 `FLOWTLS_SERVER`），

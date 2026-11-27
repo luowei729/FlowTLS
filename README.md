@@ -115,9 +115,10 @@ Go 版通过 `masquerade` 配置把站点做在 inbound 内（和 Rust 版行为
 
 ```
 到达 8443 的包
-   ├─ IP ID 高字节 == 标记  →  iptables raw/PREROUTING DROP（内核看不到）
-   │                            AF_PACKET 在 netfilter 之前收包 → 进隧道
-   └─ 其余                  →  交给内核 TCP → 真网站
+   ├─ 纯 SYN 且 ISN 低16位 == 标记 → nft raw/PREROUTING 记账+DROP（内核看不到）
+   │                                  AF_PACKET 在 netfilter 之前收包 → 进隧道
+   ├─ 同一四元组的后续包          → 按动态集合 DROP（内核不会逐包回 RST）
+   └─ 其余                        → notrack 后交给内核 TCP → 真网站
 ```
 
 两种模式二选一：

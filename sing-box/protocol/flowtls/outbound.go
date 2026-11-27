@@ -98,7 +98,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// 标成 DOWN，只能走备用节点）。
 	//
 	// 0 传给客户端库即「从动态端口段挑一个未在用的」。
-	// IPIDMark 保持 0（表示从 password 派生）：**不再填默认值**。
+	// ISNMark 保持 0（表示从 password 派生）：**不再填默认值**。
 	//
 	// 旧版回落到公开的 0xF107，而大量部署都用同一个值等于交出指纹 ——
 	// DPI 只需一条「IP ID 高字节 == 0x1e」就能命中所有未改动的部署。
@@ -106,8 +106,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// 从 password 派生能同时满足两个硬要求：两端自动一致（password
 	// 本来就共享）、不同部署自动不同（password 不同）。详见
 	// flowtls/mark.go 的完整论证。
-	if options.IPIDMark == 0 {
-		options.IPIDMark = ft.DeriveIPIDMark(options.Password)
+	if options.ISNMark == 0 {
+		options.ISNMark = ft.DeriveISNMark(options.Password)
 	}
 	// 没配带宽时明确告警：本包会静默按 1 Gbps 兑底，而它在高 RTT 公网
 	// 链路上会让 loss_pct 虚高（详见 warnIfNoBandwidth 的注释）。
@@ -269,7 +269,7 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 			Password:   o.opts.Password,
 			SNI:        sni,
 			SourcePort: o.opts.SourcePort,
-			IPIDMark:   o.opts.IPIDMark,
+			ISNMark:   o.opts.ISNMark,
 			Handshake:  handshake,
 			// 防火墙规则由 flowtls 库强制写入（没有开关）：SYN-ACK 一回，
 			// 内核就会发现没有对应 socket 并回 RST，中间设备会立即拆掉 NAT 映射。

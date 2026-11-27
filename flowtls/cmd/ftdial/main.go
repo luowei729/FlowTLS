@@ -31,7 +31,7 @@ func main() {
 		sni      = flag.String("sni", "", "伪装 SNI（默认取 target 的域名）")
 		// 0 = 自动分配。联调默认也走动态端口，避免多开几个进程就撞四元组。
 		srcPort  = flag.Uint("source-port", 0, "客户端源端口（0=自动分配）")
-		ipidMark = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
+		isnMark  = flag.Uint("isn-mark", 0, "TCP ISN 分流标记（0=从 password 派生）")
 
 		timeout  = flag.Duration("timeout", 30*time.Second, "总超时")
 		doTLS    = flag.Bool("tls", true, "在流上再做一次 TLS（访问 https 站点）")
@@ -77,7 +77,7 @@ func main() {
 			Password:   *password,
 			SNI:        *sni,
 			SourcePort: uint16(*srcPort),
-			IPIDMark:   uint16(*ipidMark),
+			ISNMark:   uint16(*isnMark),
 			Handshake:  flowtls.HandshakeSymbolic,
 
 			// 联调工具不接 sing-box，显式用标准库输出。

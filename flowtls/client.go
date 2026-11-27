@@ -86,18 +86,6 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		" local=", raw.LocalIP(), " 源端口=", sourcePort,
 		" 模式=", raw.SendMode())
 
-	// ip_id_mark 用着默认值时必须明确提醒。
-	//
-	// 它不能像 source_port 那样自动生成：服务端与**所有**客户端必须用同
-	// 一个值（服务端靠它判断伪包），而多凭据部署下每条密码不同，
-	// 「从 password 派生」在两端会算出不同结果。所以只能显式配置，
-	// 唯一能做的就是提醒部署方别留着公开默认值。
-	if IsDefaultIPIDMark(cfg.IPIDMark) {
-		logger.Warn("ip_id_mark 仍为公开默认值(", cfg.IPIDMark,
-			")。它同时是抗主动探测指纹的一部分，",
-			"请为每个部署选一个不公开的值（需与服务端一致），例如 0xC500 = 50432。")
-	}
-
 	// 客户端规则必须在**第一个包发出之前**就位。
 	//
 	// SYN-ACK 一回，内核就会发现没有对应 socket 并回 RST，
@@ -112,13 +100,13 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 	// EPERM，看着像权限问题）；少了 RST 抑制，第一个 SYN-ACK 就把 NAT
 	// 映射拆掉。所以这里不做 `if 配置==auto` 判断 —— 直接写，写不进去
 	// 就带着原因失败，比静默不通强。
-	if err := EnsureClient(cfg.Server, cfg.IPIDMark); err != nil {
+	if err := EnsureClient(cfg.Server, sourcePort, cfg.ISNMark); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}
 	// 把实际生效的规则打出来。这一层出问题时现象极隐蔽，
 	// 不写日志就永远查不到。
-	for _, r := range ClientNftRules(cfg.Server, cfg.IPIDMark) {
+	for _, r := range ClientNftRules(cfg.Server, sourcePort, cfg.ISNMark) {
 		logger.Info("防火墙规则: ", r)
 	}
 
@@ -127,13 +115,14 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		_ = raw.Close()
 		return nil, err
 	}
-	mark := IPIDMarkOf(cfg.IPIDMark)
-	if mark == 0 {
-		mark = IPIDMark
-	}
-
-	// 随机初始序列号（Rust `rand::thread_rng().gen()`）。
-	isn := randomUint32()
+	// 随机初始序列号，低 16 位写入分流标记。
+	//
+	// **标记必须在 SYN 上**：服务端在内核层（nft）和用户态（listener）
+	// 都要在解密之前判断「这个 SYN 是不是我们的」，而 nft 能静态匹配的
+	// 只有 IP ID / 序列号 / 端口这些字段。IP ID 会被中间设备随机化
+	// （实测 hk1→tk3 路径如此），序列号不会 —— 改写它 TCP 就废了。
+	// 完整论证见 packet.go 的 `---- TCP ISN 分流标记 ----`。
+	isn := ApplyISNMark(RandomISN(), cfg.ISNMark)
 	s := &Session{
 		raw:   raw,
 		codec: codec,
@@ -146,8 +135,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Session, error) {
 		localPort:  sourcePort,
 		autoPort:   autoPort,
 		remotePort: cfg.Server.Port(),
-		ipid:       RandomIPID(mark),
-		mark:       mark,
+		ipid:       uint16(randomUint32()),
 		clock:      NewTcpClock(),
 		// Rust 在 SYN 之前就把 seq 设为 isn+1（SYN 占 1 个序号）
 		seq:     isn + 1,
@@ -238,7 +226,7 @@ func (s *Session) exchangeSYN(ctx context.Context) error {
 				s.pktsSent.Add(1)
 			}
 			s.mu.Lock()
-			s.ipid = NextIPID(s.mark, s.ipid)
+			s.ipid = NextIPID(s.ipid)
 			s.mu.Unlock()
 			backoff *= 2
 			if backoff > synMaxBackoff {

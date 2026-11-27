@@ -37,7 +37,7 @@ type FlowTLSInboundOptions struct {
 	Password string `json:"password,omitempty"`
 	// Passwords 是**多密码**凭据表（与 password / users 互斥）。
 	//
-	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ip_id_mark
+	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ISN 标记
 	// （见 flowtls/mark.go）。多个客户端也可以共用其中一条（"默认密码"），
 	// 所以下面这种配置同时表达了「朋友共用一个」与「自己的设备可单独吊销」：
 	//
@@ -68,9 +68,15 @@ type FlowTLSInboundOptions struct {
 	//
 	// 只有在特殊拓扑（例如要显式绑某块网卡的内网地址）时才需要填。
 	LocalIP string `json:"local_ip,omitempty"`
-	// IPIDMark 对应 Rust `faketcp.ip_id_magic`，是 IP ID 高字节分流标记。
+	// ISNMark 是 TCP ISN 低 16 位分流标记。
 	// **留空即从 password 派生**，两端自动一致；填了就用你填的值。
-	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
+	//
+	// 为什么在 TCP ISN 而不是 IP ID：IP ID 会被中间设备随机化
+	// （RFC 6528 的防侧信道要求，多数 NAT / 云网关实现得更粗暴），
+	// 一旦被改写，服务端就认不出我们的伪包，隧道彻底不通。
+	// TCP 序列号没有任何设备会改写 —— 改了 TCP 就废了。
+	// 完整论证见 flowtls/packet.go 的 `---- TCP ISN 分流标记 ----`。
+	ISNMark uint16 `json:"isn_mark,omitempty"`
 	// Handshake 对应 Rust `faketcp.handshake`：symbolic（默认）/ none。
 	Handshake string `json:"handshake,omitempty"`
 	// UpMbps / DownMbps 是 Brutal 的目标速率，单位 Mbps，与 hysteria2 的
@@ -173,8 +179,9 @@ type FlowTLSOutboundOptions struct {
 	//
 	// 所以这里不再提供固定端口选项：动态分配是默认且唯一推荐做法。
 	SourcePort uint16 `json:"source_port,omitempty"`
-	// IPIDMark 对应 Rust `faketcp.ip_id_magic`，与客户端 iptables 规则一致。
-	IPIDMark uint16 `json:"ip_id_mark,omitempty"`
+	// ISNMark 是 TCP ISN 低 16 位分流标记，与客户端规则一致。
+	// 留空表示按每条 password 各自派生（推荐）。
+	ISNMark uint16 `json:"isn_mark,omitempty"`
 	// Handshake 对应 Rust `faketcp.handshake`：symbolic（默认）/ none。
 	//
 	// 用字符串而不是 Go 惯用的反向 bool：

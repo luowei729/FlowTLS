@@ -41,19 +41,38 @@ func TestSynOptionsLayout(t *testing.T) {
 	}
 }
 
-// TestIPIDProgression 验证 IP ID 在标记区间内递增，起点随机但仍在区间内。
+// TestIPIDProgression 验证 IP ID 就是普通的每包递增计数器。
+//
+// **IP ID 不再承载任何标记**（标记已移到 TCP ISN，见 packet.go 的长注释）。
+// 这里钉住两件事：递增、回绕按 uint16 自然行为。
 func TestIPIDProgression(t *testing.T) {
-	id := IPIDMarkOf(0xF107)
-	for i := 0; i < 1000; i++ {
-		id = NextIPID(IPIDMarkOf(0xF107), id)
-		if id&0xFF00 != IPIDMark {
-			t.Fatalf("高字节必须保持标记，得到 0x%04x", id)
-		}
+	id := uint16(0xFFFE)
+	if got := NextIPID(id); got != 0xFFFF {
+		t.Fatalf("应递增到 0xFFFF，得到 0x%04x", got)
 	}
-	for i := 0; i < 50; i++ {
-		if got := RandomIPID(IPIDMark); got&0xFF00 != IPIDMark {
-			t.Fatalf("随机起点必须落在标记区间，得到 0x%04x", got)
-		}
+	if got := NextIPID(0xFFFF); got != 0x0000 {
+		t.Fatalf("应回绕到 0x0000，得到 0x%04x", got)
+	}
+}
+
+// TestApplyISNMark 钉住标记只占低 16 位、且不破坏高 16 位的随机性。
+func TestApplyISNMark(t *testing.T) {
+	const mark = 0xF107
+	isn := ApplyISNMark(0x12345678, mark)
+	if got := ISNMarkOf(isn); got != mark {
+		t.Fatalf("低 16 位必须是标记 0x%04x，得到 0x%04x", mark, got)
+	}
+	if isn>>16 != 0x1234 {
+		t.Fatalf("高 16 位必须保持不变（RFC 6528 的随机性），得到 0x%08x", isn)
+	}
+	// 0 也是合法 ISN 低位组合，但 0 在配置里表示「未配置」，
+	// ISNMarkOf 只负责原样返回，判空由调用方做。
+	if got := ISNMarkOf(0x12340000); got != 0 {
+		t.Fatalf("低 16 位为 0 时应返回 0，得到 0x%04x", got)
+	}
+	// 大小写/位序自检：标记不能落到高 16 位去。
+	if ISNMarkOf(ApplyISNMark(0, 0xABCD)) != 0xABCD {
+		t.Fatalf("0xABCD 应原样往返")
 	}
 }
 
@@ -129,7 +148,7 @@ func TestBuildAndParseRoundTrip(t *testing.T) {
 		Seq:     1234567,
 		Ack:     7654321,
 		Flags:   TCPPSH | TCPACK,
-		IPID:    0xF1AB,
+		IPID:    0xF1AB, // 普通计数器值，不承载标记
 		Window:  32768,
 		TSVal:   1111,
 		TSecr:   2222,

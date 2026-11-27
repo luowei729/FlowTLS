@@ -187,13 +187,23 @@ IP ID 规则保留为**辅助**：数据包（带载荷）不经过运营商 NAT
 服务端 iptables 规则（两条，顺序即优先级）：
 
 ```bash
-# 1. 伪 SYN：按 wscale 匹配（偏移 56 = NOP + kind3 + len3 + 12）
+# 伪 SYN：按 TCP 序列号低 16 位匹配（rev.17 起）
+# 序列号在 IP 头偏移 24（无 IP 选项时 TCP 头从 20 开始，seq 在 TCP 头内偏移 4）
+# nft 写法（主路径）：tcp flags syn @th,48,16 <mark>
+iptables -t raw -A PREROUTING -p tcp --dport 8443 --syn \
+  -m u32 --u32 "24&0x0000FFFF=0x<mark>" \
+  -m recent --name flowtls_8443 --set -j DROP
+# 同一条流的后续数据包（靠 recent 列表，粒度是源 IP）
 iptables -t raw -A PREROUTING -p tcp --dport 8443 \
-  --tcp-flags SYN,ACK SYN -m u32 --u32 "0x38&0xffffffff=0x0103030c" -j DROP
-# 2. 伪数据包：按 IP ID 高字节匹配（辅助，反方向流量不经 NAT 改写）
-iptables -t raw -A PREROUTING -p tcp --dport 8443 \
-  -m u32 --u32 "0x4&0xff00ffff=0x1e004000" -j DROP
+  -m recent --name flowtls_8443 --rcheck -j DROP
 ```
+
+**为什么不是 IP ID（早期做法）**：IP ID 会被中间设备随机化
+（RFC 6528 的防侧信道要求），一旦被改写这条规则永远不命中，
+伪包进内核 → 内核回 SYN-ACK/RST → 隧道彻底不通。
+TCP 序列号没有任何设备会改写（改了 TCP 就废了）。
+完整字段对比与实测证据见 `flowtls/packet.go` 的
+`---- TCP ISN 分流标记 ----`。
 
 客户端规则（IP ID 只在反方向使用，可靠）：
 

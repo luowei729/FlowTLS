@@ -49,7 +49,7 @@ func main() {
 		// 可重复：每次一条凭据。用引号包住含空格的密码。
 		passwords passwordList
 		localIP   = flag.String("local-ip", "", "回包源 IP（NAT 云主机填内网地址；留空按路由探测）")
-		ipidMark  = flag.Uint("ip-id-mark", 0, "IP ID 分流标记（0=从 password 派生）")
+		isnMark   = flag.Uint("isn-mark", 0, "TCP ISN 分流标记（0=从 password 派生）")
 
 		upMbps   = flag.Int("up", 0, "发往客户端的速率上限 Mbps（0=1000）")
 		downMbps = flag.Int("down", 0, "从客户端接收的速率上限 Mbps（0=1000）")
@@ -70,7 +70,7 @@ func main() {
 	cfg := flowtls.ServerConfig{
 		Listen:    addr,
 		Passwords: passwords,
-		IPIDMark:  uint16(*ipidMark),
+		ISNMark:  uint16(*isnMark),
 
 		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,

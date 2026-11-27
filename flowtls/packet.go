@@ -41,59 +41,92 @@ const (
 	TCPACK uint8 = 0x10
 )
 
-// ---- IP ID 分流标记 ----
+// ---- TCP ISN 分流标记 ----
 //
-// 必须在两端用 iptables 把伪造包挡在内核 TCP 栈之外（服务端防止内核回
-// SYN-ACK/RST，客户端防止内核回 RST），而 iptables 需要一个「静态可匹配」的
-// 特征。TCP 选项已经全部改回真实值（含时间戳、wscale=9），不能再当指纹，
-// 因此静态标记只能留在 IP ID 上。
+// # 为什么不用 IP ID
 //
-// 标记值来自配置（`ip_id_mark`），不写死：写死意味着任何 DPI 只要加一条
-// 「IP ID 高字节 == 0xF1」的通用规则就能一次命中所有部署。
+// 本协议必须在两端把伪造包挡在内核 TCP 栈之外（服务端防内核回
+// SYN-ACK/RST，客户端防内核回 RST），而防火墙需要一个「静态可匹配」的特征。
 //
-// 标记范围刻意很窄（只固定高字节 = 256 个值）：iptables 会把这些包直接 DROP，
-// 内核看不到就没有任何响应。若范围过宽，普通端口探测只要 IP ID 落进该范围
-// 就会得到「完全没有响应」，反而暴露这里有一层过滤。
-// 高字节固定 → 约 0.4% 的探测无响应，与正常丢包率难以区分。
-const (
-	// IPIDMark 是默认标记高字节（等价于配置 ip_id_mark: 0xF107 的高字节）。
-	IPIDMark uint16 = 0xF100
-	// IPIDLowMask 是可递增的低 8 位。
-	IPIDLowMask uint16 = 0x00FF
-)
+// 早期实现把标记放在 **IP ID 高字节**。这在真实网络里**不可靠**：
+// 中间设备会改写 IP ID —— RFC 6528 要求用它做防侧信道 hash，而多数
+// NAT / 云网关实现得更粗暴，直接随机化或用计数器覆盖。
+//
+// 2026-11-28 三角测量实测（同一客户端二进制，只换目标）：
+//
+//	家宽 198.51.100.7 → tk3:8443     IP ID 保留    隧道正常
+//	hk1 203.0.113.10  → sg1:8443     IP ID 保留    隧道正常
+//	hk1 203.0.113.10  → tk3:8443     IP ID 被随机化  握手超时
+//
+// 同一台 hk1、同一条出向链路，差别只在中间路径有没有改写 IP ID 的设备。
+// 一旦被改写：nft 的 drop 规则不命中 → 伪包进内核 → 内核回 SYN-ACK/RST
+// → 客户端看到一个抢答的陌生 TCP 栈 → 隧道彻底不通，且日志上毫无线索。
+//
+// # 为什么选 TCP 序列号
+//
+// 需要满足三条：① 中间设备绝不改写；② 不改变协议语义；③ 内核能静态匹配。
+//
+//	字段              ①不被改写  ②语义无影响  ③可静态匹配
+//	IP ID             ✗ 会被随机化  ✓           ✓
+//	TCP 窗口          △ NAT 可能改  ✓           ✓
+//	wscale            ✗ 必须像真 Linux（AGENTS 已否决）
+//	TCP 时间戳        ✓ 改了破坏 PAWS  △ nft 要算选项偏移，脆弱
+//	TCP 序列号 ISN    ✓ 改了 TCP 就废了  ✓          ✓
+//
+// **ISN 是唯一同时满足三条的载体**：任何中间设备改写序列号都会立刻破坏
+// TCP 自身（它自己也要靠序列号做重传与去重），所以现实中没有设备会动它。
+//
+// 而 ISN 本来就是随机数（Linux 用 `hash(四元组) + 时间` 生成），从未规定
+// 低位必须是什么。指定低 16 位不改变任何语义，握手仍完全符合 RFC 793。
+//
+// # 为什么比 IP ID 更隐蔽
+//
+//	IP ID 标记：**每一个包**都带（高字节恒定），DPI 抓几百个包就能统计出
+//	            这个特征。
+//	ISN 标记：  只有 **SYN 一个包**带；后续数据包的 seq 从 ISN+1 正常递增，
+//	            低位立刻打散，看不出规律。
+//
+// 标记值从 password 派生（见 mark.go），每个部署不同 —— DPI 无法写出一条
+// 通用规则命中所有部署（AGENTS 约束 18）。
+//
+// # 16 位而不是 8 位
+//
+// IP ID 只能用高字节（低字节按包递增），256 个值 → 真实探测流量有
+// 1/256 ≈ 0.39% 的概率被误 DROP（表现为「探测偶尔无响应」）。
+// ISN 可以自由用低 16 位，65536 个值 → 误判率 1/65536 ≈ 0.0015%。
 
-// IPIDMarkOf 从配置的 ip_id_mark 取出标记高字节（只有高字节参与标记）。
-func IPIDMarkOf(magic uint16) uint16 { return magic & 0xFF00 }
+// ISNMarkMask 是 ISN 里承载标记的位区间（低 16 位）。
+const ISNMarkMask uint32 = 0x0000_FFFF
 
-// IsDefaultIPIDMark 报告这个标记是否等于代码里的默认值。
+// ApplyISNMark 把标记写进 ISN 的低 16 位，保留高 16 位的随机性。
 //
-// 用途只有一个：启动时提醒部署方改掉它。
-//
-// 为什么必须提醒：`ip_id_mark` 是**服务端与所有客户端共享**的标识
-// （服务端用它判断「这个 SYN 是不是我们的伪包」），所以它必须两端一致，
-// **不能像 source_port 那样各自动态生成** —— 多凭据部署时尤其不可能，
-// 因为每条密码不同，而服务端只有一个全局 mark，任何
-// 「从 password 派生」的方案在两端都会算出不同的值。
-//
-// 既然只能显式配置，那唯一的风险就是：大量部署都留着默认值 0xF107。
-// 一旦如此，DPI 只要加一条「IP ID 高字节 == 0x1e」的规则就能一次性
-// 命中所有未改动的部署 —— 这与 SNI、服务器 IP 一起构成部署指纹
-// （见 AGENTS 约束 18）。
-//
-// 所以这里不自动改，只在用默认值时明确告知：**请改掉**。
-func IsDefaultIPIDMark(magic uint16) bool {
-	m := magic & 0xFF00
-	return m == IPIDMark || m == 0
+// 为什么不整个 ISN 定死：ISN 需要足够随机性（RFC 6528 的初衷是防序列号
+// 预测攻击）。固定低 16 位后仍有 2^16 种取值 × 高 16 位随机，且这个 ISN
+// 只在 SYN 上用一次（后续 seq 从 ISN+1 递增），无法据此预测后续序列号。
+func ApplyISNMark(isn uint32, mark uint16) uint32 {
+	return (isn &^ ISNMarkMask) | uint32(mark)
 }
 
-// NextIPID 取下一个 IP ID：高字节保持标记，低字节 +1 回绕。
-func NextIPID(mark, cur uint16) uint16 {
-	return mark | ((cur + 1) & IPIDLowMask)
+// ISNMarkOf 取出 ISN 里的标记；0 表示未携带。
+func ISNMarkOf(seq uint32) uint16 {
+	return uint16(seq & ISNMarkMask)
 }
 
-// RandomIPID 随机起始 IP ID：让每条连接的起点不同。
-func RandomIPID(mark uint16) uint16 {
-	return mark | (uint16(mrand.Uint32()) & IPIDLowMask)
+// RandomISN 返回一个随机 ISN（不含标记）。
+func RandomISN() uint32 {
+	return randomUint32()
+}
+
+// NextIPID 推进 IP ID 计数器。
+//
+// **不再承载任何标记**：IP ID 现在就是普通的每包递增序号，与真实 Linux
+// 的行为一致（Linux 用 per-destination 计数器）。承载标记的责任已移到
+// TCP ISN（见上方长注释）。
+//
+// 保留为函数而不是内联 `cur+1`：README 与 DEVTIPS 里多处引用这个名字，
+// 且回绕语义（uint16 自然回绕）值得有一个说明位置。
+func NextIPID(cur uint16) uint16 {
+	return cur + 1 // uint16 自然回绕，与内核行为一致
 }
 
 // ParsedPacket 是解析后的 IPv4 + TCP 报文视图。

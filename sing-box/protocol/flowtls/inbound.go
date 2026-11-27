@@ -82,7 +82,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	// root"是项目的硬要求，错误必须在 check 阶段就暴露。
 	//
 	// 同时填多个来源必须报错而不是"以某个为准"：被忽略的那个既不参与
-	// 登录、也不参与 ip_id_mark 派生，留着只会让人以为它是兜底凭据，
+	// 登录、也不参与 ISN 标记派生，留着只会让人以为它是兜底凭据，
 	// 而 mark 不一致的症状是隧道完全不通（DEVTIPS 149）。
 	//
 	// 复用 ft.NormalizePasswords 而不是在这里重写一遍判断：
@@ -94,7 +94,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.ListenPort == 0 {
 		return nil, E.New("flowtls: listen_port is required")
 	}
-	// IPIDMark 保持 0（表示按每个用户的 password 各自派生）。
+	// ISNMark 保持 0（表示按每个用户的 password 各自派生）。
 	//
 	// 服务端是**多用户**的：它不能只算一个标记，而要把每个用户的都纳入
 	// 识别范围（内核层判断「是不是我们的包」时还没解密）。这件事由
@@ -179,7 +179,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		Listen:         listenAddr,
 		Passwords:      passwords,
 		Handshake:      handshake,
-		IPIDMark:       h.opts.IPIDMark,
+		ISNMark:       h.opts.ISNMark,
 		UDPEnabled:     &h.udpOn,
 		UDPTimeoutSecs: int(h.udpIdleTimeout / time.Second),
 		UDPMaxSessions: h.udpMaxSessions,

@@ -39,12 +39,11 @@ type synState struct {
 	ourISN  uint32
 	ts      uint32
 	at      time.Time
-	// mark 是这条 SYN 命中的 ip_id_mark。
+	// isnMark 是这条 SYN 命中的 ISN 分流标记（0 表示未命中）。
 	//
-	// 首包的 IP ID 低字节已经递增，多凭据时 `markOf` 可能命中
-	// 另一条凭据的标记（匹配是 `ip_id & m == m`，不是高字节相等）。
-	// 回包必须继续用握手时认下的那个，否则客户端内核规则对不上。
-	mark uint16
+	// 回 SYN-ACK 时必须把自己这一侧的 ISN 也打上同一个标记，
+	// 客户端才能确认对面是我们的服务端（而不是同端口的真网站）。
+	isnMark uint16
 }
 
 // synStateTTL 是 pending 复用窗口（Rust `s.at.elapsed() < 10s`）。
@@ -70,13 +69,13 @@ type Listener struct {
 	// 它们在这里就是同一条记录，本来就应当不可区分。
 	creds *userTable
 	port  uint16
-	// marks 是本服务端接受的**全部** ip_id_mark（每条凭据一个）。
+	// isnMarks 是本服务端接受的**全部** TCP ISN 分流标记（每条凭据一个）。
 	//
 	// 为什么是一组：内核层要判断「这个包是不是我们的」时还没解密，
 	// 不知道对方用的是哪条凭据，所以只能把每条凭据的派生标记都纳入范围
-	// （见 ServerConfig.Marks）。这也是多凭据部署下「mark 从 password
+	// （见 ServerConfig.ISNMarks）。这是多凭据部署下「标记从 password
 	// 派生」能成立的关键 —— 服务端不需要预先知道谁来连。
-	marks []uint16
+	isnMarks []uint16
 	// logger 是诊断日志出口，恒非 nil（构造时经 loggerOr 归一）。
 	//
 	// 服务端所有会话共享它：收包路径是单协程共享 socket，
@@ -136,10 +135,10 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	// 日志出口先归一：后面 newRawSocket 与收包协程都要用。
 	logger := loggerOr(cfg.Logger)
 
-	// marks 是每条 password 派生出的 ip_id_mark（见 ServerConfig.Marks）。
+	// isnMarks 是每条 password 派生出的 ISN 标记（见 ServerConfig.ISNMarks）。
 	// 服务端在内核层判断「是不是我们的包」时还没解密，所以必须把所有
 	// 凭据的标记都纳入识别范围。
-	marks := cfg.Marks()
+	isnMarks := cfg.ISNMarks()
 
 	// 探测用的目的地址**不能是监听地址**。
 	//
@@ -166,21 +165,23 @@ func NewListener(cfg ServerConfig, opts ListenerOptions) (*Listener, error) {
 	// **没有开关**（同客户端）：这些规则是协议能工作的前提，不是可选优化。
 	// 少了它们内核会自己回 SYN-ACK / RST，把伪连接和同端口的真实网站都搞乱。
 	// 写不进去就带着原因失败，比静默不通强。
-	if err := EnsureServer(cfg.Listen.Port(), marks); err != nil {
+	if err := EnsureServer(cfg.Listen.Port(), isnMarks); err != nil {
 		_ = raw.Close()
 		cancel()
 		return nil, err
 	}
 	// 同客户端：fw4 的 ct invalid DROP 会静默吞掉我们的伪包。
-	for _, r := range NftRules(cfg.Listen.Port(), marks) {
+	for _, r := range NftRules(cfg.Listen.Port(), isnMarks) {
 		logger.Info("防火墙规则: ", r)
 	}
 
 	l := &Listener{
 		raw:    raw,
 		port:   cfg.Listen.Port(),
-		creds:  creds,
-		marks:  marks,
+		creds: creds,
+		// isnMarks 漏传时字段是 nil，`isnMarkOf` 恒返回 0，现象是
+		// 「服务端永远不回 SYN-ACK」，而且日志上完全看不出原因。
+		isnMarks: isnMarks,
 		logger: logger,
 		// 这两个必须从 opts 抄过来。漏掉时字段是 0，
 		// maintainLoop 里 `idleFor() > 0` 对任何刚收到包的会话都成立，
@@ -484,28 +485,49 @@ func (l *Listener) shouldReinject(p ParsedPacket, consumed bool) bool {
 
 // protocolOwned 报告这个包是否属于本协议族。
 //
-// 判据就是 IP ID 高字节标记，与 Rust 版、与 Linux 的 iptables u32 规则
-// （`0x4&0xff00ffff=0x<mark>4000`）逐位一致。
+// 判据是 **TCP ISN 低 16 位标记**，且只对纯 SYN 成立。
+//
+// 为什么不用 IP ID（早期实现的做法）：IP ID 会被中间设备随机化，
+// 一旦发生这条判据就永远不成立 —— 见 packet.go 的
+// `---- TCP ISN 分流标记 ----` 里的三角测量实测。
+//
+// 为什么数据包不用判：ISN 标记只写在 SYN 上，数据包的序列号是
+// ISN+1 之后正常递增的，低位早已打散，无法静态匹配。数据包靠
+// **四元组会话表**归属（handlePacket 第 2 分支），这本来就够了 ——
+// 判「是不是本协议」只在建连时需要。
 //
 // 注意：带标记 ≠ 认证通过。标记只是「这个包被本协议占用」的声明，
 // 真正的鉴权是握手首包的 AEAD 认证。两件事不能混。
 //
-// 多标记：任一用户的派生标记命中即算本协议（见 Listener.marks）。
+// 多标记：任一用户的派生标记命中即算本协议（见 Listener.isnMarks）。
 func (l *Listener) protocolOwned(p ParsedPacket) bool {
-	return l.markOf(p) != 0
+	if len(p.Payload) != 0 || p.Flags&TCPSYN == 0 {
+		// 非纯 SYN 一律不算「本协议族」：
+		//   - Windows 上未归属会话的数据包要重新注入给内核
+		//     （伪装站靠这个工作），这里返回 false 正是那个语义。
+		//   - 已归属会话的数据包根本走不到这里（handlePacket 第 2 分支
+		//     已返回 consumed=true）。
+		return false
+	}
+	return l.isnMarkOf(p) != 0
 }
 
-// markOf 返回这个包的 IP ID 命中的标记；未命中返回 0。
+// isnMarkOf 返回这个包的 TCP 序列号命中的 ISN 标记；未命中返回 0。
 //
-// 只比高字节。配置里的 ip_id_mark 可以是 0xF107 这种带低字节的值，
-// 低字节是按包递增的序号，不参与识别。若直接做 `ip_id & m == m`，
-// m 的低字节非 0 时，IP ID 低字节一旦回绕到对不上就整包被丢掉。
-// 返回值也收成 0xNN00：回包要拿它去填 IP ID 高字节。
-func (l *Listener) markOf(p ParsedPacket) uint16 {
-	hibyte := p.IPID & 0xFF00
-	for _, m := range l.marks {
-		m = m & 0xFF00
-		if m != 0 && hibyte == m {
+// **只对纯 SYN 有意义**：ISN 标记只在 SYN 上写（ApplyISNMark），
+// 数据包的序列号是 ISN+1 之后正常递增的，低位早已打散。
+// 所以调用方必须先判 `SYN && 无载荷`，与 IP ID 分支的判据一致
+// （见 handlePacket 第 1 分支）。
+func (l *Listener) isnMarkOf(p ParsedPacket) uint16 {
+	if len(l.isnMarks) == 0 {
+		return 0
+	}
+	m := ISNMarkOf(p.Seq)
+	if m == 0 {
+		return 0
+	}
+	for _, want := range l.isnMarks {
+		if m == want {
 			return m
 		}
 	}
@@ -532,11 +554,15 @@ func (l *Listener) handlePacket(p ParsedPacket) (*Session, bool) {
 
 	// 1) 纯 SYN：标准握手第一步，立即回 SYN-ACK。
 	//
-	// 判别依据是 IP ID 高字节（配置派生的标记），与 Rust 一致：
-	// `(ip_id & mark) == mark && SYN && payload.is_empty()`。
-	if m := l.markOf(p); m != 0 && p.Flags&TCPSYN != 0 && len(p.Payload) == 0 {
-		l.handleSYN(client, p, m)
-		return nil, true
+	// 判别依据是 TCP ISN 低 16 位的派生标记（见 packet.go 的长注释
+	// 说明为什么不是 IP ID）。**必须同时要求「无载荷」**：ISN 标记
+	// 只在纯 SYN 上有意义，带载荷的 SYN 属于异常流量，交给后面的
+	// 首包鉴权路径处理。
+	if len(p.Payload) == 0 && p.Flags&TCPSYN != 0 {
+		if isnMark := l.isnMarkOf(p); isnMark != 0 {
+			l.handleSYN(client, p, isnMark)
+			return nil, true
+		}
 	}
 
 	// 2) 已有会话
@@ -577,7 +603,11 @@ func (l *Listener) sessionFor(client netip.AddrPort) *Session {
 }
 
 // handleSYN 回应 SYN-ACK 并登记 pending（对应 Rust 的 SYN 分支）。
-func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, mark uint16) {
+//
+// isnMark 是从客户端 SYN 里提取到的分流标记。回 SYN-ACK 时把自己这一侧的
+// ISN 也打上同一个标记，客户端据此确认「对面是我们的服务端」而不是
+// 同端口的真网站（真网站的内核不会产生带标记的 ISN）。
+func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, isnMark uint16) {
 	now := time.Now()
 	l.mu.Lock()
 	// 客户端重启后四元组会复用（源端口固定），旧会话必须先清掉。
@@ -610,7 +640,7 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, mark uint16)
 		ourISN:  isn,
 		ts:      ts,
 		at:      now,
-		mark:    mark,
+		isnMark: isnMark,
 	}
 	l.mu.Unlock()
 
@@ -632,13 +662,21 @@ func (l *Listener) handleSYN(client netip.AddrPort, p ParsedPacket, mark uint16)
 	if !srcIP.IsValid() {
 		srcIP = l.raw.localIP
 	}
+	// 自己这一侧的 ISN 也带上标记：客户端若按 ISN 通道识别回程包
+	// （中间设备把 IP ID 改写掉的那种场景），必须能在这个 SYN-ACK 上
+	// 看到它。isnMark 为 0 表示客户端没走 ISN 通道，保持纯随机。
+	if isnMark != 0 {
+		isn = ApplyISNMark(isn, isnMark)
+	}
+	// 回包的 IP ID 不再承载任何标记：它就是个普通的随机起始值，
+	// 与真实内核的行为一致（内核用 per-destination 计数器）。
+	// 承载标记的责任完全在 ISN 上。
+	synIPID := uint16(randomUint32())
 	pkt := BuildPacket(srcIP, client.Addr(), l.port, client.Port(), TcpSeg{
 		Seq:   isn,
 		Ack:   p.Seq + 1,
 		Flags: TCPSYN | TCPACK,
-		// 回包的标记必须与客户端发来的那个一致：客户端内核层规则
-		// 按同一个值匹配，用别的标记会让它认不出来。
-		IPID: RandomIPID(mark),
+		IPID: synIPID,
 		// SYN 阶段用未缩放的原始窗口（缩放因子在 ESTABLISHED 后才生效）
 		Window:  65535,
 		TSVal:   ts,
@@ -708,13 +746,14 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	l.mu.Unlock()
 
 	var peerISN, ourISN, ts uint32
-	// 有 pending 就用 SYN 认下的标记。首包再 markOf 一次会在多凭据时
-	// 命中别的标记，回包的 IP ID 高字节就和客户端规则不一致。
-	mark := l.markOf(p)
+	// 回包的 ISN 标记沿用握手时认下的那个。**不能在这里重新判**：
+	// ISN 标记只在 SYN 上有，首包的序列号已经从 ISN+1 递增，
+	// 再取一次会得到无意义的低位值。
+	isnMark := l.isnMarkOf(p)
 	if hasPending {
 		peerISN, ourISN, ts = st.peerISN, st.ourISN, st.ts
-		if st.mark != 0 {
-			mark = st.mark
+		if st.isnMark != 0 {
+			isnMark = st.isnMark
 		}
 	} else {
 		// 客户端跳过了握手：序号与时间戳现取随机值，
@@ -725,7 +764,7 @@ func (l *Listener) handleFirstPacket(client netip.AddrPort, p ParsedPacket) (con
 	clock := NewTcpClockAt(ts + 2)
 	clock.Observe(p.TSVal, p.HasTS)
 
-	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, mark, p.Dst, l.logger)
+	sess := newServerSession(l.raw, entry.codec, client, l.port, ourISN+1, peerISN+1, clock, isnMark, p.Dst, l.logger)
 
 	// ---- 发伪 ServerHello（与 Rust 一致）----
 	//
@@ -794,8 +833,8 @@ func newServerSession(raw *rawSocket, codec *Codec, peer netip.AddrPort,
 		// peerSeq 入参始终是「对端 ISN + 1」（SYN 占一个序号），
 		// 这里反推回 ISN 留给分流层判断四元组复用。
 		peerISN: peerSeq - 1,
-		ipid:    RandomIPID(mark),
-		mark:    mark,
+		ipid:    uint16(randomUint32()),
+		isnMark: mark,
 		clock:   clock,
 		lastAck: time.Now(),
 		rx:      make(chan []byte, rxQueueDepth),

@@ -255,15 +255,31 @@ func TestWindivertFilterTooLong(t *testing.T) {
 	}
 }
 
-// TestWindivertIPIDRange 钉住 IP ID 标记的取值区间语义。
-func TestWindivertIPIDRange(t *testing.T) {
-	lo, hi := wdivIPIDMarkRange(0x1E07)
-	if lo != 0x1E00 || hi != 0x1EFF {
-		t.Fatalf("区间应为 [0x1E00,0x1EFF]，实际 [%#x,%#x]", lo, hi)
+// TestWindivertIgnoresIPID 钉住「WinDivert 过滤器不按 IP ID 匹配」。
+//
+// 这条是有意为之：`windivert.h` 没有 vendor 进本仓库，`ip.Id` 的字段号
+// 无法核对，写错一位的后果是**一个包都收不到** —— 与「链路断了」表现
+// 完全相同，排查成本极高。
+//
+// 分流特征全部在**用户态**判断（IP ID 已不再承载标记，改由 TCP ISN
+// 承载，见 packet.go 的 DeriveISNMark 注释）。过滤器只按方向 + 端口收紧。
+func TestWindivertIgnoresIPID(t *testing.T) {
+	// 客户端过滤器：只按「入向 + TCP + 目的端口 + 源端口」收紧。
+	f := wdivClientInboundFilter(netip.MustParseAddr("203.0.113.10"), 44300, 8443)
+	bin, flags, err := f.encode()
+	if err != nil {
+		t.Fatalf("编码失败: %v", err)
 	}
-	// 配置里低字节非零时同样只取高字节（与 IPIDMarkOf 一致）。
-	lo2, hi2 := wdivIPIDMarkRange(0xF1FF)
-	if lo2 != 0xF100 || hi2 != 0xF1FF {
-		t.Fatalf("区间应为 [0xF100,0xF1FF]，实际 [%#x,%#x]", lo2, hi2)
+	if len(bin) == 0 {
+		t.Fatal("过滤器不能为空")
+	}
+	// 过滤器标志必须含 inbound（只要入向包）与 ipv4。
+	if flags&wdivFilterFlagInbound == 0 || flags&wdivFilterFlagIP == 0 {
+		t.Fatalf("过滤器标志不对: %#x", flags)
+	}
+	// 服务端过滤器同样只按端口。
+	sf := wdivServerInboundFilter(8443)
+	if _, _, err := sf.encode(); err != nil {
+		t.Fatalf("服务端过滤器编码失败: %v", err)
 	}
 }

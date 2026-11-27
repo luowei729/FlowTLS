@@ -18,7 +18,7 @@ func newTestListener() *Listener {
 	return &Listener{
 		raw:     newTestRawSocket(),
 		port:    8443,
-		marks:   []uint16{IPIDMarkOf(0xF107)},
+		isnMarks: []uint16{0xF107},
 		byAddr:  make(map[netip.AddrPort]*Session),
 		pending: make(map[netip.AddrPort]*synState),
 		// 手工构造会绕过 NewListener 的 loggerOr 归一，
@@ -38,7 +38,7 @@ func newTestSession(peer netip.AddrPort, peerISN uint32) *Session {
 		localPort:  8443,
 		remotePort: peer.Port(),
 		peerISN:    peerISN,
-		mark:       IPIDMarkOf(0xF107),
+		isnMark:    0xF107,
 		clock:      NewTcpClock(),
 		rx:         make(chan []byte, 1),
 		closeCh:    make(chan struct{}),
@@ -61,7 +61,7 @@ func TestSYNWithNewISNDropsStaleSession(t *testing.T) {
 	l.byAddr[addr] = stale
 
 	// 客户端重启：新 SYN 带新的 ISN
-	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, IPIDMarkOf(0xF107))
+	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, 0xF107)
 
 	if got := l.sessionFor(addr); got != nil {
 		t.Fatal("新 SYNC 到达后旧会话必须被清掉，否则新连接的数据会被旧会话吞掉")
@@ -86,7 +86,7 @@ func TestSYNRetransmitKeepsSession(t *testing.T) {
 	l.byAddr[addr] = sess
 
 	// 握手完成后迟到的 SYN 重传：ISN 与建连时相同
-	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, IPIDMarkOf(0xF107))
+	l.handleSYN(addr, ParsedPacket{Src: addr.Addr(), SrcPort: addr.Port(), Seq: 222}, 0xF107)
 
 	if got := l.sessionFor(addr); got != sess {
 		t.Fatal("ISN 相同的 SYN 是重传，绝不能关掉已建立的会话")
@@ -122,24 +122,30 @@ func TestMaintainLoopHonorsIdleTimeout(t *testing.T) {
 	}
 }
 
-// TestMarkOfIgnoresLowByte 钉住识别只用 IP ID 高字节。
+// TestISNMarkOf 钉住 ISN 标记的提取语义。
 //
-// 配置可以写成 0xF107（低字节非 0）。若按整值做按位与，
-// IP ID 低字节一旦不是 0x07 就匹配失败，伪包被当成普通流量丢掉。
-func TestMarkOfIgnoresLowByte(t *testing.T) {
-	l := newTestListener() // marks 里放的是 0xF107 的高字节 0xF100
-	l.marks = []uint16{0xF107}
-	hit := ParsedPacket{IPID: 0xF100}
-	if got := l.markOf(hit); got != 0xF100 {
-		t.Fatalf("低字节为 0 的包应命中 0xF100，得到 %#x", got)
+// 标记占满低 16 位（不像旧的 IP ID 只能用高字节），所以 0x0000 之外
+// 任何值都是合法标记。高 16 位必须完全不参与匹配。
+func TestISNMarkOf(t *testing.T) {
+	l := newTestListener()
+	l.isnMarks = []uint16{0xF107}
+
+	hit := ParsedPacket{Seq: 0x1234F107, Flags: TCPSYN}
+	if got := l.isnMarkOf(hit); got != 0xF107 {
+		t.Fatalf("ISN 低 16 位为 0xF107 应命中，得到 %#x", got)
 	}
-	wrapped := ParsedPacket{IPID: 0xF1AB}
-	if got := l.markOf(wrapped); got != 0xF100 {
-		t.Fatalf("低字节回绕后仍应命中，得到 %#x", got)
+	// 高 16 位任意变化都不影响（标记只用低 16 位）。
+	hit2 := ParsedPacket{Seq: 0xFFFFF107, Flags: TCPSYN}
+	if got := l.isnMarkOf(hit2); got != 0xF107 {
+		t.Fatalf("高 16 位变化不应影响匹配，得到 %#x", got)
 	}
-	other := ParsedPacket{IPID: 0x1E07}
-	if got := l.markOf(other); got != 0 {
-		t.Fatalf("高字节不同不能命中，得到 %#x", got)
+	// IP ID 完全不参与判定了 —— 这是本次改造的核心。
+	if l.protocolOwned(ParsedPacket{IPID: 0xF100, Seq: 0x12340001}) {
+		t.Fatal("IP ID 不再承载标记：非纯 SYN 或 ISN 不匹配时不能判定为本协议")
+	}
+	// 纯 SYN 且 ISN 命中 → 本协议。
+	if !l.protocolOwned(ParsedPacket{Flags: TCPSYN, Seq: 0x1234F107}) {
+		t.Fatal("纯 SYN 且 ISN 命中应判定为本协议")
 	}
 }
 
@@ -237,8 +243,8 @@ func TestCredentialSources(t *testing.T) {
 	if err := multi.Validate(); err != nil {
 		t.Fatalf("只配 passwords 应通过: %v", err)
 	}
-	if got := len(multi.Marks()); got != 2 {
-		t.Fatalf("两条凭据应有 2 个 mark，得到 %d", got)
+	if got := len(multi.ISNMarks()); got != 2 {
+		t.Fatalf("两条凭据应有 2 个 ISN 标记，得到 %d", got)
 	}
 
 	// 只有 password：正常，mark 从它派生
@@ -246,8 +252,8 @@ func TestCredentialSources(t *testing.T) {
 	if err := onlyPw.Validate(); err != nil {
 		t.Fatalf("只配 password 应通过: %v", err)
 	}
-	if m := onlyPw.Marks(); len(m) != 1 || m[0] != DeriveIPIDMark("pw1") {
-		t.Fatalf("单密码 mark 应从 password 派生，得到 %v", m)
+	if m := onlyPw.ISNMarks(); len(m) != 1 || m[0] != DeriveISNMark("pw1") {
+		t.Fatalf("单密码 ISN 标记应从 password 派生，得到 %v", m)
 	}
 }
 

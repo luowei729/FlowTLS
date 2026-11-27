@@ -62,8 +62,14 @@ type ClientConfig struct {
 	// 显式填一个非 0 值仍然有效：部署方需要可预测的四元组时（例如
 	// 对端防火墙按源端口放行）可以钉死，此时行为与旧版完全一致。
 	SourcePort uint16
-	// IPIDMark 是 IP ID 分流标记（用高字节）。
-	IPIDMark uint16
+	// ISNMark 是 TCP ISN 分流标记（用低 16 位）。
+	//
+	// 客户端把它写进 SYN 的序列号低 16 位，服务端靠它判断
+	// 「这个纯 SYN 是不是我们的客户端」。**不再使用 IP ID** ——
+	// IP ID 会被中间设备随机化，是不可靠的载体
+	// （完整论证见 packet.go 的 `---- TCP ISN 分流标记 ----`）。
+	// 0 表示从 password 派生（推荐也是默认）。
+	ISNMark uint16
 	// Handshake 是握手模式（HandshakeSymbolic / HandshakeNone）。
 	Handshake string
 	// Logger 是诊断日志出口；nil 表示静默（见 log.go 的说明）。
@@ -91,14 +97,16 @@ func (c *ClientConfig) Validate() error {
 	// SourcePort == 0 是合法的：表示让 Dial 自动分配一个未在用的端口。
 	// 参数是 uint16，不存在超出 65535 的可能，所以无需额外范围校验。
 	//
-	// IPIDMark == 0 表示**从 password 派生**，这是推荐值也是默认值。
+	// ISNMark（含 0）的意义：0 表示**从 password 派生**，这是推荐值也是默认值。
 	//
 	// 为什么可以派生而 source_port 不行：source_port 是本机资源，只需本地
-	// 唯一；而 ip_id_mark 是两端共享的标识，必须两端算出同一个值。
+	// 唯一；而 ISN 标记是两端共享的标识，必须两端算出同一个值。
 	// password 本来就两端共享且每个部署不同，所以它是最合适的派生源
-	// （见 mark.go 的完整论证）。
-	if c.IPIDMark == 0 {
-		c.IPIDMark = DeriveIPIDMark(c.Password)
+	// （见 mark.go 的 DeriveISNMark）。
+	//
+	// 显式填非 0 值仍然有效：需要与已冻结的部署对齐时可以钉死。
+	if c.ISNMark == 0 {
+		c.ISNMark = DeriveISNMark(c.Password)
 	}
 	if _, err := ParseHandshake(c.Handshake); err != nil {
 		return err
@@ -120,7 +128,7 @@ type ServerConfig struct {
 	Password string
 	// Passwords 是**多密码**凭据表（与 Password 互斥）。
 	//
-	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ip_id_mark。
+	// 每个元素是一条独立凭据，各自派生自己的 authID 与 ISN 标记。
 	// 多个客户端也可以共用**其中一条**（典型的「默认密码」），
 	// 所以下面这种配置同时表达了「朋友共用一个」与「自己的设备可单独吊销」：
 	//
@@ -136,8 +144,11 @@ type ServerConfig struct {
 	// 走 IPPROTO_RAW 时内核会用出接口地址回填 saddr，
 	// 所以 NAT 云主机填公网地址也能正常工作。
 	LocalIP netip.Addr
-	// IPIDMark 是 IP ID 分流标记（用高字节）。
-	IPIDMark uint16
+	// ISNMark 是 TCP ISN 分流标记（用低 16 位）。
+	//
+	// 服务端用它判断「这个纯 SYN 是不是我们的客户端」。
+	// 0 表示按每条 password 各自派生（见 ISNMarks）。
+	ISNMark uint16
 	// Handshake 对应 Rust `faketcp.handshake`（两端共用同一个配置结构）。
 	//
 	// 服务端本身不使用它（服务端总是被动的），但 Rust 的 `FakeTcpFile`
@@ -175,15 +186,9 @@ func (s *ServerConfig) Validate() error {
 	if _, err := NormalizePasswords(s.Password, s.Passwords, nil); err != nil {
 		return err
 	}
-	// IPIDMark 参见 Marks()：0 表示按每条密码各自派生。
-	// 服务端**不再**在这里填一个全局值，因为它要为每条凭据维护各自的标记。
-	if s.IPIDMark != 0 {
-		// 显式配置时所有凭据共用一个标记（兼容旧配置与特殊部署）。
-		s.IPIDMark &= 0xFF00
-		if s.IPIDMark == 0 {
-			return errors.New("flowtls: ip_id_mark 的高字节不能为 0")
-		}
-	}
+	// ISNMark 参见 ISNMarks()：0 表示按每条密码各自派生。
+	// 显式配置时所有凭据共用一个标记（兼容已经钉死标记的部署）。
+	// ISN 用满 16 位，所以不做 & 0xFF00 归一化，也不拒绝任何非 0 值。
 	if _, err := ParseHandshake(s.Handshake); err != nil {
 		return err
 	}
@@ -260,9 +265,9 @@ func NormalizePasswords(single string, multi []string, legacy []string) ([]strin
 	return out, nil
 }
 
-// Marks 返回本服务端会接受的全部 ip_id_mark。
+// ISNMarks 返回本服务端会接受的全部 TCP ISN 标记。
 //
-// 为什么是**一组**而不是一个：服务端在内核层就要判断「这个包是不是我们的」
+// 为什么是一组：服务端在内核层就要判断「这个包是不是我们的」
 // （rules.go 写 drop 规则）和「这个 SYN 要不要回 SYN-ACK」
 // （listener.go 的 protocolOwned），而这两件事都发生在**解密之前** ——
 // 那时还不知道对方用的是哪条凭据。
@@ -273,26 +278,22 @@ func NormalizePasswords(single string, multi []string, legacy []string) ([]strin
 //	凭据 B → password_B → mark_B
 //	服务端接受 mark_A 与 mark_B
 //
-// 凭据数很少（几条到几十条量级），所以 nft 规则数与 map 大小都可以忽略。
+// 凭据数很少（几条到几十条量级），所以 nft 规则数与 map 大小都可忽略。
 //
-// 显式配置了 ip_id_mark 时只返回那一个值（兼容旧配置：
-// 旧部署可能已经和客户端约定了一个手工值）。
-func (s *ServerConfig) Marks() []uint16 {
-	if s.IPIDMark != 0 {
-		return []uint16{s.IPIDMark & 0xFF00}
+// 显式配置了 isn_mark 时只返回那一个值（兼容已经钉死标记的部署）。
+func (s *ServerConfig) ISNMarks() []uint16 {
+	if s.ISNMark != 0 {
+		return []uint16{s.ISNMark}
 	}
 	passwords, err := NormalizePasswords(s.Password, s.Passwords, nil)
 	if err != nil || len(passwords) == 0 {
-		// Validate 已校验过，这里只是防御：退回默认值，
-		// 保证不会返回空集（空集会让服务端一个包都认不出来）。
-		return []uint16{IPIDMark}
+		// Validate 已校验过，这里只保证不返回空集。
+		return []uint16{DeriveISNMark(defaultISNMarkSeed)}
 	}
 	out := make([]uint16, 0, len(passwords))
 	seen := make(map[uint16]struct{}, len(passwords))
 	for _, p := range passwords {
-		m := DeriveIPIDMark(p)
-		// 去重：不同部署/不同凭据理论上有极小概率派生出同一个标记，
-		// 那样规则会重复写两遍（无害但脏），去重更干净。
+		m := DeriveISNMark(p)
 		if _, dup := seen[m]; dup {
 			continue
 		}
@@ -301,3 +302,9 @@ func (s *ServerConfig) Marks() []uint16 {
 	}
 	return out
 }
+
+// defaultISNMarkSeed 是 NormalizePasswords 意外失败时的派生源。
+//
+// 不直接用常量标记：常量会让「凭据配置错误」的部署与「某个用了
+// 这串字面量的部署」共享标记，等于把兜底路径变成公开指纹。
+const defaultISNMarkSeed = "flowtls-default-isn-mark"
