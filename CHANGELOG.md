@@ -2,6 +2,67 @@
 
 ## 2026-11-28 (北京时间)
 
+### 修复：nft 动态集合只在 SYN 上续期，导致隧道每 10 分钟断一次（rev.19）
+
+**wire format 未改动**，rev.17 ↔ rev.19 可互通（只改防火墙规则形态）。
+但**两端都应升级**：这个缺陷服务端和客户端都有。
+
+#### 现象
+
+用户的面板（haproxy `:1188`）里节点反复出现 `DOWN` 几十秒后自愈。
+本次抓到的窗口：`downtime=93`（11:00:14 → 11:01:47）。
+节点本身没有重启（`uptime` 778 天），服务端日志显示旧连接在
+11:00:12 之后一个包都收不到，11:01:32 换了源端口重建。
+
+#### 根因
+
+rev.17 把分流标记从 IP ID 换成 TCP ISN 后，**数据包的归属完全依赖
+nft 动态集合**（`@ft_8443` / `@cft_<ip>_8443`）。但脚本里 `update`
+只写在「纯 SYN 记账」那条规则上，靠集合 DROP 的那条**只匹配、不刷新**：
+
+```nft
+tcp flags syn @th,48,16 <mark> update @ft_8443 { ip saddr . tcp sport } drop  # 记账
+ip saddr . tcp sport @ft_8443 drop                                            # 查表
+```
+
+nft 的 `timeout` 是「最后一次刷新后经过多久过期」。QUIC 长连接**永远不会
+再发 SYN**，所以条目必定在 `建连 + 10 分钟`过期 → 伪包落到内核 → 服务端
+8443 上有 masquerade 的真 listener，内核逐包回 RST（实测 `OutRsts`
+10 秒 +15）→ 隧道死锁，等 QUIC `maxIdleTimeout`(30s) 超时后重建。
+
+实测证据：把服务端日志按 `peer=` 分组算每条连接存活时长，得到
+**10.6 / 10.7 / 10.7 / 10.7 / 10.8 / 10.8 / 10.7 / 10.7 / 10.6 / 10.7 / 10.8
+分钟**，与流量大小完全无关；同一时刻 `nft list set inet flowtls ft_8443`
+已经是空的。
+
+#### 改动
+
+`flowtls/rules.go`：服务端 `nftServerScript` 与客户端 `nftClientScript`
+的**查表规则都加上 `update`**，超时语义从「创建后多久」变成「多久没看到
+这条流」—— 空闲流照旧自动回收，活跃流永不过期。
+
+```nft
+# 服务端
+fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 \
+    update @ft_8443 { ip saddr . tcp sport } drop
+# 客户端
+ip saddr <server> tcp sport 8443 ip saddr . tcp dport @cft_x \
+    update @cft_x { ip saddr . tcp dport } drop
+```
+
+`flowtls/rules_test.go`：更新两条断言，新增 `TestNftSetMatchRulesRefresh`
+钉住「两条规则都必须带 `update`」。
+
+#### 已生效范围（热补丁，不等升级）
+
+- 服务端 tk3 `203.0.113.38` 与客户端路由器 `10.0.100.1` 已用单个 `nft -f`
+  事务热替换入向链，**未重启进程、未断现有连接**。
+- 验证：`nft list set ... | grep expires` 稳定在 `9m5x s`（修补前会一路
+  倒数到过期），生产隧道不再每 10 分钟断一次。
+- 注意：进程重启会从代码重建规则，所以**升级到 rev.19 才算永久修好**。
+
+完整排查过程与热补丁命令见 `DEVTIPS.md` 第 174 条。
+
 ### 诊断：`hk1→tk3` 是透明 TCP 代理，IPv6 二层隧道方案已验证（未部署）
 
 同一次运行的双点抓包证明：`hk1 → tk3` 保留源端口、窗口、wscale，

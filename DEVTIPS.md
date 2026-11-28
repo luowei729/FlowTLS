@@ -6,6 +6,124 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 174. nft 动态集合只在 SYN 上续期 → 每条隧道恰好活 10.7 分钟（2026-11-28 北京时间）
+
+### 一、现象：面板上节点每隔十来分钟「DOWN」一次
+
+用户报 `http://10.0.100.1:1188/` 里 `M1-203.0.113.38:8443` 中断过。
+节点本身没崩（`uptime` 778 天，`sing-box` 从 08:52:30 起没重启），
+haproxy 的 CSV 里能读到精确的故障窗口：
+
+```bash
+curl -s 'http://10.0.100.1:1188/;csv' | awk -F, '{print $1","$2","$18","$24","$25}'
+# 1182,M1-203.0.113.38:8443,...,DOWN,...,1101,...   lastchg=1101s
+passwall_health_checks,check_2,...,DOWN,...,1101,...,chkfail=3,chkdown=1,downtime=93
+```
+
+即 **DOWN ≈ 93 秒后自愈**。服务端日志对得上：旧连接
+`198.51.100.18:4094` 的「QUIC 路径统计」停在 11:00:12，之后**一个包都没有**，
+11:01:32 才出现新的 `flowtls: connection from 198.51.100.18:3923`
+（换了源端口重建）。
+
+### 二、判据：把每条 QUIC 连接的存活时长算出来
+
+服务端每 2 秒打一行「QUIC 路径统计」，`peer=` 就是连接的源端口。
+按 peer 分组取首末时间：
+
+| peer | 存活 |
+|---|---|
+| :3986 | 10.7 分 |
+| :3883 | 10.7 分 |
+| :4006 | 10.7 分 |
+| :4017 | 10.8 分 |
+| :3950 | 10.6 分 |
+| :3748 | 10.8 分 |
+| :3645 | 10.7 分 |
+| :3722 | 10.7 分 |
+| :3779 | 10.6 分 |
+| :4094 | 10.7 分 ← 就是面板记 DOWN 的那条 |
+| :3923 | 10.8 分 |
+
+**10.6~10.8 分钟高度聚集，与流量多少无关。** 这个数字本身就是答案：
+`timeout 10m` + 「一次性建连」= 寿命恒定。
+
+### 三、根因：`update` 只写在 SYN 记账规则上
+
+rev.17 把分流标记从 IP ID 换成 TCP ISN 后，数据包只能靠动态集合归属
+（`DEVTIPS` 第 171 条）。当时的脚本是：
+
+```nft
+# 1. 纯 SYN：记账 + DROP          ← 只有这条带 update
+fib daddr type local tcp dport 8443 tcp flags syn @th,48,16 <mark> \
+    update @ft_8443 { ip saddr . tcp sport } drop
+# 2. 后续数据包：按集合 DROP       ← 只匹配，不续期
+fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 drop
+# 3. 其它：notrack 交给内核
+fib daddr type local tcp dport 8443 notrack
+```
+
+`timeout` 的语义是「**最后一次写入 / 刷新**之后经过多久过期」。QUIC 长连接
+**永远不会再发 SYN**，所以条目必然在 `建连 + 10 分钟`过期。过期后数据包落到
+第 3 条规则 → `notrack` → 进内核；而服务端配了 `masquerade`，内核在 8443 上
+**确实有一个真 TCP listener**，它对这些「没有对应 socket 的数据包」逐包回
+RST。实测服务端 `OutRsts` 10 秒内 +15，而客户端侧的入向规则也因为同一个
+缺陷早已过期，这些 RST 一路送到客户端内核。
+
+客户端 `handleIncoming` 忽略 RST（AGENTS.md 约束 17），所以 QUIC 层什么也
+看不到，只能等 `maxIdleTimeout`（30s）超时后重建连接 —— 这就是「DOWN 几十秒
+后自愈」的来源。
+
+### 四、修法：让**查表规则也刷新**
+
+```nft
+# 服务端
+fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 \
+    update @ft_8443 { ip saddr . tcp sport } drop
+
+# 客户端（input 钩子）
+ip saddr <server> tcp sport 8443 ip saddr . tcp dport @cft_x \
+    update @cft_x { ip saddr . tcp dport } drop
+```
+
+于是超时变成「**多久没看到这条流**」而不是「创建后多久」，空闲流照样自动
+回收，活跃流永不过期。真机验证：修补后 `nft list set` 的
+`expires` 稳定停在 `9m5x s`，不再一路倒数。
+
+### 五、热补丁（不重启进程、不断现有连接）
+
+两端都可以直接用单个 nft 事务换掉链里的规则（`flush chain` + `add rule` 在
+同一次 `nft -f` 里是原子的，不会留下「规则空窗」）。**不要 `flush set`**：
+那会连当前正在用的条目一起删掉，等于立刻制造一次故障。
+
+```bash
+# 服务端（mark 从 password 派生，用 nft list chain 里已有的那个值）
+nft -f - <<'EOF'
+flush chain inet flowtls in_8443
+add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 tcp flags syn @th,48,16 0xb481 update @ft_8443 { ip saddr . tcp sport } drop
+add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 update @ft_8443 { ip saddr . tcp sport } drop
+add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 notrack
+EOF
+```
+
+> 这个缺陷**两端都有**，只补一端不够：服务端集合过期会让 RST 起飞，
+> 客户端集合过期会让这些 RST 直达内核。
+
+> **`iptables` 回退路径没有这个问题**：它用 `u32` 在**每个包**上直接匹配
+> ISN 低 16 位，完全无状态、没有 timeout，所以只有 nft 分支才会周期性掉保护。
+> 这也说明「两个后端的行为必须逐条对齐」——换后端时最容易漏掉的就是这类
+> **状态化 ↔ 无状态**的语义差。
+
+### 六、教训
+
+1. **动态集合的 `timeout` 必须和「谁会碰它」一起设计**。只要有一条
+   「只匹配不刷新」的规则参与主线，寿命就等于「最后一次刷新的时刻 + timeout」，
+   而 UPDATES 往往只在握手路径上。
+2. **「每 N 分钟断一次」几乎一定是某个 timeout 在起作用**。先把
+   `nft list set ... | grep expires`、`conntrack -L`、`keepalive`、
+   `idle_timeout` 全部列出来比一比，比读代码快得多。
+3. **不要用「重启进程」验证这类问题**。重启会顺带重建规则（集合被清空、
+   重新记账），现象消失十几分钟又出现，很容易误判成「重启修好了」。
+
 ## 173. `hk1→tk3` 不是普通 NAT，而是透明 TCP 代理；IPv6 二层隧道已验证（2026-11-28 北京时间）
 
 ### 一、纠正前两轮的结论

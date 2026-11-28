@@ -408,7 +408,14 @@ func nftServerScript(port uint16, marks []uint16) string {
 		//
 		// 超时必须 ≥ 会话空闲回收时间（默认 120s）：QUIC 连接在低流量时
 		// 可能几十秒没有数据包，集合提前过期会让内核重新看到数据包并回 RST。
-		// 这里取 10 分钟，靠 update 在每次新 SYN 时刷新。
+		// 这里取 10 分钟。
+		//
+		// **超时是「多久没刷新」而不是「创建后多久」**：下面的记账规则（SYN）
+		// 与查表规则（后续数据包）**都带 update**，所以只要这条流还在跑，
+		// 条目就会被每个包推到 10 分钟之后。
+		// 只在 SYN 上 update 是不够的 —— QUIC 长连接不会再有 SYN，条目必然在
+		// 「建连 + 10 分钟」过期，然后伪包落到内核 TCP 栈、内核开始逐包回 RST，
+		// 表现为隧道每 10 分钟断一次、重连后恢复正常（DEVTIPS 第 205 条）。
 		"add set inet " + notrackTable + " " + set +
 			" { type ipv4_addr . inet_service; flags dynamic,timeout; timeout 10m; }",
 		"flush set inet " + notrackTable + " " + set,
@@ -434,8 +441,12 @@ func nftServerScript(port uint16, marks []uint16) string {
 			" update @"+set+" { ip saddr . tcp sport } drop")
 	}
 	lines = append(lines,
+		// 查表规则同时**刷新**条目：每次命中都把过期时间推到 10 分钟后。
+		// 不带 update 时条目只在 SYN 时记账，长连接必然在 10 分钟后过期
+		// （2026-11-28 真机：每条 QUIC 连接恰好活 10.7 分钟）。
 		"add rule inet "+notrackTable+" "+inChain+inLocal+
-			" ip saddr . tcp sport @"+set+" drop",
+			" ip saddr . tcp sport @"+set+
+			" update @"+set+" { ip saddr . tcp sport } drop",
 		"add rule inet "+notrackTable+" "+inChain+inLocal+" notrack",
 	)
 	return strings.Join(append(lines, ""), "\n")
@@ -449,7 +460,8 @@ func nftServerScript(port uint16, marks []uint16) string {
 //	output   daddr=<server> dport=<port> syn @th,48,16 <mark> \
 //	             update @<set> { ip daddr . tcp sport }           记下本次流的源端口
 //	input    saddr=<server> sport=<port> ip saddr . tcp dport \
-//	             @<set> drop                                     挡内核处理回程包
+//	             @<set> update @<set> { ip saddr . tcp dport } drop  挡内核处理回程包，
+//	                                                            同时刷新条目
 //
 // 入向规则用**集合**而不是 IP ID 标记，原因有二：
 //  1. IP ID 会被中间设备随机化（服务端回包的 IP ID 同理），不可靠；
@@ -499,8 +511,12 @@ func nftClientScript(server netip.AddrPort, sourcePort, magic uint16) string {
 		"add chain inet "+notrackTable+" "+inChain+
 			" { type filter hook input priority raw; policy accept; }",
 		"flush chain inet "+notrackTable+" "+inChain,
+		// 入向规则同时刷新条目。回程包是长连接最主要的流量来源
+		// （服务端 → 客户端方向），只靠出向 SYN 记账的话，客户端这边
+		// 同样会在「建连 + 10 分钟」丢掉保护，内核回 RST 打断隧道。
 		"add rule inet "+notrackTable+" "+inChain+inSrc+
-			" ip saddr . tcp dport @"+set+" drop",
+			" ip saddr . tcp dport @"+set+
+			" update @"+set+" { ip saddr . tcp dport } drop",
 	)
 	return strings.Join(append(lines, ""), "\n")
 }

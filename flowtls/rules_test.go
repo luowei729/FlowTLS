@@ -185,6 +185,8 @@ func TestClientNftRulesByServerAddr(t *testing.T) {
 		// 记账规则：只在我们自己的 SYN 上命中（ISN 低 16 位 = 标记）
 		"tcp flags syn @th,48,16 0xf107 update @cft_",
 		"add set inet flowtls cft_",
+		// 入向查表规则必须同时刷新条目（否则长连接在 10 分钟后丢保护）
+		"ip saddr . tcp dport @cft_",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("nft 脚本缺少：%s\n实际：\n%s", want, script)
@@ -302,8 +304,8 @@ func TestNftServerScriptShape(t *testing.T) {
 		// 每条凭据的 ISN 标记各一条记账规则（多凭据部署的核心）
 		"add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 tcp flags syn @th,48,16 0x1e00 update @ft_8443 { ip saddr . tcp sport } drop",
 		"add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 tcp flags syn @th,48,16 0xc500 update @ft_8443 { ip saddr . tcp sport } drop",
-		// 该流后续包按集合丢弃（否则内核逐包回 RST）
-		"add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 drop",
+		// 该流后续包按集合丢弃（否则内核逐包回 RST），同时刷新条目
+		"add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 ip saddr . tcp sport @ft_8443 update @ft_8443 { ip saddr . tcp sport } drop",
 	}
 	for _, m := range musts {
 		if !strings.Contains(s, m) {
@@ -329,6 +331,41 @@ func TestNftServerScriptShape(t *testing.T) {
 	// flush set 必须存在，否则重复执行时旧条目会残留。
 	if !strings.Contains(s, "flush set inet flowtls ft_8443") {
 		t.Error("集合必须先 flush，否则重复执行会残留旧条目")
+	}
+}
+
+// TestNftSetMatchRulesRefresh 钉住「查表规则必须刷新集合条目」。
+//
+// 2026-11-28 真机事故：分流换成 TCP ISN 标记后，集合条目只在**新的 SYN**
+// 上记账（`update` 只写在记账规则上），而查表规则只匹配、不刷新。
+// 效果是「条目寿命 = 建连 + 10 分钟」，与流量多少完全无关——
+// QUIC 长连接永远不会再发 SYN，所以每条隧道都恰好活 10.7 分钟，
+// 然后伪包落到内核 TCP 栈被回 RST，隧道断掉、几秒后客户端新建连接。
+//
+// 面板上表现为节点每 10 分钟左右 "DOWN" 几十秒（haproxy 健康检查
+// rise 2 fall 2 要两次失败才判 DOWN，所以 downtimes 不均匀）。
+//
+// 修法是让**两条**规则的 `update` 都写上：SYN 记账 + 数据包续期。
+// nft 的 `timeout` 语义是「最后一次刷新后经过多久过期」，所以续期后
+// 空闲流依然会正常回收，活跃流永不过期。
+func TestNftSetMatchRulesRefresh(t *testing.T) {
+	server := nftServerScript(8443, []uint16{0x1E00})
+	// 服务端：按集合匹配的 DROP 必须带 update，且键与匹配键一致。
+	want := "add rule inet flowtls in_8443 fib daddr type local tcp dport 8443 " +
+		"ip saddr . tcp sport @ft_8443 update @ft_8443 { ip saddr . tcp sport } drop"
+	if !strings.Contains(server, want) {
+		t.Errorf("服务端查表规则必须刷新集合条目（否则长连接 10 分钟后断线）\n实际:\n%s", server)
+	}
+
+	// 客户端：入向链同理。键是「服务端地址 . 本端端口」，与出向记账一致。
+	client := nftClientScript(netip.MustParseAddrPort("203.0.113.9:8443"), 44300, 0xF107)
+	outChain, inChain, set := clientChains(netip.MustParseAddrPort("203.0.113.9:8443"))
+	_ = outChain
+	wantClient := "add rule inet flowtls " + inChain +
+		" ip saddr 203.0.113.9 tcp sport 8443 ip saddr . tcp dport @" + set +
+		" update @" + set + " { ip saddr . tcp dport } drop"
+	if !strings.Contains(client, wantClient) {
+		t.Errorf("客户端入向规则必须刷新集合条目（否则长连接 10 分钟后断线）\n实际:\n%s", client)
 	}
 }
 
