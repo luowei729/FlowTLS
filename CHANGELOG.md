@@ -1,5 +1,52 @@
 # CHANGELOG
 
+## 2026-11-29 (北京时间)
+
+### 诊断：把「节点中断」拆成三个独立问题（无协议改动，未升版本）
+
+rev.19 修掉了 10.7 分钟周期断线（见下一条）。之后又观察到中断，逐一判定：
+
+| 现象 | 判定 | 处理 |
+|---|---|---|
+| 10.7 分钟周期断线 | nft 集合只在 SYN 续期 | **rev.19 已修**，实测连接存活 287.9 / 640.8 分钟 |
+| 服务端重启后掉线 ~31 秒 | QUIC `maxIdleTimeout=30s`，无 RST 可依赖 | **设计代价**，不改；运维须知 |
+| sg1 一次 101 秒中断 | 单核争抢导致阻塞投递停摆（连接健康、只是没新流） | 加优先级 + 清残留进程 |
+
+第三种中断的证据很干净：服务端「QUIC 路径统计」每 2 秒无间断、
+`sent` 持续增长、`rtt=77~81ms`、`cwnd≈10MB`，但 `inbound connection`
+（新流）从 21:16:33 到 21:18:14 **完全空白 101 秒**。sg1 是 1 核，
+同时跑 6 个 Docker 容器和两个 `php artisan horizon:work`，`load 0.36~0.65`
+（tk3 0.21 / hk1 0.22）。flowtls 的 `deliver` 是阻塞投递，单核被抢占时
+整条通道停住而保活流量很小、不受影响 —— 所以「连接活着但新流建不起来」。
+
+#### 改动
+
+**没有代码改动，也不升版本**（rev.19 仍是当前版本）。做的是运维侧四项：
+
+1. `sg1` 加 systemd drop-in：`Nice=-5` + `CPUWeight=500`，单核争抢时优先调度。
+2. 停掉 `sg1` 上跑了 14 天的孤立 `./flowtls server -c server-8445.yaml`
+   （工作目录已是 `(deleted)`，二进制和配置都从磁盘消失），负载从 0.65 降到 0.08。
+3. **客户端日志开关**：PassWall 的 haproxy 后端由 `haproxy.lua` 起，
+   那次 `run_socks` 调用不传 `log_file`，所以配置被固定成
+   `"disabled": true, "output": "/dev/null"` —— 客户端侧出问题**完全无记录**。
+   现在通过 `flowtls_log.lua` 在已有的 `FLOWTLS-PATCH` 注入块里多包一层
+   `gen_config`，由 `/tmp/etc/passwall/flowtls-client.log.on` 控制，
+   **只开 warn 级**（单核路由器，开 info 会反过来加重正在排查的 CPU 争抢）。
+4. 新增 `scripts/flowtls-watch.sh`（部署到路由器 `/usr/bin/passwall-flowtls-watch`，
+   cron 每分钟一轮）：外部探针，带**直连控制变量**（区分 WAN 故障与 FlowTLS 故障）、
+   失败时抓 `/proc/PID/stat` 的 CPU 时间增量（区分「进程卡住」与「网络丢包」）、
+   并单独记录 `SLOW`（>2s 但成功，是卡住的前兆）。
+   **为什么必须外部探测**：卡住 100 秒的事件不产生任何日志行，
+   日志开多细都抓不到。
+
+#### 顺手修的坑：路由器时钟漂移 3 分 28 秒
+
+`sysntpd` 从开机起就没同步成功（开机时 WAN 未就绪），42 小时漂移 3.5 分钟
+（≈83 ppm）。这会让跨机日志对齐直接对错对象。`/etc/init.d/sysntpd restart`
+后立刻对齐。**排查跨机问题前先 `ssh <host> date` 比一次时钟。**
+
+完整过程与判据见 `DEVTIPS.md` 第 175 条。
+
 ## 2026-11-28 (北京时间)
 
 ### 修复：nft 动态集合只在 SYN 上续期，导致隧道每 10 分钟断一次（rev.19）

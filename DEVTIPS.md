@@ -6,6 +6,136 @@
 > 两类坑在原理上常常相通（例如窗口、乱序、NAT 行为），所以历史条目保留。
 > 演进的来龙去脉见 `docs/EVOLUTION.md`。
 
+## 175. 把「节点中断」拆成三个独立问题：周期断线 / 重启重连 / 单核争抢（2026-11-29 北京时间）
+
+### 一、先分清三种「中断」，判据完全不同
+
+用户反复报「节点中断」，但实际是三个互不相干的故障，套同一个假设会一直查错方向。
+先把可观测信号列全，再按信号分组：
+
+| 信号 | 判据 | 结论 |
+|---|---|---|
+| 服务端按 `peer=` 分组算连接存活时长 | 全是 10.6~10.8 分钟 | 某个 10 分钟 timeout（第 174 条） |
+| QUIC 连接 `peer` 不变，但目标侧一段时间收不到新流 | 连接活着、统计正常、只是没新流 | 客户端卡或隧道内阻塞 |
+| 服务端 `systemctl show -p ExecMainStartTimestamp` | 与 DOWN 时刻吻合 | 自己的重启，不是故障 |
+| `nft list set ... \| grep expires` | 在续期 / 为空 | 保护是否还在 |
+
+### 二、被判定的三种中断
+
+#### 1) 周期断线（10.7 分钟）——已由 rev.19 修掉
+
+见第 174 条。修复后实测 tk3 的连接存活 **287.9 分钟、640.8 分钟**，
+`chkfail` 不再增长。判据：`nft list set` 的 `expires` 稳定在 `9m5x s` 而不是倒数。
+
+#### 2) 服务端重启 → 客户端要等 30 秒才发现
+
+`flowtls/quic/config.go` 里 `maxIdleTimeout = 30s`、`keepAlivePeriod = 10s`。
+服务端一重启，客户端**不会立刻知道**：本协议从不发 RST，且
+`handleIncoming` 必须忽略 RST（AGENTS.md 约束 17），所以 QUIC 只能靠
+「连续 3 次保活无响应」推断连接死了 —— 实测 **重启 03:46:12 → 重连 03:46:43，
+正好 31 秒**，与 `maxIdleTimeout` 吻合。
+
+**这不是 bug，是代价**：想更快只能减小 `maxIdleTimeout`，但那样弱网下的
+短暂抖动会被误判断线。要根治得让服务端在退出时主动发 FIN/迁移信号，
+属于协议层改动，现阶段不做。**运维含义：重启服务端 = 该节点必然掉线约 30 秒，
+别把这个当成「又出故障了」。**
+
+#### 3) 单核争抢 → 「隧道还在但新流建不起来」
+
+2026-11-28 21:16 的一次 101 秒中断，证据组合很特殊：
+
+- 服务端「QUIC 路径统计」**每 2 秒无间断**，`sent` 从 79064 持续涨到 82158，
+  `rtt=77~81ms`、`cwnd≈10MB`、`lost` 只缓慢增长 → **连接对象完全健康**
+- 同一时段 `inbound connection`（新流）从 21:16:33 到 21:18:14 **完全空白**
+- 服务端直连出网 20/20 成功、18~22ms；DNS 3ms → 不是 sg1 的出网问题
+
+也就是说：**隧道在跑，但新建流被堵住了 101 秒。** 最可能是客户端（或服务端）
+的 single-threaded 投递被调度延迟卡住 —— flowtls 的 `deliver` 是**阻塞投递**
+（这是防止静默丢包的前提，见 `pitfalls.md`），单核被抢占时收包协程拿到
+时间片之前，整条通道都会停住，而保活流量很小、不受影响，于是「连接活着
+但没新流」。
+
+sg1 的佐证：1 核，同时跑 6 个 Docker 容器（V2board / MySQL / Redis /
+php-fpm / openresty / buildkit）和两个 `php artisan horizon:work` 常驻进程，
+`load average 0.36~0.65`；对比 tk3 是 0.21/HK 0.22。
+
+### 三、这次做的四件事
+
+| 动作 | 原因 |
+|---|---|
+| sg1 加 `Nice=-5` + `CPUWeight=500` | 单核争抢时让 sing-box 优先拿时间片（`systemd` drop-in） |
+| 停掉 sg1 上的孤立 `./flowtls server`（工作目录已 `(deleted)`） | 它是 14 天前的残留进程，白占 CPU/内存 |
+| 客户端日志开关（`flowtls_log.lua` 注入 + marker 文件） | 见下节 |
+| 路由器外部探针 `passwall-flowtls-watch` | 见下节 |
+
+### 四、客户端日志为什么之前是关的，以及为什么只开 warn
+
+PassWall 的 haproxy 后端由 `haproxy.lua` 调 `app.sh run_socks` 启动，
+**那次调用不传 `log_file`**：
+
+```lua
+sys.call(string.format('/usr/share/%s/app.sh run_socks "%s" > /dev/null', ...))
+```
+
+于是 `app.sh` 里 `[ -n "$log_file" ] || log_file="/dev/null"` 命中，
+接着 `json_add_string "log" "0"`，最终配置固定是：
+
+```json
+"log": { "disabled": true, "output": "/dev/null" }
+```
+
+**客户端侧出任何问题都没有任何记录**，排查只能靠服务端反推。
+
+修法：在已有的 `FLOWTLS-PATCH` 注入块里**多包一层 `gen_config`**
+（`flowtls_log.lua`），由 marker 文件 `/tmp/etc/passwall/flowtls-client.log.on`
+控制，输出到 `/tmp/etc/passwall/flowtls-client.log`。
+
+**只开 `warn` 级，刻意不开 info/debug**：这台路由器是单核，而卡顿本身很可能
+就来自 CPU 争抢 —— 开 info 会按「每条连接一行」写内存盘，等于给正在排查的
+问题添柴。warn 级只记错误，量极小。
+
+需要短期抓细节：`echo debug > /tmp/etc/passwall/flowtls-log-level` 再 apply；
+排查完删掉 marker + apply 回到 warn。
+
+**注意**：`haproxy.lua` 只在**端口缓存未命中**时才重新生成 json，所以打完补丁
+必须等 PassWall 重启/设备重启才生效；要立刻生效只能手改 json 再重启那两个进程
+（本次就是这么做，代价是该端口约 30 秒中断）。
+
+### 五、外部探针 `passwall-flowtls-watch`
+
+**为什么不能靠日志代替它**：卡住 100 秒的事件**不产生任何日志行**
+（它不出错，只是不动），所以无论日志开多细都抓不到。唯一可靠的办法是从外面
+按固定间隔主动探测。
+
+脚本在 `scripts/flowtls-watch.sh`，部署到路由器 `/usr/bin/passwall-flowtls-watch`，
+cron 每分钟跑一轮。设计上三个关键点：
+
+1. **带控制变量**：先测「路由器不经代理直接出网」。若直连也失败 → 是 WAN/家宽
+   的问题，隧道结论不可用。没有这个控制变量，任何失败都会被误判成 FlowTLS 的错。
+2. **失败时抓 CPU 时间戳**：`/proc/PID/stat` 的 `utime+stime` 增量能区分
+   - 增量≈0 且探测失败 → 进程没事干，问题在网络
+   - 增量很大且探测失败 → 进程在忙（自旋/GC），是 CPU 侧瓶颈
+3. **区分「失败」与「慢」**：`SLOW`（>2s 但成功）往往是「卡住」的前兆，
+   比只记录失败更早发现趋势。
+
+输出在 `/tmp/flowtls-watch.log`（内存盘，不磨 flash），带行数上限自动裁剪。
+
+```bash
+/usr/bin/passwall-flowtls-watch status   # 统计 + 最近失败 + 客户端日志尾部
+```
+
+### 六、顺手发现：路由器时钟漂移会毁掉日志对齐
+
+排查时发现路由器比真实时间**快 3 分 28 秒**，而 tk3/sg1/hk1/本机彼此只差 4~10 秒。
+原因：`sysntpd` 从开机起就没同步成功（开机时 WAN 还没就绪），时钟自由漂移
+42 小时累积 3.5 分钟（≈83 ppm，符合廉价晶体）。
+
+`/etc/init.d/sysntpd restart` 后**立刻**对齐。
+
+**教训**：跨机对齐日志前先比一次时钟（`for h in ...; do ssh $h date; done`）。
+差几百毫秒可以忽略，差几分钟会让「服务端日志空白 101 秒」和「面板 DOWN 202 秒」
+这种结论直接对错对象。
+
 ## 174. nft 动态集合只在 SYN 上续期 → 每条隧道恰好活 10.7 分钟（2026-11-28 北京时间）
 
 ### 一、现象：面板上节点每隔十来分钟「DOWN」一次

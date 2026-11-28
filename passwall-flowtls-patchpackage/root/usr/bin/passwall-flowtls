@@ -105,6 +105,11 @@ pcall(function()
 		local _w = _f(gen_outbound)
 		if type(_w) == "function" then gen_outbound = _w end
 	end
+	local _ok2, _g = pcall(dofile, "/usr/lib/lua/luci/passwall/flowtls_log.lua")
+	if _ok2 and type(_g) == "function" then
+		local _w2 = _g(gen_config)
+		if type(_w2) == "function" then gen_config = _w2 end
+	end
 end)
 -- <<< FLOWTLS-PATCH <<<
 EOF
