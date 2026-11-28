@@ -70,7 +70,7 @@ func main() {
 	cfg := flowtls.ServerConfig{
 		Listen:    addr,
 		Passwords: passwords,
-		ISNMark:  uint16(*isnMark),
+		ISNMark:   uint16(*isnMark),
 
 		LocalIP:        parseLocalIP(*localIP),
 		UDPTimeoutSecs: 120,

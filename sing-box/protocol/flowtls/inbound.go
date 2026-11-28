@@ -179,7 +179,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		Listen:         listenAddr,
 		Passwords:      passwords,
 		Handshake:      handshake,
-		ISNMark:       h.opts.ISNMark,
+		ISNMark:        h.opts.ISNMark,
 		UDPEnabled:     &h.udpOn,
 		UDPTimeoutSecs: int(h.udpIdleTimeout / time.Second),
 		UDPMaxSessions: h.udpMaxSessions,

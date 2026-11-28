@@ -269,7 +269,7 @@ func (o *Outbound) connect() (*ftquic.Client, error) {
 			Password:   o.opts.Password,
 			SNI:        sni,
 			SourcePort: o.opts.SourcePort,
-			ISNMark:   o.opts.ISNMark,
+			ISNMark:    o.opts.ISNMark,
 			Handshake:  handshake,
 			// 防火墙规则由 flowtls 库强制写入（没有开关）：SYN-ACK 一回，
 			// 内核就会发现没有对应 socket 并回 RST，中间设备会立即拆掉 NAT 映射。
