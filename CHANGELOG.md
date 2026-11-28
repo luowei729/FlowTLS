@@ -2,6 +2,18 @@
 
 ## 2026-11-28 (北京时间)
 
+### 诊断：`hk1→tk3` 是透明 TCP 代理，IPv6 二层隧道方案已验证（未部署）
+
+同一次运行的双点抓包证明：`hk1 → tk3` 保留源端口、窗口、wscale，
+但双向映射 seq / TSval、钳制 MSS，且 TLS payload 逐字节不变。
+普通 TCP 可用，是因为它被代理终结重建；FlowTLS 的 raw 回程被截断，
+所以「只换 ISN / 源端口 / 窗口标记」即使识别成功也无法完成 QUIC。
+
+已验证绕过方案：**`ip6gretap` 二层 GRE-over-IPv6 + tk3 `IPPROTO_RAW`
+回包 + QUIC MTU 1200**。IPv6 路径 seq/TSval 原样、RTT 约 48ms；
+隧道内 rev.17 实测 20.7MB / 23s、`lost=0`。完整证据与落地清单见
+`DEVTIPS.md` 第 173 条。**未改协议、未升版本、未部署**，生产仍为 rev.17。
+
 ### 发布：v1.14.4-rev.17 —— 分流标记从 IP ID 换成 TCP ISN（**破坏性变更**）
 
 **wire format 未改动**（载荷层 `17 03 03` + AEAD 与 rev.16 完全一致，
