@@ -87,19 +87,33 @@ sys.call(string.format('/usr/share/%s/app.sh run_socks "%s" > /dev/null', ...))
 **客户端侧出任何问题都没有任何记录**，排查只能靠服务端反推。
 
 修法：在已有的 `FLOWTLS-PATCH` 注入块里**多包一层 `gen_config`**
-（`flowtls_log.lua`），由 marker 文件 `/tmp/etc/passwall/flowtls-client.log.on`
+（`flowtls_log.lua`），由 marker 文件 `/etc/passwall-flowtls-log.on`
 控制，输出到 `/tmp/etc/passwall/flowtls-client.log`。
 
 **只开 `warn` 级，刻意不开 info/debug**：这台路由器是单核，而卡顿本身很可能
 就来自 CPU 争抢 —— 开 info 会按「每条连接一行」写内存盘，等于给正在排查的
 问题添柴。warn 级只记错误，量极小。
 
-需要短期抓细节：`echo debug > /tmp/etc/passwall/flowtls-log-level` 再 apply；
+需要短期抓细节：`echo debug > /etc/passwall-flowtls-log-level` 再 apply；
 排查完删掉 marker + apply 回到 warn。
 
 **注意**：`haproxy.lua` 只在**端口缓存未命中**时才重新生成 json，所以打完补丁
 必须等 PassWall 重启/设备重启才生效；要立刻生效只能手改 json 再重启那两个进程
 （本次就是这么做，代价是该端口约 30 秒中断）。
+
+#### marker 必须放持久分区（2026-11-29 当场踩到）
+
+marker 最初放在 `/tmp/etc/passwall/` 下，**PassWall 一重启就丢**：
+`/tmp` 是 tmpfs，PassWall 启动时重建整个 `/tmp/etc/passwall` 目录，
+连 marker 一起清掉，于是新生成的配置又回到 `disabled: true`。
+设备重启同样会丢（tmpfs 不落盘）。
+
+所以开关文件改成 `/etc/passwall-flowtls-log.on`（持久分区，重装补丁包也不动），
+**日志文件仍放 `/tmp`**（内存盘，高频写不磨 flash）。
+`flowtls_log.lua` 同时兼容旧路径，避免已按旧文档建过 marker 的机器失效。
+
+**教训**：往 OpenWrt 上放任何「需要记住」的状态，先 `mount | grep <dir>`
+确认它不在 tmpfs 上。`/tmp`、`/var`、`/var/lock`、`/var/run` 全部是内存盘。
 
 ### 五、外部探针 `passwall-flowtls-watch`
 

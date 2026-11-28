@@ -30,7 +30,7 @@ rev.19 修掉了 10.7 分钟周期断线（见下一条）。之后又观察到�
    那次 `run_socks` 调用不传 `log_file`，所以配置被固定成
    `"disabled": true, "output": "/dev/null"` —— 客户端侧出问题**完全无记录**。
    现在通过 `flowtls_log.lua` 在已有的 `FLOWTLS-PATCH` 注入块里多包一层
-   `gen_config`，由 `/tmp/etc/passwall/flowtls-client.log.on` 控制，
+   `gen_config`，由 `/etc/passwall-flowtls-log.on` 控制，
    **只开 warn 级**（单核路由器，开 info 会反过来加重正在排查的 CPU 争抢）。
 4. 新增 `scripts/flowtls-watch.sh`（部署到路由器 `/usr/bin/passwall-flowtls-watch`，
    cron 每分钟一轮）：外部探针，带**直连控制变量**（区分 WAN 故障与 FlowTLS 故障）、

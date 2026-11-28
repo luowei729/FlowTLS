@@ -34,9 +34,16 @@
 --     /usr/bin/passwall-flowtls apply
 -- 排查完删掉 marker、再 apply 一次就回到 warn（零残留）。
 --
+-- ## marker 为什么放在 /etc 而不是 /tmp
+--
+-- `/tmp` 是 tmpfs，**PassWall 一重启就会重建 `/tmp/etc/passwall`**，
+-- marker 会跟着消失（2026-11-29 实测踩过）。设备重启同样会丢。
+-- 所以开关文件必须放在持久分区：`/etc/passwall-flowtls-log.on`。
+-- 日志文件本身仍然放 `/tmp`（内存盘，不磨 flash）。
+--
 -- ## 怎么临时关掉
 --
---     rm -f /tmp/etc/passwall/flowtls-client.log.on
+--     rm -f /etc/passwall-flowtls-log.on
 --     /usr/bin/passwall-flowtls apply
 -- 之后新生成的配置恢复成原来的 disabled=true。
 return function(orig)
@@ -44,9 +51,13 @@ return function(orig)
 		return nil
 	end
 
-	local LOG_ON   = "/tmp/etc/passwall/flowtls-client.log.on"
-	local LOG_FILE = "/tmp/etc/passwall/flowtls-client.log"
-	local LVL_FILE = "/tmp/etc/passwall/flowtls-log-level"
+	-- 开关放持久分区（见上面注释）；旧路径保留兼容，避免升级前
+	-- 已经按旧文档建过 marker 的机器突然失效。
+	local LOG_ON    = "/etc/passwall-flowtls-log.on"
+	local LOG_ON_V0 = "/tmp/etc/passwall/flowtls-client.log.on"
+	local LOG_FILE  = "/tmp/etc/passwall/flowtls-client.log"
+	local LVL_FILE  = "/etc/passwall-flowtls-log-level"
+	local LVL_V0    = "/tmp/etc/passwall/flowtls-log-level"
 
 	local function exists(path)
 		local f = io.open(path, "r")
@@ -54,11 +65,16 @@ return function(orig)
 		return false
 	end
 
+	local function enabled()
+		return exists(LOG_ON) or exists(LOG_ON_V0)
+	end
+
 	-- 日志级别：默认 warn；marker 文件里写 info/debug/trace 可以临时提高。
 	-- 只接受四个合法值，写错就落回 warn，避免把非法值喂给 sing-box
 	-- （它会在解析配置时直接退出，表现为「节点起不来」）。
 	local function level()
 		local f = io.open(LVL_FILE, "r")
+		if not f then f = io.open(LVL_V0, "r") end
 		if not f then return "warn" end
 		local v = f:read("*l")
 		f:close()
@@ -71,7 +87,7 @@ return function(orig)
 
 	return function(var)
 		-- 开关文件不存在时**完全不动** var，行为与没打补丁时一致。
-		if exists(LOG_ON) and type(var) == "table" then
+		if enabled() and type(var) == "table" then
 			-- 只在 PassWall 自己关掉了日志时接管；用户显式开了日志的
 			-- 配置不去覆盖（尊重用户的选择）。
 			if var["log"] ~= "1" then
